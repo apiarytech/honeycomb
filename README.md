@@ -170,11 +170,11 @@ For more details on both licensing options, please see the `LICENSE.md` file.
 
 ## Contributing
 
-Contributions to `royaljelly` are welcome! Please feel free to:
+Contributions to `honeycomb` are welcome! Please feel free to:
 - Fork the repository.
 - Submit issues for bugs or feature requests.
 - Submit pull requests with improvements, bug fixes, or new IEC 61131-3 compliant implementations.
 
 Please ensure that your contributions adhere to the existing code style and include appropriate tests.
 
-Thank you for your interest in `royaljelly`!
+Thank you for your interest in `honeycomb`!
