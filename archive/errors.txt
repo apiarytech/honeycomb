@@ -1,0 +1,6 @@
+
+--- FAIL: TestStringLengthLimit (0.00s)
+    c:/go/github.com/honeycomb/TagDatabase_test.go:2040: MaxLength not persisted correctly. Got 0, want 10
+FAIL
+FAIL	github.com/apiarytech/honeycomb	1.723s
+FAIL
