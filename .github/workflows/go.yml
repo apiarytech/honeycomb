@@ -14,6 +14,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        goarch:
+          - amd
+          - amd64
+          - arm
+          - arm64
+          - riscv
+          - riscv64
+          - wasm
+          - wasm32
+          - wasm64
+          - 386
+        goos:
+          - linux
+          - darwin
+          - windows
         os:
           - ubuntu-latest
           - macos-latest
@@ -37,6 +52,10 @@ jobs:
         go get ./...
         go install .
         go build -v ./...
+      env:
+          GOARCH: ${{ matrix.goarch }}
 
     - name: Test
+      env:
+          GOARCH: ${{ matrix.goarch }}
       run: go test -v ./...
