@@ -39,11 +39,17 @@ jobs:
       with:
         go-version: ${{ matrix.go }}
 
-    - name: Build & Test
+    - name: Build
       run: |
         go get ./...
         go install .
         go build -v ./...
+      env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+
+    - name: Test
+      run: |
         go test -v ./...
       env:
           GOOS: ${{ matrix.os }}
