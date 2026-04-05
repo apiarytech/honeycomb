@@ -16,21 +16,20 @@ jobs:
       matrix:
         # Define specific supported pairs to avoid invalid combinations
         include:
-          - {os: linux,   arch: amd64, name: linux-x64}
-          - {os: linux,   arch: arm64,   name: linux-arm64}
-          - {os: linux,   arch: 386,   name: linux-x86}
-          - {os: windows, arch: amd64, name: windows-x64}
-          - {os: windows, arch: arm64,   name: windows-arm64}
-          - {os: windows, arch: 386,   name: windows-x86}
-          - {os: darwin,  arch: amd64, name: macos-amd64}
-          - {os: darwin,  arch: arm64, name: macos-arm64}
-          - {os: darwin,  arch: 386, name: macos-x86}
-
+          - {os: linux,   arch: amd64, name: ubuntu-latest}
+          - {os: linux,   arch: arm64,   name: ubuntu-latest}
+          - {os: linux,   arch: 386,   name: ubuntu-latest}
+          - {os: windows, arch: amd64, name: windows-latest}
+          - {os: windows, arch: arm64,   name: windows-latest}
+          - {os: windows, arch: 386,   name: windows-latest}
+          - {os: darwin,  arch: amd64, name: macos-latest}
+          - {os: darwin,  arch: arm64, name: macos-latest}
+          - {os: darwin,  arch: 386, name: macos-latest}
         go:
           - '1.26.1' # minimum version
           - 'oldstable'
           - 'stable'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.name }}
 
     steps:
     - uses: actions/checkout@v4
