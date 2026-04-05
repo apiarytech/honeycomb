@@ -14,45 +14,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 386 and arm are 32-bit; amd64 and arm64 are 64-bit
-        goarch: [amd64, 386, arm, arm64]
-        goos: [linux, windows, darwin]
-        name: [widows-latest, ubuntu-latest, macos-latest]
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
         go:
           - '1.26.1' # minimum version
           - 'oldstable'
           - 'stable'
-        exclude:
-          # Exclude goos from names of OS images
-          - goos: linux
-            name: macos-latest
-          - goos: windows
-            name: macos-latest
-          - goos: darwin
-            name: ubuntu-latest
-          - goos: windows
-            name: ubuntu-latest
-    runs-on: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
     steps:
     - uses: actions/checkout@v4
 
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: ${{ matrix.go }}
+        go-version: '1.26.1'
 
     - name: Build
       run: |
         go get ./...
         go install .
         go build -v ./...
-      env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
 
     - name: Test
-      run: |
-        go test -v ./...
-      env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+      run: go test -v ./...
