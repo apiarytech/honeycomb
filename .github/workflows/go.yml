@@ -17,13 +17,22 @@ jobs:
         # 386 and arm are 32-bit; amd64 and arm64 are 64-bit
         goarch: [amd64, 386, arm, arm64]
         goos: [linux, windows, darwin]
-        name: [widows-latets, ubuntu-latest, macos-latest]
+        name: [widows-latest, ubuntu-latest, macos-latest]
         go:
           - '1.26.1' # minimum version
           - 'oldstable'
           - 'stable'
+        exclude:
+          # Exclude goos from names of OS images
+          - goos: linux
+            name: macos-latest
+          - goos: windows
+            name: macos-latest
+          - goos: darwin
+            name: ubuntu-latest
+          - goos: windows
+            name: ubuntu-latest
     runs-on: ${{ matrix.name }}
-
     steps:
     - uses: actions/checkout@v4
 
