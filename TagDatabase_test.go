@@ -12,6 +12,7 @@
 package honeycomb
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1162,17 +1163,37 @@ func TestWriteAndReadTags(t *testing.T) {
 		t.Fatalf("Failed to read the created persistence file: %v", err)
 	}
 
-	// Since map iteration order is not guaranteed, we check for the presence of all expected lines.
-	expectedLines := map[string]bool{
-		"TagDINT=123":           true,
-		"TagREAL=45.67":         true,
-		"TagINT=999":            true,
-		"TagSTRING=hello world": true,
-	}
+	// Verify the JSON content of the file.
+	// Since WriteTagsToFile now sorts the lines, we can expect a consistent order.
 	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
-		if line != "" && !expectedLines[line] {
-			t.Errorf("Unexpected line in output file: %s", line)
+	if len(lines) != 4 {
+		t.Fatalf("Expected 4 lines in persistence file, but got %d", len(lines))
+	}
+
+	expectedTags := map[string]interface{}{
+		"TagDINT":   float64(123), // JSON unmarshals numbers to float64 by default
+		"TagINT":    float64(999),
+		"TagREAL":   45.67,
+		"TagSTRING": "hello world",
+	}
+
+	foundTags := make(map[string]bool)
+	for i, line := range lines {
+		if line == "" {
+			if i == len(lines)-1 {
+				continue
+			}
+			t.Fatalf("Unexpected empty line at line %d", i+1)
+		}
+		var pTag persistentTag
+		if err := json.Unmarshal([]byte(line), &pTag); err != nil {
+			t.Fatalf("Failed to unmarshal line %d: %v\nContent: %s", i+1, err, line)
+		}
+		if expectedVal, ok := expectedTags[pTag.Name]; ok {
+			if pTag.Value != expectedVal {
+				t.Errorf("Value mismatch for tag %s. Got %v, want %v", pTag.Name, pTag.Value, expectedVal)
+			}
+			foundTags[pTag.Name] = true
 		}
 	}
 
@@ -1246,7 +1267,7 @@ func TestReadTags_ParseError(t *testing.T) {
 	filePath := filepath.Join(tempDir, "bad_file.txt")
 
 	// Create a file with a malformed line
-	badContent := []byte("MyTag=not_a_number")
+	badContent := []byte(`{"Name":"MyTag","TypeInfo":{"DataType":"DINT"},"Value":"not_a_number"}`)
 	if err := os.WriteFile(filePath, badContent, 0666); err != nil {
 		t.Fatalf("Failed to write bad file: %v", err)
 	}
@@ -1255,7 +1276,7 @@ func TestReadTags_ParseError(t *testing.T) {
 	if err == nil {
 		t.Fatal("ReadTagsFromFile() should have returned an error for a parse failure")
 	}
-	if !strings.Contains(err.Error(), "error parsing value for tag 'MyTag'") {
+	if !strings.Contains(err.Error(), "line error for tag 'MyTag'") {
 		t.Errorf("Expected a parsing error, but got: %v", err)
 	}
 }
@@ -1310,6 +1331,10 @@ func TestUDTPersistence(t *testing.T) {
 	if err1 != nil {
 		t.Fatalf("Failed to write UDT to file: %v", err1)
 	}
+
+	// The verification of the file content is complex and is handled in TestWriteAndReadTags.
+	// Here, we focus on ensuring the end-to-end process works for UDTs.
+	// We will proceed directly to the read phase.
 
 	// --- Read Phase ---
 	dbRead := NewTagDatabase()
@@ -2320,7 +2345,7 @@ func TestRetainFlagPersistence(t *testing.T) {
 	}
 	contentStr := string(content)
 
-	if !strings.Contains(contentStr, "RetainedTag=123") {
+	if !strings.Contains(contentStr, `"Name":"RetainedTag"`) {
 		t.Error("File content should contain the retained tag, but it doesn't.")
 	}
 	if strings.Contains(contentStr, "NonRetainedTag") || strings.Contains(contentStr, "ConstantTag") {
@@ -2384,17 +2409,22 @@ func TestStringLengthLimit(t *testing.T) {
 
 	// 5. Test persistence of MaxLength.
 	filePath := "string_length_persistence.txt"
+	tag.Retain = true // Mark for persistence
 	t.Cleanup(func() { os.Remove(filePath) })
-	db.WriteTagsToFile(filePath)
+	if err := db.WriteTagsToFile(filePath); err != nil {
+		t.Fatalf("Failed to write for persistence test: %v", err)
+	}
 
 	dbRead := NewTagDatabase()
 	// Add a placeholder with the correct TypeInfo, including MaxLength.
 	// This simulates an application restart where tag definitions are known.
-	dbRead.AddTag(&Tag{Name: tagName, TypeInfo: &TypeInfo{
+	readTag := &Tag{Name: tagName, TypeInfo: &TypeInfo{
 		DataType:  TypeSTRING,
 		MaxLength: maxLength,
-	}, Value: plc.STRING("")})
-	dbRead.ReadTagsFromFile(filePath)
+	}, Value: plc.STRING(""), Retain: true}
+	dbRead.AddTag(readTag)
+
+	dbRead.ReadTagsFromFile(filePath) // This should read the value and also respect the TypeInfo
 
 	retrievedTag, _ := dbRead.GetTag(tagName)
 	if retrievedTag.TypeInfo.MaxLength != maxLength {

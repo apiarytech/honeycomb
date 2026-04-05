@@ -261,8 +261,8 @@ A: Please contact us and we'll be happy to help.
 
 To purchase a commercial license or for any other questions, please contact us at:
 
-*   **Email:** [your email address]
-*   **Website:** [your website]
+*   **Email:** [famador@apiarytech.io]
+*   **Website:** [apiarytech.io]
 
 ---
 

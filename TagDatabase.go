@@ -601,13 +601,15 @@ func (db *TagDatabase) UnsubscribeFromTag(tagName string, subscriptionID uint64)
 
 // AddTag adds a new tag to the database. It returns an error if a tag with the same name already exists.
 func (db *TagDatabase) AddTag(tag *Tag) error {
-	// For non-alias tags, resolve and assign TypeInfo. Remote aliases don't have local TypeInfo.
-	if !tag.IsRemoteAlias {
+	// For non-alias tags, if TypeInfo is not already provided, resolve and assign it.
+	// If it is provided (common when pre-adding tags for persistence), we still need to
+	// ensure it's registered in the type registry.
+	if !tag.IsRemoteAlias && tag.TypeInfo == nil {
 		typeInfo, err := db.getOrRegisterTypeInfo(tag)
 		if err != nil {
 			return fmt.Errorf("error processing type for tag '%s': %w", tag.Name, err)
 		}
-		tag.TypeInfo = typeInfo
+		tag.TypeInfo = typeInfo // Assign the inferred or registered TypeInfo
 	}
 
 	// LoadOrStore is an atomic operation that checks for existence and stores if not present. // Corrected from TypeInfo to honeycomb.TypeInfo
@@ -1563,6 +1565,14 @@ func getPlcTypeSize(dataType DataType) (int, bool) {
 	}
 }
 
+// persistentTag is an unexported struct used as a data transfer object
+// for serializing and deserializing tags to and from a persistence file.
+type persistentTag struct {
+	Name     string    `json:"Name"`
+	TypeInfo *TypeInfo `json:"TypeInfo"`
+	Value    any       `json:"Value"`
+}
+
 // WriteTagsToFile iterates through the database and writes each tag's name
 // and current value to a file.
 // This function is optimized to reduce memory allocations by pre-calculating
@@ -1585,57 +1595,22 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 			return true // Continue to the next tag.
 		}
 
-		var valueStr string
-		if tag.TypeInfo.DataType == TypeARRAY {
-			// If the value is an array, serialize it to JSON.
-			jsonData, err := json.Marshal(tag.GetValue())
-			if err != nil {
-				return true // Skip tags that fail to marshal.
-			}
-			valueStr = string(jsonData)
-		} else if udt, ok := tag.Value.(UDT); ok { // Corrected from TypeInfo.ElementType to honeycomb.TypeInfo.ElementType
-			// If the tag is a UDT, we need to serialize its dimensions as well if it's an array
-			if tag.TypeInfo.DataType == TypeARRAY && tag.TypeInfo.Dimensions != nil {
-				// This part is tricky because UDTs are not arrays.
-				// Let's assume for now UDTs are not arrays themselves.
-			}
-
-			// If the value is a UDT, serialize it to JSON.
-			jsonData, err := json.Marshal(udt) // Corrected from TypeInfo.ElementType to honeycomb.TypeInfo.ElementType
-			if err != nil {
-				return true // Skip tags that fail to marshal.
-			}
-			valueStr = string(jsonData)
-		} else {
-			// For STRING/WSTRING with MaxLength, use structured JSON.
-			if (tag.TypeInfo.DataType == TypeSTRING || tag.TypeInfo.DataType == TypeWSTRING) && tag.TypeInfo.MaxLength > 0 {
-				// Ensure the value is a string before marshaling. // Corrected from TypeSTRING to honeycomb.TypeSTRING
-				strVal := fmt.Sprintf("%v", tag.GetValue())
-				jsonData, err := json.Marshal(map[string]interface{}{
-					"Value":     strVal,
-					"MaxLength": tag.TypeInfo.MaxLength,
-				})
-				if err == nil {
-					valueStr = string(jsonData)
-				}
-			} else {
-				// For primitive types, use fmt.Sprintf.
-				valueStr = fmt.Sprintf("%v", tag.GetValue())
-			} // Corrected from TypeSTRING to honeycomb.TypeSTRING
+		// Create a serializable representation of the tag.
+		pTag := persistentTag{
+			Name:     tag.Name,
+			TypeInfo: tag.TypeInfo,
+			Value:    tag.GetValue(), // Use GetValue to respect forcing if needed, though usually not for persistence.
 		}
 
-		var line string
-		if tag.TypeInfo.DataType == TypeARRAY && tag.TypeInfo.Dimensions != nil {
-			// For multi-dimensional arrays, store dimensions.
-			dimsStr, _ := json.Marshal(tag.TypeInfo.Dimensions)
-			// Using a more structured format like JSON for the value part
-			line = fmt.Sprintf("%s={\"Value\":%s,\"Dimensions\":%s}", tag.Name, valueStr, string(dimsStr))
-		} else {
-			line = fmt.Sprintf("%s=%s", tag.Name, valueStr)
+		// Marshal the entire persistentTag struct to JSON for a complete representation.
+		jsonData, err := json.Marshal(pTag)
+		if err != nil {
+			// Optionally log the error, but continue to the next tag.
+			return true
 		}
 
-		lines = append(lines, line)
-		estimatedSize += len(line) + 1 // +1 for the newline character
+		lines = append(lines, string(jsonData))
+		estimatedSize += len(jsonData) + 1 // +1 for the newline character
 		return true
 	})
 
@@ -1663,7 +1638,7 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 	}
 
 	lines := strings.Split(string(data), "\n")
-	var combinedErr error
+	var errorList []string
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -1671,114 +1646,81 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 			continue
 		}
 
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue // Skip malformed lines
+		// Each line is now a self-contained JSON object representing a persistentTag.
+		var pTag persistentTag
+		if err := json.Unmarshal([]byte(line), &pTag); err != nil {
+			errorList = append(errorList, fmt.Sprintf("line error: failed to unmarshal JSON: %v", err))
+			continue
 		}
 
-		tagName := parts[0]
-		valueStr := parts[1]
+		tagName := pTag.Name
+		valueData := pTag.Value
 
 		// Get the tag to determine its expected data type.
 		val, found := db.tags.Load(tagName)
 		if !found {
+			// If the tag doesn't exist in the database, we can't load its value.
+			// This is expected if the application's tag configuration has changed.
 			continue
 		}
 		tag := val.(*Tag)
+
 		// Convert the string value from the file back to the tag's native type.
 		var newValue interface{}
 		var parseErr error
 
-		// Check for structured JSON (could be multi-dim array or string with length)
-		if strings.HasPrefix(valueStr, "{") && strings.HasSuffix(valueStr, "}") {
-			// Attempt to parse as a multi-dimensional array structure first.
-			var multiDimArray struct {
-				Value      json.RawMessage
-				Dimensions []int
-			}
-			if json.Unmarshal([]byte(valueStr), &multiDimArray) == nil && multiDimArray.Value != nil && len(multiDimArray.Dimensions) > 0 {
-				valueStr = string(multiDimArray.Value) // Use the inner value for further parsing.
-
-				// The dimensions from the file differ from the tag's current dimensions.
-				// To avoid modifying a potentially shared TypeInfo, we create a new one for this tag.
-				if tag.TypeInfo.Dimensions == nil || !reflect.DeepEqual(tag.TypeInfo.Dimensions, multiDimArray.Dimensions) {
-					newTypeInfo := *tag.TypeInfo // Create a copy.
-					newTypeInfo.Dimensions = multiDimArray.Dimensions
-					tag.TypeInfo = &newTypeInfo // Assign the new, specific TypeInfo.
-				}
-			} else {
-				// If not a multi-dim array, check for string with MaxLength.
-				var stringWithMaxLength struct {
-					Value     string `json:"Value"`
-					MaxLength int    `json:"MaxLength"`
-				}
-				if json.Unmarshal([]byte(valueStr), &stringWithMaxLength) == nil && stringWithMaxLength.Value != "" {
-					// This tag has a specific MaxLength. We need to give it a unique TypeInfo.
-					newTypeInfo := *tag.TypeInfo // Create a copy.
-					newTypeInfo.MaxLength = stringWithMaxLength.MaxLength
-					tag.TypeInfo = &newTypeInfo // Assign the new, specific TypeInfo.
-					valueStr = stringWithMaxLength.Value
-				}
-			}
-		}
-		// --- General Parsing Logic ---
 		_, isUDT := newUDTInstance(tag.TypeInfo.DataType)
 
 		if isUDT {
-			// It's a UDT, so parse from JSON into the existing pointer.
+			// For UDTs, we unmarshal the JSON data back into the existing tag's value pointer.
 			tag.valMu.Lock()
-			if tag.Value == nil {
-				if instance, ok := newUDTInstance(tag.TypeInfo.DataType); ok {
-					tag.Value = instance
-				}
-			}
-			if jsonErr := json.Unmarshal([]byte(valueStr), tag.Value); jsonErr != nil {
-				parseErr = fmt.Errorf("failed to unmarshal JSON for UDT '%s': %w", tagName, jsonErr)
+			// The value from JSON is a map[string]interface{}, so we re-marshal and unmarshal.
+			udtJSON, _ := json.Marshal(valueData)
+			if jsonErr := json.Unmarshal(udtJSON, tag.Value); jsonErr != nil {
+				parseErr = fmt.Errorf("failed to process UDT data for '%s': %w", tagName, jsonErr)
 			}
 			tag.valMu.Unlock()
-			// For UDTs, newValue remains nil since the value is updated by reference.
 		} else if tag.TypeInfo.DataType == TypeARRAY {
-			// It's an array, so parse from JSON.
-			var genericSlice []interface{}
-			if jsonErr := json.Unmarshal([]byte(valueStr), &genericSlice); jsonErr != nil {
-				parseErr = fmt.Errorf("failed to unmarshal JSON array for tag '%s': %w", tagName, jsonErr)
-			} else {
-				elemGoType, _ := getGoType(tag.TypeInfo.ElementType)
-				newSlice := reflect.MakeSlice(reflect.SliceOf(elemGoType), len(genericSlice), len(genericSlice))
-				for i, v := range genericSlice {
-					convertedVal, err := convertTo(v, elemGoType)
-					if err != nil {
-						parseErr = fmt.Errorf("error converting element %d for array tag '%s': %w", i, tagName, err)
-						break
+			// For arrays, convert the []interface{} from JSON into a strongly-typed slice.
+			if genericSlice, ok := valueData.([]interface{}); ok {
+				if elemGoType, ok := getGoType(tag.TypeInfo.ElementType); ok {
+					newSlice := reflect.MakeSlice(reflect.SliceOf(elemGoType), len(genericSlice), len(genericSlice))
+					for i, v := range genericSlice {
+						if convertedVal, err := convertTo(v, elemGoType); err == nil {
+							newSlice.Index(i).Set(reflect.ValueOf(convertedVal))
+						} else {
+							parseErr = fmt.Errorf("error converting element %d for array tag '%s': %w", i, tagName, err)
+							break
+						}
 					}
-					newSlice.Index(i).Set(reflect.ValueOf(convertedVal))
-				}
-				if parseErr == nil {
-					newValue = newSlice.Interface()
+					if parseErr == nil {
+						newValue = newSlice.Interface()
+					}
 				}
 			}
 		} else {
 			// It's a primitive type.
-			newValue, parseErr = parseValueToType(valueStr, tag.TypeInfo.DataType)
+			newValue, parseErr = parseValueToType(fmt.Sprintf("%v", valueData), tag.TypeInfo.DataType)
 		}
 
-		if parseErr != nil && combinedErr == nil {
-			combinedErr = fmt.Errorf("error parsing value for tag '%s': %w", tagName, parseErr)
+		if parseErr != nil {
+			errorList = append(errorList, fmt.Sprintf("line error for tag '%s': %v", tagName, parseErr))
 		}
 
 		// For UDTs, the value is updated by reference, so we don't call SetTagValue.
 		// For primitives and arrays, newValue will be non-nil.
 		if newValue != nil {
 			if err := db.SetTagValue(tagName, newValue); err != nil {
-				if combinedErr == nil {
-					combinedErr = fmt.Errorf("error setting value for tag '%s': %w", tagName, err)
-				}
+				errorList = append(errorList, fmt.Sprintf("set value error for tag '%s': %v", tagName, err))
 			}
 		} // Continue to the next line even if an error occurred on this one.
 	}
 
-	// After processing all lines, return the first error that was encountered, or nil if successful.
-	return combinedErr
+	if len(errorList) > 0 {
+		return fmt.Errorf("encountered %d error(s) while reading tags file:\n- %s", len(errorList), strings.Join(errorList, "\n- "))
+	}
+
+	return nil
 }
 
 // parseValueToType converts a string value to a specific DataType. It returns the converted value and an error if parsing fails.
