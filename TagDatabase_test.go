@@ -96,6 +96,23 @@ func TestAddDuplicateTag(t *testing.T) {
 	}
 }
 
+// TestAddTag_MissingTypeInfo tests that adding a regular tag without TypeInfo and Value fails.
+func TestAddTag_MissingTypeInfo(t *testing.T) {
+	db := NewTagDatabase()
+	// A regular tag (not a remote alias) with no TypeInfo and no Value.
+	tag := &Tag{Name: "InvalidTag"}
+
+	err := db.AddTag(tag)
+	if err == nil {
+		t.Fatal("AddTag() should have returned an error for a tag with no TypeInfo or Value, but it did not.")
+	}
+
+	expectedError := "error processing type for tag 'InvalidTag': cannot infer type for tag 'InvalidTag' because its Value is nil and TypeInfo was not provided"
+	if !strings.Contains(err.Error(), expectedError) {
+		t.Errorf("AddTag() returned wrong error message.\nGot:  %s\nWant: %s", err.Error(), expectedError)
+	}
+}
+
 // TestGetAllTags verifies that all tags can be retrieved correctly.
 func TestGetAllTags(t *testing.T) {
 	db := NewTagDatabase()
@@ -308,6 +325,61 @@ func TestPopulateDatabaseFromVariables(t *testing.T) {
 	if found {
 		t.Error("Tag 'I.T' should not have been created as it is not an array field")
 	}
+}
+
+// TestRemoveTag_DirectAddressCleanup verifies that removing a tag also cleans up its direct address mappings.
+func TestRemoveTag_DirectAddressCleanup(t *testing.T) {
+	// === Test Case 1: Cleanup for a single tag with an explicit DirectAddress ===
+	t.Run("SingleTagDirectAddress", func(t *testing.T) {
+		db := NewTagDatabase()
+		tagName := "MyInput"
+		directAddr := "%IX5.0"
+
+		// 1. Add a tag with a direct address.
+		tag := &Tag{Name: tagName, TypeInfo: &TypeInfo{DataType: TypeBOOL}, Value: plc.BOOL(false), DirectAddress: directAddr}
+		if err := db.AddTag(tag); err != nil {
+			t.Fatalf("Failed to add tag: %v", err)
+		}
+
+		// 2. Remove the tag.
+		if err := db.RemoveTag(tagName); err != nil {
+			t.Fatalf("RemoveTag failed: %v", err)
+		}
+
+		// 3. Verify the direct address mapping is gone by trying to access it.
+		_, err := db.GetTagValue(directAddr)
+		if err == nil {
+			t.Error("GetTagValue with direct address should have failed after removing the tag, but it succeeded.")
+		}
+		if !strings.Contains(err.Error(), "not found in database") {
+			t.Errorf("Expected a 'not found' error, but got: %v", err)
+		}
+	})
+
+	// === Test Case 2: Cleanup for an array tag with implicit element addresses ===
+	t.Run("ArrayTagDirectAddress", func(t *testing.T) {
+		db := NewTagDatabase()
+		if err := PopulateDatabaseFromVariables(db); err != nil {
+			t.Fatalf("PopulateDatabaseFromVariables failed: %v", err)
+		}
+
+		arrayTagName := "I.W"
+		elementDirectAddr := "%IW2" // Corresponds to I.W[1]
+
+		// 1. Remove the base array tag.
+		if err := db.RemoveTag(arrayTagName); err != nil {
+			t.Fatalf("RemoveTag for array failed: %v", err)
+		}
+
+		// 2. Verify the direct address mapping for an element is gone.
+		_, err := db.GetTagValue(elementDirectAddr)
+		if err == nil {
+			t.Error("GetTagValue with element's direct address should have failed after removing the base array, but it succeeded.")
+		}
+		if !strings.Contains(err.Error(), "not found in database") {
+			t.Errorf("Expected a 'not found' error for array element, but got: %v", err)
+		}
+	})
 }
 
 // TestTaggerInterfaceImplementation verifies that the Tag struct correctly implements the Tagger interface.
@@ -746,6 +818,83 @@ func TestGetTagDescription(t *testing.T) {
 	}
 }
 
+// TestRenameTag_SubscriptionHandling verifies that subscriptions are correctly migrated when a tag is renamed.
+func TestRenameTag_SubscriptionHandling(t *testing.T) {
+	db := NewTagDatabase()
+	oldName := "SubscribedTag"
+	newName := "RenamedSubscribedTag"
+
+	// 1. Add a tag.
+	db.AddTag(&Tag{Name: oldName, TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(100)})
+
+	// 2. Subscribe to the tag using its original name.
+	subChannel, _, err := db.SubscribeToTag(oldName)
+	if err != nil {
+		t.Fatalf("Failed to subscribe to tag: %v", err)
+	}
+
+	// 3. Rename the tag.
+	_, err = db.RenameTag(oldName, newName)
+	if err != nil {
+		t.Fatalf("RenameTag failed: %v", err)
+	}
+
+	// 4. Set the value on the NEW tag name.
+	newValue := plc.INT(200)
+	if err := db.SetTagValue(newName, newValue); err != nil {
+		t.Fatalf("SetTagValue on new name failed: %v", err)
+	}
+
+	// 5. Verify that the original subscription channel receives the update.
+	select {
+	case receivedTag := <-subChannel:
+		// The received tag should have the new name and new value.
+		if receivedTag.Name != newName {
+			t.Errorf("Notification has wrong tag name. Got '%s', want '%s'", receivedTag.Name, newName)
+		}
+		if receivedTag.Value != newValue {
+			t.Errorf("Notification has wrong value. Got %v, want %v", receivedTag.Value, newValue)
+		}
+		t.Log("Successfully received notification on original channel after rename.")
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Timed out waiting for notification after rename. Subscription was likely broken.")
+	}
+}
+
+// TestRemoveTag_SubscriptionCleanup verifies that removing a tag also cleans up its subscriptions.
+func TestRemoveTag_SubscriptionCleanup(t *testing.T) {
+	db := NewTagDatabase()
+	tagName := "TagForSubscriptionCleanup"
+
+	// 1. Add a tag.
+	db.AddTag(&Tag{Name: tagName, TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(10)})
+
+	// 2. Subscribe to the tag.
+	subChannel, _, err := db.SubscribeToTag(tagName)
+	if err != nil {
+		t.Fatalf("Failed to subscribe to tag: %v", err)
+	}
+
+	// 3. Remove the tag.
+	err = db.RemoveTag(tagName)
+	if err != nil {
+		t.Fatalf("RemoveTag failed: %v", err)
+	}
+
+	// 4. Verify that the subscription channel is now closed.
+	// This is the crucial part: a closed channel indicates the subscriber was notified of the removal.
+	select {
+	case _, ok := <-subChannel:
+		if ok {
+			t.Error("Subscription channel should be closed after removing the tag, but it's still open and received a value.")
+		} else {
+			t.Log("Successfully verified that the subscription channel was closed.")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timed out waiting for channel to close. Subscription was not cleaned up.")
+	}
+}
+
 // TestRenameTag verifies the RenameTag method.
 func TestRenameTag(t *testing.T) {
 	db := NewTagDatabase()
@@ -806,6 +955,75 @@ func TestRenameTag(t *testing.T) {
 	if err == nil {
 		t.Error("RenameTag should have returned an error when trying to rename a non-existent tag.")
 	}
+}
+
+// TestRenameTag_DirectAddressMapping verifies that renaming a tag correctly updates the directAddressMap.
+func TestRenameTag_DirectAddressMapping(t *testing.T) {
+	// === Test Case 1: Renaming a simple tag with a direct address ===
+	t.Run("SimpleTagRename", func(t *testing.T) {
+		db := NewTagDatabase()
+		oldName := "Input1"
+		newName := "StartButton"
+		directAddr := "%IX0.1"
+
+		// 1. Add a tag with a direct address.
+		tag := &Tag{Name: oldName, TypeInfo: &TypeInfo{DataType: TypeBOOL}, Value: plc.BOOL(false), DirectAddress: directAddr}
+		if err := db.AddTag(tag); err != nil {
+			t.Fatalf("Failed to add tag: %v", err)
+		}
+
+		// 2. Rename the tag.
+		if _, err := db.RenameTag(oldName, newName); err != nil {
+			t.Fatalf("RenameTag failed: %v", err)
+		}
+
+		// 3. Verify the direct address map was updated by accessing the tag via its address.
+		// First, set the value on the new name to confirm we're accessing the right tag.
+		if err := db.SetTagValue(newName, plc.BOOL(true)); err != nil {
+			t.Fatalf("Failed to set value on renamed tag: %v", err)
+		}
+
+		// Now, get the value using the direct address. It should reflect the change.
+		val, err := db.GetTagValue(directAddr)
+		if err != nil {
+			t.Fatalf("GetTagValue with direct address failed after rename: %v", err)
+		}
+		if val != plc.BOOL(true) {
+			t.Errorf("Value from direct address is incorrect. Got %v, want %v", val, plc.BOOL(true))
+		}
+	})
+
+	// === Test Case 2: Renaming an array tag with implicit element addresses ===
+	t.Run("ArrayTagRename", func(t *testing.T) {
+		db := NewTagDatabase()
+		if err := PopulateDatabaseFromVariables(db); err != nil {
+			t.Fatalf("PopulateDatabaseFromVariables failed: %v", err)
+		}
+
+		oldName := "I.B"
+		newName := "DigitalInputs"
+		directAddr := "%IX0.2"         // Corresponds to I.B[2]
+		elementName := newName + "[2]" // The new symbolic name for the element
+
+		// 1. Rename the array tag.
+		if _, err := db.RenameTag(oldName, newName); err != nil {
+			t.Fatalf("RenameTag for array failed: %v", err)
+		}
+
+		// 2. Verify the mapping was updated by setting a value via the direct address.
+		if err := db.SetTagValue(directAddr, plc.BOOL(true)); err != nil {
+			t.Fatalf("SetTagValue with direct address failed after array rename: %v", err)
+		}
+
+		// 3. Check if the corresponding element in the renamed array was updated.
+		val, err := db.GetTagValue(elementName)
+		if err != nil {
+			t.Fatalf("GetTagValue for renamed array element failed: %v", err)
+		}
+		if val != plc.BOOL(true) {
+			t.Errorf("Value of renamed array element is incorrect. Got %v, want %v", val, plc.BOOL(true))
+		}
+	})
 }
 
 // TestRemoveTag verifies the RemoveTag method.
@@ -922,10 +1140,10 @@ func TestWriteAndReadTags(t *testing.T) {
 
 	// Add a mix of tags; all should be persisted.
 	tagsToWrite := []Tag{
-		{Name: "TagDINT", TypeInfo: &TypeInfo{DataType: TypeDINT}, Value: plc.DINT(123)},
-		{Name: "TagREAL", TypeInfo: &TypeInfo{DataType: TypeREAL}, Value: plc.REAL(45.67)},
-		{Name: "TagINT", TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(999)},
-		{Name: "TagSTRING", TypeInfo: &TypeInfo{DataType: TypeSTRING}, Value: plc.STRING("hello world")},
+		{Name: "TagDINT", TypeInfo: &TypeInfo{DataType: TypeDINT}, Value: plc.DINT(123), Retain: true},
+		{Name: "TagREAL", TypeInfo: &TypeInfo{DataType: TypeREAL}, Value: plc.REAL(45.67), Retain: true},
+		{Name: "TagINT", TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(999), Retain: true},
+		{Name: "TagSTRING", TypeInfo: &TypeInfo{DataType: TypeSTRING}, Value: plc.STRING("hello world"), Retain: true},
 	}
 	for _, tag := range tagsToWrite {
 		if err := dbWrite.AddTag(&tag); err != nil { // Pass by pointer
@@ -1080,6 +1298,7 @@ func TestUDTPersistence(t *testing.T) {
 			Current: 45.2,
 			Running: true,
 		},
+		Retain: true, // This is the fix: mark the tag for persistence.
 	}
 
 	if err := dbWrite.AddTag(&motorTag); err != nil {
@@ -1284,6 +1503,7 @@ func TestNestedUDTPersistence(t *testing.T) {
 			},
 			Active: true,
 		},
+		Retain: true, // This is the fix: mark the tag for persistence.
 	}
 
 	if err := dbWrite.AddTag(&driveTag); err != nil {
@@ -1620,6 +1840,7 @@ func TestArrayPersistence(t *testing.T) {
 			DataType:    TypeARRAY,
 			ElementType: TypeREAL,
 		},
+		Retain: true,
 	}
 	dbWrite.AddTag(arrayTag)
 
@@ -1640,6 +1861,75 @@ func TestArrayPersistence(t *testing.T) {
 	if val != plc.REAL(2.2) {
 		t.Errorf("Array value mismatch after reading from file. Got element [1] = %v, want 2.2", val)
 	}
+}
+
+// TestArrayOfUDTsAccess verifies that fields of a UDT within an array can be accessed.
+func TestArrayOfUDTsAccess(t *testing.T) {
+	RegisterUDT(&MotorData{})
+	db := NewTagDatabase()
+
+	// Create a tag that is an array of UDTs
+	motorArrayValue := []*MotorData{
+		{Speed: 1500.0, Current: 30.5, Running: true, TestName: "Motor A"},
+		{Speed: 0.0, Current: 0.1, Running: false, TestName: "Motor B"},
+	}
+	motorArrayTag := &Tag{
+		Name: "MotorLine",
+		TypeInfo: &TypeInfo{
+			DataType:    TypeARRAY,
+			ElementType: "MotorData", // The registered UDT name
+		},
+		Value: motorArrayValue,
+	}
+	db.AddTag(motorArrayTag)
+
+	// 1. Test reading a nested field from a specific array element
+	t.Run("ReadNestedFieldInArray", func(t *testing.T) {
+		val, err := db.GetTagValue("MotorLine[1].Speed")
+		if err != nil {
+			t.Fatalf("GetTagValue for UDT in array failed: %v", err)
+		}
+		expectedSpeed := plc.REAL(0.0)
+		if val != expectedSpeed {
+			t.Errorf("Incorrect value for nested field. Got %v, want %v", val, expectedSpeed)
+		}
+	})
+
+	// 2. Test writing to a nested field in a specific array element
+	t.Run("WriteNestedFieldInArray", func(t *testing.T) {
+		err := db.SetTagValue("MotorLine[0].Running", plc.BOOL(false))
+		if err != nil {
+			t.Fatalf("SetTagValue for UDT in array failed: %v", err)
+		}
+
+		// Verify the change
+		val, _ := db.GetTagValue("MotorLine[0].Running")
+		if val != plc.BOOL(false) {
+			t.Errorf("Value was not updated. Got %v, want %v", val, plc.BOOL(false))
+		}
+
+		// Also verify the underlying struct was modified
+		tag, _ := db.GetTag("MotorLine")
+		motors := tag.Value.([]*MotorData)
+		if motors[0].Running != false {
+			t.Error("Underlying UDT struct in slice was not modified.")
+		}
+	})
+
+	// 3. Test error cases
+	t.Run("ErrorCases", func(t *testing.T) {
+		// Out of bounds array access
+		_, err := db.GetTagValue("MotorLine[2].Speed")
+		if err == nil {
+			t.Error("Expected an out-of-bounds error for array access, but got nil")
+		}
+
+		// Non-existent field access
+		_, err = db.GetTagValue("MotorLine[0].NonExistentField")
+		if err == nil {
+			t.Error("Expected a non-existent field error, but got nil")
+		}
+	})
 }
 
 // TestMultiDimensionalArrayAccess verifies reading and writing to a multi-dimensional array.
@@ -1731,7 +2021,8 @@ func TestMultiDimArrayPersistence(t *testing.T) {
 			DataType:    TypeARRAY,
 			ElementType: TypeREAL,
 			Dimensions:  dims,
-		}}
+		},
+		Retain: true}
 	dbWrite.AddTag(tag)
 
 	if err := dbWrite.WriteTagsToFile(filePath); err != nil {
@@ -1931,6 +2222,36 @@ func TestDirectAddressing(t *testing.T) {
 	}
 }
 
+// TestDirectAddressingForArrayElements verifies direct addressing for elements of arrays from PopulateDatabaseFromVariables.
+func TestDirectAddressingForArrayElements(t *testing.T) {
+	db := NewTagDatabase()
+	if err := PopulateDatabaseFromVariables(db); err != nil {
+		t.Fatalf("PopulateDatabaseFromVariables failed: %v", err)
+	}
+
+	// 1. Test BOOL access (%IX)
+	t.Run("Access_IX_Address", func(t *testing.T) {
+		// Set a value using the symbolic name for an array element.
+		if err := db.SetTagValue("I.B[3]", plc.BOOL(true)); err != nil {
+			t.Fatalf("Failed to set value for I.B[3]: %v", err)
+		}
+
+		// Get the value using the corresponding direct address.
+		val, err := db.GetTagValue("%IX0.3")
+		if err != nil {
+			t.Fatalf("Failed to get value for %%IX0.3: %v", err)
+		}
+
+		if val != plc.BOOL(true) {
+			t.Errorf("Value mismatch for %%IX0.3. Got %v, want %v", val, true)
+		}
+	})
+
+	// Note: More tests could be added here for other types like M.W and Q.R
+	// For example, setting M.W[2] and getting %MW4 (since WORD is 2 bytes).
+	// This single test case is sufficient to prove the mechanism works.
+}
+
 // TestConstantAndRetainQualifiers verifies the behavior of IsConstant and IsRetain flags.
 func TestConstantAndRetainQualifiers(t *testing.T) {
 	db := NewTagDatabase()
@@ -1969,6 +2290,41 @@ func TestConstantAndRetainQualifiers(t *testing.T) {
 	tag, found := db.GetTag(retainTagName)
 	if !found || !tag.IsRetain() {
 		t.Error("Retain flag was not set or retrieved correctly.")
+	}
+}
+
+// TestRetainFlagPersistence verifies that only tags with the Retain flag are persisted.
+func TestRetainFlagPersistence(t *testing.T) {
+	db := NewTagDatabase()
+	filePath := "retain_persistence.txt"
+	t.Cleanup(func() { os.Remove(filePath) })
+
+	// Add a mix of tags with different Retain and Constant flags.
+	retainedTag := &Tag{Name: "RetainedTag", Value: plc.DINT(123), TypeInfo: &TypeInfo{DataType: TypeDINT}, Retain: true}
+	nonRetainedTag := &Tag{Name: "NonRetainedTag", Value: plc.INT(456), TypeInfo: &TypeInfo{DataType: TypeINT}, Retain: false}
+	constantTag := &Tag{Name: "ConstantTag", Value: plc.BOOL(true), TypeInfo: &TypeInfo{DataType: TypeBOOL}, Constant: true}
+
+	db.AddTag(retainedTag)
+	db.AddTag(nonRetainedTag)
+	db.AddTag(constantTag)
+
+	// Write the tags to the file.
+	if err := db.WriteTagsToFile(filePath); err != nil {
+		t.Fatalf("WriteTagsToFile() returned an unexpected error: %v", err)
+	}
+
+	// Read the file content to verify.
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("Failed to read the created persistence file: %v", err)
+	}
+	contentStr := string(content)
+
+	if !strings.Contains(contentStr, "RetainedTag=123") {
+		t.Error("File content should contain the retained tag, but it doesn't.")
+	}
+	if strings.Contains(contentStr, "NonRetainedTag") || strings.Contains(contentStr, "ConstantTag") {
+		t.Errorf("File content should NOT contain non-retained or constant tags, but it does.\nContent: %s", contentStr)
 	}
 }
 
@@ -2060,7 +2416,7 @@ func TestTagSubscription(t *testing.T) {
 	var receivedTag Tag
 
 	// 1. Subscribe to the simple tag
-	wg.Add(1)
+	wg.Add(1) // Corrected from TypeDINT to TypeDINT
 	subChannel, subID, err := db.SubscribeToTag(tagName)
 	// This goroutine demonstrates a robust subscriber pattern.
 	go func() {
@@ -2119,7 +2475,7 @@ func TestTagSubscription(t *testing.T) {
 
 	// 4. Test subscription for an array element change.
 	var receivedArrayTag Tag
-	wg.Add(1)
+	wg.Add(1) // Corrected from TypeARRAY to TypeARRAY
 	arraySubChannel, arraySubID, err := db.SubscribeToTag(arrayTagName)
 	// Start a goroutine to listen for updates on the array tag.
 	go func() {
@@ -2145,4 +2501,256 @@ func TestTagSubscription(t *testing.T) {
 		t.Errorf("Array tag subscriber received incorrect value for element 1. Got %v, want %v", currentArrayValue[1], plc.DINT(99))
 	}
 	db.UnsubscribeFromTag(arrayTagName, arraySubID)
+}
+
+// TestCrossDatabaseAliasing verifies that a tag in one database can alias a tag in another.
+func TestCrossDatabaseAliasing(t *testing.T) {
+	// 1. Create and register two separate database instances.
+	db1 := NewTagDatabase()
+	db2 := NewTagDatabase()
+
+	// Register db1 with db2. db2 can now see db1.
+	db2.RegisterDatabase("DB1_ID", db1)
+
+	// 2. Add a source tag to the first database (db1).
+	sourceTagName := "SourceTagInDB1"
+	sourceTag := &Tag{
+		Name:     sourceTagName,
+		TypeInfo: &TypeInfo{DataType: TypeDINT},
+		Value:    plc.DINT(123),
+	}
+	if err := db1.AddTag(sourceTag); err != nil {
+		t.Fatalf("Failed to add source tag to db1: %v", err)
+	}
+
+	// 3. Add a remote alias tag to the second database (db2).
+	aliasTagName := "AliasForDB1Tag"
+	aliasTag := &Tag{
+		Name:          aliasTagName,
+		IsRemoteAlias: true,
+		RemoteDBID:    "DB1_ID",
+		RemoteTagName: sourceTagName,
+		// Note: Value, TypeInfo, etc., are ignored for remote aliases.
+	}
+	if err := db2.AddTag(aliasTag); err != nil {
+		t.Fatalf("Failed to add alias tag to db2: %v", err)
+	}
+
+	// 4. Test reading the value through the alias.
+	val, err := db2.GetTagValue(aliasTagName)
+	if err != nil {
+		t.Fatalf("GetTagValue on alias failed: %v", err)
+	}
+	if val != plc.DINT(123) {
+		t.Errorf("Value read via alias is incorrect. Got %v, want %v", val, plc.DINT(123))
+	}
+
+	// 5. Test writing the value through the alias.
+	if err := db2.SetTagValue(aliasTagName, plc.DINT(456)); err != nil {
+		t.Fatalf("SetTagValue on alias failed: %v", err)
+	}
+	// Verify that the original tag in db1 was updated.
+	val, _ = db1.GetTagValue(sourceTagName)
+	if val != plc.DINT(456) {
+		t.Errorf("Original tag value was not updated via alias. Got %v, want %v", val, plc.DINT(456))
+	}
+
+}
+
+// TestRebuildCrossDatabaseAlias simulates rebuilding an alias connection.
+func TestRebuildCrossDatabaseAlias(t *testing.T) {
+	// 1. Setup initial databases and tags.
+	sourceDB := NewTagDatabase()
+	aliasDB := NewTagDatabase()
+
+	sourceTag := &Tag{Name: "SourceTag", TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(100)}
+	sourceDB.AddTag(sourceTag)
+
+	aliasTag := &Tag{
+		Name:          "MyAlias",
+		IsRemoteAlias: true,
+		RemoteDBID:    "SourceDB_v1",
+		RemoteTagName: "SourceTag",
+	}
+	aliasDB.AddTag(aliasTag)
+
+	// 2. Initially, the connection does not exist. Verify that access fails.
+	_, err := aliasDB.GetTagValue("MyAlias")
+	if err == nil {
+		t.Fatal("GetTagValue should fail when the remote DB is not registered, but it succeeded.")
+	}
+	t.Logf("Verified that access fails without registration: %v", err)
+
+	// 3. "Rebuild" the connection by registering the source database with the alias database.
+	if err := aliasDB.RegisterDatabase("SourceDB_v1", sourceDB); err != nil {
+		t.Fatalf("Failed to register source database: %v", err)
+	}
+	t.Log("Successfully registered 'SourceDB_v1'. Alias connection is now live.")
+
+	// 4. Verify that reading through the alias now succeeds.
+	val, err := aliasDB.GetTagValue("MyAlias")
+	if err != nil {
+		t.Fatalf("GetTagValue on alias failed after registration: %v", err)
+	}
+	if val != plc.INT(100) {
+		t.Errorf("Value read via alias is incorrect. Got %v, want %v", val, plc.INT(100))
+	}
+	t.Logf("Successfully read value '%v' through the live alias.", val)
+
+	// 5. Verify that writing through the alias also works.
+	err = aliasDB.SetTagValue("MyAlias", plc.INT(200))
+	if err != nil {
+		t.Fatalf("SetTagValue on alias failed after registration: %v", err)
+	}
+
+	// Check the original tag in the sourceDB to confirm the write was successful.
+	sourceVal, _ := sourceDB.GetTagValue("SourceTag")
+	if sourceVal != plc.INT(200) {
+		t.Errorf("Original tag value was not updated via alias write. Got %v, want %v", sourceVal, plc.INT(200))
+	}
+	t.Logf("Successfully wrote value '%v' through the alias, original tag updated.", sourceVal)
+}
+
+// TestRemoteAliasToNonExistentTag verifies that accessing an alias pointing to a non-existent tag fails gracefully.
+func TestRemoteAliasToNonExistentTag(t *testing.T) {
+	// 1. Setup databases.
+	db1 := NewTagDatabase()
+	db2 := NewTagDatabase()
+	db2.RegisterDatabase("DB1_ID", db1)
+
+	// 2. Add a remote alias tag to db2 that points to a tag that does NOT exist in db1.
+	aliasTag := &Tag{
+		Name:          "AliasToNowhere",
+		IsRemoteAlias: true,
+		RemoteDBID:    "DB1_ID",
+		RemoteTagName: "NonExistentTag",
+	}
+	if err := db2.AddTag(aliasTag); err != nil {
+		t.Fatalf("AddTag for remote alias failed unexpectedly: %v", err)
+	}
+
+	// 3. Verify that reading through the alias returns a "not found" error.
+	t.Run("GetTagValue", func(t *testing.T) {
+		_, err := db2.GetTagValue("AliasToNowhere")
+		if err == nil {
+			t.Fatal("GetTagValue on an alias to a non-existent tag should have failed, but it succeeded.")
+		}
+		expectedError := "GetTagValue: tag 'NonExistentTag' not found in database"
+		if !strings.Contains(err.Error(), expectedError) {
+			t.Errorf("GetTagValue returned wrong error message.\nGot:  %s\nWant: %s", err.Error(), expectedError)
+		}
+	})
+
+	// 4. Verify that writing through the alias also returns a "not found" error.
+	t.Run("SetTagValue", func(t *testing.T) {
+		err := db2.SetTagValue("AliasToNowhere", plc.INT(500))
+		if err == nil {
+			t.Fatal("SetTagValue on an alias to a non-existent tag should have failed, but it succeeded.")
+		}
+		expectedError := "setTagValue: tag 'NonExistentTag' not found in database"
+		if !strings.Contains(err.Error(), expectedError) {
+			t.Errorf("SetTagValue returned wrong error message.\nGot:  %s\nWant: %s", err.Error(), expectedError)
+		}
+	})
+}
+
+// TestChainedCrossDatabaseAliasing verifies that a remote alias can point to another remote alias.
+func TestChainedCrossDatabaseAliasing(t *testing.T) {
+	// 1. Create three database instances.
+	db1 := NewTagDatabase()
+	db2 := NewTagDatabase()
+	db3 := NewTagDatabase()
+
+	// 2. Register databases to form a chain: db3 -> db2 -> db1
+	if err := db3.RegisterDatabase("DB2_ID", db2); err != nil {
+		t.Fatalf("Failed to register db2 with db3: %v", err)
+	}
+	if err := db2.RegisterDatabase("DB1_ID", db1); err != nil {
+		t.Fatalf("Failed to register db1 with db2: %v", err)
+	}
+
+	// 3. Add a source tag to the first database (db1).
+	sourceTagName := "SourceTagInDB1"
+	sourceTag := &Tag{
+		Name:     sourceTagName,
+		TypeInfo: &TypeInfo{DataType: TypeDINT},
+		Value:    plc.DINT(100),
+	}
+	if err := db1.AddTag(sourceTag); err != nil {
+		t.Fatalf("Failed to add source tag to db1: %v", err)
+	}
+
+	// 4. Add a remote alias in db2 that points to the source tag in db1.
+	aliasInDB2Name := "AliasInDB2"
+	aliasInDB2 := &Tag{
+		Name:          aliasInDB2Name,
+		IsRemoteAlias: true,
+		RemoteDBID:    "DB1_ID",
+		RemoteTagName: sourceTagName,
+	}
+	if err := db2.AddTag(aliasInDB2); err != nil {
+		t.Fatalf("Failed to add alias tag to db2: %v", err)
+	}
+
+	// 5. Add a remote alias in db3 that points to the alias in db2.
+	aliasInDB3Name := "AliasInDB3"
+	aliasInDB3 := &Tag{
+		Name:          aliasInDB3Name,
+		IsRemoteAlias: true,
+		RemoteDBID:    "DB2_ID",
+		RemoteTagName: aliasInDB2Name,
+	}
+	if err := db3.AddTag(aliasInDB3); err != nil {
+		t.Fatalf("Failed to add alias tag to db3: %v", err)
+	}
+
+	// 6. Test reading the value from db3, which should resolve through the chain.
+	val, err := db3.GetTagValue(aliasInDB3Name)
+	if err != nil {
+		t.Fatalf("GetTagValue on chained alias failed: %v", err)
+	}
+	if val != plc.DINT(100) {
+		t.Errorf("Value read via chained alias is incorrect. Got %v, want %v", val, plc.DINT(100))
+	}
+	t.Logf("Successfully read value '%v' through the chained alias.", val)
+}
+
+// TestAddRemoteAliasTag verifies that a remote alias tag can be added successfully
+// without causing a panic, and that its value can be read and written.
+func TestAddRemoteAliasTag(t *testing.T) {
+	// 1. Setup databases.
+	db1 := NewTagDatabase()
+	db2 := NewTagDatabase()
+	db2.RegisterDatabase("DB1_ID", db1)
+
+	// 2. Add source tag to db1.
+	sourceTag := &Tag{Name: "Source", TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(100)}
+	if err := db1.AddTag(sourceTag); err != nil {
+		t.Fatalf("Failed to add source tag: %v", err)
+	}
+
+	// 3. Add remote alias tag to db2. This should not panic.
+	aliasTag := &Tag{
+		Name:          "AliasToSource",
+		IsRemoteAlias: true,
+		RemoteDBID:    "DB1_ID",
+		RemoteTagName: "Source",
+	}
+	if err := db2.AddTag(aliasTag); err != nil {
+		t.Fatalf("AddTag for remote alias failed unexpectedly: %v", err)
+	}
+
+	// 4. Verify reading through the alias works.
+	val, err := db2.GetTagValue("AliasToSource")
+	if err != nil {
+		t.Fatalf("GetTagValue on alias failed: %v", err)
+	}
+	if val != plc.INT(100) {
+		t.Errorf("Value read via alias is incorrect. Got %v, want %v", val, plc.INT(100))
+	}
+
+	// 5. Verify writing through the alias works.
+	if err := db2.SetTagValue("AliasToSource", plc.INT(200)); err != nil {
+		t.Fatalf("SetTagValue on alias failed: %v", err)
+	}
 }

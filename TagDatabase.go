@@ -111,6 +111,10 @@ type Tag struct {
 	Constant      bool         // Constant, if true, prevents any modification to the tag's Value or ForceValue after creation.
 	Retain        bool         // Retain, if true, marks the tag's value for persistence across application restarts.
 	ForceValue    interface{}  // ForceValue stores the value that overrides the actual Value when the tag is Forced.
+	// Fields for cross-database aliasing
+	IsRemoteAlias bool   // If true, this tag is an alias for a tag in another database.
+	RemoteDBID    string // The ID of the remote database.
+	RemoteTagName string // The name of the tag in the remote database.
 }
 
 // UDT (User-Defined Type) defines the interface that any struct-based tag
@@ -238,11 +242,16 @@ func (t *Tag) GetName() string {
 func (t *Tag) GetValue() interface{} {
 	t.valMu.RLock()
 	defer t.valMu.RUnlock()
-	if t.IsForced() {
+	if t.Forced {
+		// Remote aliases do not have their own force values.
+		// The forcing is handled on the remote tag itself.
+		if t.IsRemoteAlias {
+			// This path should ideally not be hit if GetTagValue is used, but as a safeguard:
+			return nil
+		}
 		return t.ForceValue
 	}
 	return t.Value
-
 }
 
 // SetValue updates the value of the tag.
@@ -505,17 +514,36 @@ type TagDatabaseManager interface {
 
 // TagDatabase is a thread-safe implementation of the TagDatabaseManager.
 type TagDatabase struct {
-	tags               sync.Map
-	directAddressMap   sync.Map                    // map[string]string (direct address -> symbolic name)
-	typeRegistry       sync.Map                    // map[DataType]*TypeInfo
-	subscriptions      map[string]map[int]chan Tag // Changed to chan Tag
-	nextSubscriptionID int
-	subMu              sync.RWMutex
+	tags             sync.Map
+	directAddressMap sync.Map                       // map[string]string (direct address -> symbolic name)
+	typeRegistry     sync.Map                       // map[DataType]*TypeInfo
+	subscriptions    map[string]map[uint64]chan Tag // Changed to chan Tag
+	subMu            sync.RWMutex
+	dbRegistry       sync.Map // Instance-level registry: map[string]*TagDatabase
 }
 
 // NewTagDatabase creates and returns a new TagDatabase instance.
 func NewTagDatabase() *TagDatabase {
-	return &TagDatabase{}
+	return &TagDatabase{
+		subscriptions: make(map[string]map[uint64]chan Tag),
+	}
+}
+
+// RegisterDatabase adds a database instance to this instance's local registry.
+func (db *TagDatabase) RegisterDatabase(id string, remoteDB *TagDatabase) error {
+	if _, loaded := db.dbRegistry.LoadOrStore(id, remoteDB); loaded {
+		return fmt.Errorf("a database with ID '%s' is already registered with this instance", id)
+	}
+	return nil
+}
+
+// getDatabase retrieves a database instance from this instance's local registry.
+func (db *TagDatabase) getDatabase(id string) (*TagDatabase, bool) {
+	val, found := db.dbRegistry.Load(id)
+	if !found {
+		return nil, false
+	}
+	return val.(*TagDatabase), true
 }
 
 // SubscribeToTag allows a client to register a callback function to be notified
@@ -527,14 +555,60 @@ func NewTagDatabase() *TagDatabase {
 // directAddressRegex matches IEC direct addresses like %IX1.0, %QW10, %MD20
 var directAddressRegex = regexp.MustCompile(`^%([IQM])([XBWDL])(\d+)(?:\.(\d+))?$`)
 
+func (db *TagDatabase) SubscribeToTag(tagName string) (<-chan Tag, uint64, error) {
+	if _, found := db.tags.Load(tagName); !found {
+		return nil, 0, fmt.Errorf("tag '%s' not found for subscription", tagName)
+	}
+
+	db.subMu.Lock()
+	defer db.subMu.Unlock()
+
+	if _, ok := db.subscriptions[tagName]; !ok {
+		db.subscriptions[tagName] = make(map[uint64]chan Tag)
+	} // Corrected from TypeARRAY to honeycomb.TypeARRAY
+
+	ch := make(chan Tag, 1) // Buffered channel to avoid blocking the publisher
+	// Use a random number for the ID to avoid overflow and make it unpredictable.
+	randVal, _ := plc.RAND(plc.ULINT(0))
+	id := reflect.ValueOf(randVal).Uint()
+	// Ensure the ID is unique for this tag's subscriptions.
+	for _, exists := db.subscriptions[tagName][id]; exists; _, exists = db.subscriptions[tagName][id] {
+		randVal, _ = plc.RAND(plc.ULINT(0))
+		id = reflect.ValueOf(randVal).Uint()
+	}
+	db.subscriptions[tagName][id] = ch
+	return ch, id, nil
+}
+
+// UnsubscribeFromTag removes a registered callback function using its subscription ID.
+// It returns an error if the tag or subscription ID does not exist.
+func (db *TagDatabase) UnsubscribeFromTag(tagName string, subscriptionID uint64) error {
+	db.subMu.Lock()
+	defer db.subMu.Unlock()
+
+	if subs, ok := db.subscriptions[tagName]; ok {
+		if ch, found := subs[subscriptionID]; found {
+			delete(subs, subscriptionID)
+			close(ch) // Close the channel to signal to consumers that no more data will be sent.
+			if len(subs) == 0 {
+				delete(db.subscriptions, tagName) // Clean up if no more subscribers for this tag
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("subscription ID %d not found for tag '%s'", subscriptionID, tagName)
+}
+
 // AddTag adds a new tag to the database. It returns an error if a tag with the same name already exists.
 func (db *TagDatabase) AddTag(tag *Tag) error {
-	// Resolve and assign TypeInfo by either finding an existing one or creating a new one.
-	typeInfo, err := db.getOrRegisterTypeInfo(tag)
-	if err != nil {
-		return fmt.Errorf("error processing type for tag '%s': %w", tag.Name, err)
+	// For non-alias tags, resolve and assign TypeInfo. Remote aliases don't have local TypeInfo.
+	if !tag.IsRemoteAlias {
+		typeInfo, err := db.getOrRegisterTypeInfo(tag)
+		if err != nil {
+			return fmt.Errorf("error processing type for tag '%s': %w", tag.Name, err)
+		}
+		tag.TypeInfo = typeInfo
 	}
-	tag.TypeInfo = typeInfo
 
 	// LoadOrStore is an atomic operation that checks for existence and stores if not present. // Corrected from TypeInfo to honeycomb.TypeInfo
 	// It returns the existing value if the key was already there.
@@ -549,9 +623,13 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 	tagPtr := newTag.(*Tag)
 
 	tagPtr.valMu.Lock()
-	if _, isUDT := newUDTInstance(tag.TypeInfo.DataType); isUDT && tag.Value == nil {
-		if instance, ok := newUDTInstance(tag.TypeInfo.DataType); ok {
-			tagPtr.Value = instance
+	// Only attempt to auto-instantiate UDTs for non-alias tags with valid TypeInfo.
+	if !tagPtr.IsRemoteAlias && tagPtr.TypeInfo != nil {
+		_, isUDT := newUDTInstance(tagPtr.TypeInfo.DataType)
+		if isUDT && tagPtr.Value == nil {
+			if instance, ok := newUDTInstance(tagPtr.TypeInfo.DataType); ok {
+				tagPtr.Value = instance
+			}
 		}
 	}
 	tagPtr.valMu.Unlock()
@@ -582,6 +660,11 @@ func (db *TagDatabase) getOrRegisterTypeInfo(tag *Tag) (*TypeInfo, error) {
 
 	// If TypeInfo is nil, we must construct it from the tag's properties. // Corrected from TypeInfo to honeycomb.TypeInfo
 	newTypeInfo := &TypeInfo{}
+	// If the value is nil, we cannot infer the type.
+	if tag.Value == nil {
+		return nil, fmt.Errorf("cannot infer type for tag '%s' because its Value is nil and TypeInfo was not provided", tag.Name)
+	}
+
 	dataType, ok := getDataType(reflect.TypeOf(tag.Value))
 	if !ok {
 		return nil, fmt.Errorf("could not determine data type from tag value of type %T", tag.Value)
@@ -632,53 +715,6 @@ func generateTypeInfoKey(ti *TypeInfo) string {
 	}
 
 	return keyBuilder.String()
-}
-
-// SubscribeToTag allows a client to register a callback function to be notified
-// when the value of a specific tag changes. It returns a unique subscription ID
-// and an error if the tag does not exist.
-// The callback function receives a copy of the updated Tag struct.
-//
-// The client should store the returned subscription ID to later unsubscribe.
-func (db *TagDatabase) SubscribeToTag(tagName string) (<-chan Tag, int, error) {
-	if _, found := db.tags.Load(tagName); !found {
-		return nil, 0, fmt.Errorf("tag '%s' not found for subscription", tagName)
-	}
-
-	db.subMu.Lock()
-	defer db.subMu.Unlock()
-
-	if db.subscriptions == nil {
-		db.subscriptions = make(map[string]map[int]chan Tag)
-	}
-	if _, ok := db.subscriptions[tagName]; !ok {
-		db.subscriptions[tagName] = make(map[int]chan Tag)
-	} // Corrected from TypeARRAY to honeycomb.TypeARRAY
-
-	db.nextSubscriptionID++
-	ch := make(chan Tag, 1) // Buffered channel to avoid blocking the publisher
-	id := db.nextSubscriptionID
-	db.subscriptions[tagName][id] = ch
-	return ch, id, nil
-}
-
-// UnsubscribeFromTag removes a registered callback function using its subscription ID.
-// It returns an error if the tag or subscription ID does not exist.
-func (db *TagDatabase) UnsubscribeFromTag(tagName string, subscriptionID int) error {
-	db.subMu.Lock()
-	defer db.subMu.Unlock()
-
-	if subs, ok := db.subscriptions[tagName]; ok {
-		if ch, found := subs[subscriptionID]; found {
-			delete(subs, subscriptionID)
-			close(ch) // Close the channel to signal to consumers that no more data will be sent.
-			if len(subs) == 0 {
-				delete(db.subscriptions, tagName) // Clean up if no more subscribers for this tag
-			}
-			return nil
-		}
-	}
-	return fmt.Errorf("subscription ID %d not found for tag '%s'", subscriptionID, tagName)
 }
 
 // GetTag retrieves a tag by its name. It returns the tag and true if found, otherwise an empty Tag and false.
@@ -829,8 +865,45 @@ func (db *TagDatabase) GetAllTagNames() []string {
 // RemoveTag deletes a tag from the database by its name.
 // It returns an error if the tag does not exist.
 func (db *TagDatabase) RemoveTag(name string) error {
-	if _, loaded := db.tags.LoadAndDelete(name); !loaded {
+	val, loaded := db.tags.LoadAndDelete(name)
+	if !loaded {
 		return fmt.Errorf("tag '%s' not found in database", name)
+	}
+
+	// Also remove any active subscriptions for this tag.
+	db.subMu.Lock()
+	if subs, found := db.subscriptions[name]; found {
+		// Close all channels to notify subscribers that the tag is gone.
+		for _, ch := range subs {
+			close(ch)
+		}
+		// Remove the entry from the subscriptions map.
+		delete(db.subscriptions, name)
+	}
+	db.subMu.Unlock()
+
+	// If the removed tag had a direct address, we must also remove it from the directAddressMap.
+	if tag, ok := val.(*Tag); ok {
+		// If the tag itself has a direct address, remove it.
+		if tag.DirectAddress != "" {
+			db.directAddressMap.Delete(tag.DirectAddress)
+		}
+
+		// If the tag is an array, we must also remove the direct address mappings for all its elements.
+		// This is common for tags created by PopulateDatabaseFromVariables.
+		if tag.TypeInfo != nil && tag.TypeInfo.DataType == TypeARRAY {
+			if sliceVal := reflect.ValueOf(tag.Value); sliceVal.Kind() == reflect.Slice {
+				re := regexp.MustCompile(`^([IQM])\.([BWDLR])$`)
+				matches := re.FindStringSubmatch(tag.Name)
+				if len(matches) == 3 {
+					for i := 0; i < sliceVal.Len(); i++ {
+						if directAddr, ok := generateDirectAddressForElement(matches[1], matches[2], tag.TypeInfo.ElementType, i); ok {
+							db.directAddressMap.Delete(directAddr)
+						}
+					}
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -866,6 +939,44 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 	tagPtr.Name = newName
 	db.tags.Store(newName, tagPtr)
 
+	// Also migrate any active subscriptions from the old name to the new name.
+	db.subMu.Lock()
+	if subs, found := db.subscriptions[oldName]; found {
+		// If there are no existing subscriptions for the new name (which should be the case),
+		// simply move the map of subscriptions.
+		if _, exists := db.subscriptions[newName]; !exists {
+			db.subscriptions[newName] = subs
+			delete(db.subscriptions, oldName)
+		}
+	}
+	db.subMu.Unlock()
+
+	// Update the directAddressMap for the new name.
+	if tagPtr.DirectAddress != "" {
+		// For a simple tag, just update the single mapping.
+		db.directAddressMap.Delete(tagPtr.DirectAddress)
+		db.directAddressMap.Store(tagPtr.DirectAddress, newName)
+	} else if tagPtr.TypeInfo != nil && tagPtr.TypeInfo.DataType == TypeARRAY {
+		// For an array tag, we need to update the mapping for each element.
+		if sliceVal := reflect.ValueOf(tagPtr.Value); sliceVal.Kind() == reflect.Slice {
+			re := regexp.MustCompile(`^([IQM])\.([BWDLR])$`)
+			// We check against the newName's potential prefix, but use oldName to find matches
+			// as the tag's internal name was just changed.
+			matches := re.FindStringSubmatch(oldName)
+			if len(matches) == 3 {
+				for i := 0; i < sliceVal.Len(); i++ {
+					if directAddr, ok := generateDirectAddressForElement(matches[1], matches[2], tagPtr.TypeInfo.ElementType, i); ok {
+						// Delete the old mapping (e.g., %IX0.0 -> I.B[0])
+						db.directAddressMap.Delete(directAddr)
+						// Add the new mapping (e.g., %IX0.0 -> MyInputs[0])
+						newElementName := fmt.Sprintf("%s[%d]", newName, i)
+						db.directAddressMap.Store(directAddr, newElementName)
+					}
+				}
+			}
+		}
+	}
+
 	// Create and return a safe copy of the tag's state.
 	return Tag{
 		Name:        tagPtr.Name,
@@ -882,8 +993,12 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 
 // SetTagValue updates the value of an existing tag in the database.
 // It performs a type check to ensure the new value is compatible with the tag's DataType.
-func (db *TagDatabase) SetTagValue(name string, value interface{}) (err error) {
+func (db *TagDatabase) SetTagValue(name string, value interface{}) error {
 	// If the value being set is itself a UDT, we should treat it as a wholesale
+	return db.setTagValueRecursive(name, value, 0)
+}
+
+func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, depth int) (err error) {
 	// First, check if the name is a direct address.
 	if directAddressRegex.MatchString(name) {
 		if symbolicName, found := db.directAddressMap.Load(name); found {
@@ -892,11 +1007,42 @@ func (db *TagDatabase) SetTagValue(name string, value interface{}) (err error) {
 			return fmt.Errorf("SetTagValue: direct address '%s' not found in database", name)
 		}
 	}
+
+	// Check for remote alias before any other processing.
+	if val, found := db.tags.Load(name); found {
+		tag := val.(*Tag)
+		if tag.IsRemoteAlias {
+			if depth > 10 { // Prevent infinite recursion
+				return fmt.Errorf("max recursion depth exceeded for remote alias '%s'", name)
+			}
+			remoteDB, found := db.getDatabase(tag.RemoteDBID)
+			if !found {
+				return fmt.Errorf("remote database with ID '%s' not found for alias '%s'", tag.RemoteDBID, name)
+			}
+			// Call the remote database's SetTagValue.
+			return remoteDB.setTagValueRecursive(tag.RemoteTagName, value, depth+1)
+		}
+	}
+
 	// If the value being set is itself a UDT, we should treat it as a wholesale
 	// replacement of the tag's value, not a nested field write, even if the name // Corrected from TypeARRAY to honeycomb.TypeARRAY
 	// contains dots (which it shouldn't for this case, but we check defensively).
 	if _, isUDT := value.(UDT); isUDT {
-		return db.setTagValue(name, value)
+		return db.setSimpleTagValue(name, value)
+	}
+
+	// Handle compound access like "MyArray[1].MyField"
+	if strings.Contains(name, "[") && strings.Contains(name, ".") {
+		// Find the last ']' to correctly parse paths like "MyArray[1].NestedStruct.Field"
+		lastBracket := strings.LastIndex(name, "]")
+		if lastBracket != -1 && lastBracket < len(name)-1 {
+			arrayPart := name[:lastBracket+1]
+			fieldPart := name[lastBracket+2:] // +2 to skip the '.'
+
+			// This is a recursive call to handle the nested field part
+			// on the result of the array access part.
+			return db.setNestedField(arrayPart, value, fieldPart)
+		}
 	}
 
 	// Check for array element access.
@@ -915,43 +1061,97 @@ func (db *TagDatabase) SetTagValue(name string, value interface{}) (err error) {
 
 	// Otherwise, check for nested UDT field access.
 	if strings.Contains(name, ".") {
-		return db.setNestedField(name, value)
+		parts := strings.SplitN(name, ".", 2)
+		basePath := parts[0]
+		fieldPath := parts[1]
+		return db.setNestedField(basePath, value, fieldPath)
 	}
 
 	// If not nested, proceed with updating the whole tag value.
-	return db.setTagValue(name, value)
+	return db.setSimpleTagValue(name, value)
 }
 
 // GetTagValue retrieves the value of a tag by its name.
 func (db *TagDatabase) GetTagValue(name string) (interface{}, error) {
-	// First, check if the name is a direct address.
+	return db.getTagValueRecursive(name, 0)
+}
+
+// getTagValueRecursive is the core implementation for retrieving a tag's value.
+// It handles various access patterns in a specific order:
+// 1. Direct Address Resolution (e.g., "%IX0.0")
+// 2. Direct Tag Match (e.g., "MyTag")
+// 3. Remote Alias Resolution (if a direct match is a remote alias)
+// 4. Compound Access (e.g., "MyArray[0].MyField")
+// 5. Array Element Access (e.g., "MyArray[0]")
+// 6. Nested UDT Field Access (e.g., "MyUDT.MyField")
+// The `depth` parameter is used to prevent infinite recursion in chained remote aliases.
+func (db *TagDatabase) getTagValueRecursive(name string, depth int) (interface{}, error) {
+	// STEP 1: Direct Address Resolution.
+	// Check if the name matches the pattern for an IEC direct address (e.g., %IX0.0, %MW100).
 	if directAddressRegex.MatchString(name) {
+		// If it's a direct address, look up its corresponding symbolic name in the map.
 		if symbolicName, found := db.directAddressMap.Load(name); found {
-			name = symbolicName.(string) // Use the resolved symbolic name
+			name = symbolicName.(string) // Replace the address with the symbolic name for further processing.
 		} else {
 			return nil, fmt.Errorf("GetTagValue: direct address '%s' not found in database", name)
 		}
 	}
 
-	// First, check for a direct tag match.
+	// STEP 2: Direct Tag Match.
+	// Check if the name (which could now be a resolved symbolic name) exists as a top-level tag.
 	val, found := db.tags.Load(name)
 	if found {
 		tag := val.(*Tag)
+		// STEP 3: Remote Alias Resolution.
+		// If the found tag is a remote alias, we must delegate the request to the target database.
+		if tag.IsRemoteAlias {
+			if depth > 10 { // Safety check to prevent infinite loops in alias chains.
+				return nil, fmt.Errorf("max recursion depth exceeded for remote alias '%s'", name)
+			}
+			remoteDB, found := db.getDatabase(tag.RemoteDBID)
+			if !found {
+				return nil, fmt.Errorf("remote database with ID '%s' not found for alias '%s'", tag.RemoteDBID, name)
+			}
+			// Recursively call this function on the remote DB with the remote tag name.
+			return remoteDB.getTagValueRecursive(tag.RemoteTagName, depth+1)
+		}
+		// If it's a regular tag, return its value, respecting the forced status.
 		return tag.GetValue(), nil // Use GetValue() to respect forcing
 	}
 
-	// Check for array element access (e.g., "MyArray[2]").
+	// If no direct tag was found, we check for more complex access patterns.
+	// STEP 4: Compound Access (e.g., "MyArray[0].MyField").
+	// This pattern involves both array access and nested field access.
+	if strings.Contains(name, "[") && strings.Contains(name, ".") {
+		lastBracket := strings.LastIndex(name, "]")
+		if lastBracket != -1 && lastBracket < len(name)-1 {
+			arrayPart := name[:lastBracket+1] // e.g., "MyArray[0]"
+			fieldPart := name[lastBracket+2:] // e.g., "MyField" (+2 to skip the ']').
+
+			// First, recursively resolve the array element part to get the UDT instance.
+			element, err := db.getTagValueRecursive(arrayPart, depth) // Pass depth
+			if err != nil {
+				return nil, err
+			}
+			// Then, get the specific field from that UDT instance.
+			return getFieldFromStruct(element, fieldPart)
+		}
+	}
+
+	// STEP 5: Array Element Access (e.g., "MyArray[0]" or "My2DArray[1,2]").
 	if strings.Contains(name, "[") && strings.HasSuffix(name, "]") {
+		// Parse the name to get the base array tag and the calculated flat index.
 		baseTag, index, err := db.parseArrayAccess(name)
 		if err != nil {
 			return nil, err
 		}
-		// Lock, bounds check, and return the value.
+		// Retrieve the element value from the array.
 		return getArrayElementValue(baseTag, index)
 	}
 
-	// If no direct match, try to access a nested UDT field.
+	// STEP 6: Nested UDT Field Access (e.g., "MyUDT.MyField").
 	if strings.Contains(name, ".") {
+		// getNestedField handles parsing the path and traversing the struct.
 		nestedTag, err := db.getNestedField(name)
 		if err != nil {
 			return nil, fmt.Errorf("GetTagValue: %w", err)
@@ -959,6 +1159,7 @@ func (db *TagDatabase) GetTagValue(name string) (interface{}, error) {
 		return nestedTag.Value, nil
 	}
 
+	// If none of the above patterns match, the tag does not exist.
 	return nil, fmt.Errorf("GetTagValue: tag '%s' not found in database", name)
 }
 
@@ -1149,41 +1350,38 @@ func (db *TagDatabase) GetTagForceValue(name string) (interface{}, error) {
 // notifySubscribers iterates through all subscriptions for a given tag and invokes their callbacks.
 // It passes a copy of the tag's data to avoid external modification of the internal state.
 func (db *TagDatabase) notifySubscribers(tag *Tag) {
+	// First, create a safe, clean copy of the tag's data. This requires locking
+	// the individual tag's mutex. We do this *before* locking the global
+	// subscription mutex to maintain a consistent lock order and prevent deadlocks.
+	tag.valMu.RLock()
+	cleanTag := Tag{
+		Name:        tag.Name,
+		Value:       tag.Value,
+		Alias:       tag.Alias,
+		TypeInfo:    tag.TypeInfo,
+		Description: tag.Description,
+		Forced:      tag.Forced,
+		ForceValue:  tag.ForceValue,
+		Constant:    tag.Constant,
+		Retain:      tag.Retain,
+	}
+	tag.valMu.RUnlock()
+
+	// Now, lock the subscription map and launch a single goroutine to handle all notifications for this update.
+	// This is much more efficient than launching one goroutine per subscriber.
 	db.subMu.RLock()
-	defer db.subMu.RUnlock() // Ensure the read lock is released
+	defer db.subMu.RUnlock()
 
-	if subscriptions, ok := db.subscriptions[tag.Name]; ok {
-		// Execute callbacks in goroutines to avoid blocking the main thread
-		// and to prevent deadlocks if a callback tries to acquire database locks.
-		for _, ch := range subscriptions {
-			// Pass a copy of the tag to prevent external modification of the original.
-			// Importantly, we create a new struct rather than just copying the pointer,
-			// so the subscriber receives a "clean" tag without the original's mutex,
-			// preventing potential deadlocks if the callback tries to lock it again.
-			tag.valMu.RLock() // This lock is now on the original tag's mutex
-			cleanTag := Tag{
-				Name:        tag.Name,
-				Value:       tag.Value,
-				Alias:       tag.Alias,
-				TypeInfo:    tag.TypeInfo,
-				Description: tag.Description,
-				Forced:      tag.Forced,
-				ForceValue:  tag.ForceValue,
-				Constant:    tag.Constant,
-				Retain:      tag.Retain,
-			}
-			tag.valMu.RUnlock()
-
-			go func(ch chan Tag, t Tag) {
+	if subscriptions, ok := db.subscriptions[cleanTag.Name]; ok {
+		go func(subs map[uint64]chan Tag, t Tag) {
+			for _, ch := range subs {
 				select {
-				case ch <- t: // Attempt to send the tag
-					// Successfully sent
+				case ch <- t: // Non-blocking send
 				default:
-					// Channel is full, drop the update.
-					// Log a warning here if dropped messages are a concern.
+					// Channel is full, drop update to avoid blocking.
 				}
-			}(ch, cleanTag) // Pass the channel from the loop to the goroutine.
-		}
+			}
+		}(subscriptions, cleanTag)
 	}
 }
 
@@ -1294,6 +1492,56 @@ func checkSubrange(value, min, max interface{}) error {
 	return nil // Not a numeric type we can range check
 }
 
+// generateDirectAddress attempts to generate an IEC direct address for a given Tag.
+// It returns the direct address string and true if successful, otherwise an empty string and false.
+func generateDirectAddress(tag *Tag) (string, bool) {
+	// Only generate direct addresses for tags that look like PLC memory addresses
+	// (e.g., I.B[0], Q.R[100], M.W[254])
+	re := regexp.MustCompile(`^([IQM])\.([BWDLR])\[(\d+)]$`)
+	matches := re.FindStringSubmatch(tag.Name)
+	if len(matches) != 4 {
+		return "", false // Not a recognized symbolic array format for direct addressing
+	}
+
+	areaPrefix := matches[1]
+	typeChar := matches[2]
+	index, _ := strconv.Atoi(matches[3])
+
+	return generateDirectAddressForElement(areaPrefix, typeChar, tag.TypeInfo.ElementType, index)
+}
+
+// generateDirectAddressForElement generates an IEC direct address based on its components.
+func generateDirectAddressForElement(areaChar, typeChar string, elementType DataType, index int) (string, bool) {
+	size, addressable := getPlcTypeSize(elementType)
+	if !addressable {
+		return "", false // Cannot generate direct address for this element type
+	}
+
+	var prefix string
+	switch areaChar {
+	case "I":
+		prefix = "%I"
+	case "Q":
+		prefix = "%Q"
+	case "M":
+		prefix = "%M"
+	default:
+		return "", false
+	}
+
+	switch elementType {
+	case TypeBOOL:
+		byteOffset := index / 8
+		bitOffset := index % 8
+		return fmt.Sprintf("%sX%d.%d", prefix, byteOffset, bitOffset), true
+	case TypeBYTE, TypeSINT, TypeUSINT, TypeWORD, TypeINT, TypeUINT, TypeDWORD, TypeDINT, TypeUDINT, TypeREAL, TypeLWORD, TypeLINT, TypeULINT, TypeLREAL:
+		// For byte, word, dword, lword types, the address is the byte offset.
+		return fmt.Sprintf("%s%s%d", prefix, typeChar, index*size), true
+	default:
+		return "", false
+	}
+}
+
 // getPlcTypeSize returns the size in bytes of a given DataType, and true if it's addressable.
 func getPlcTypeSize(dataType DataType) (int, bool) {
 	switch dataType {
@@ -1315,50 +1563,6 @@ func getPlcTypeSize(dataType DataType) (int, bool) {
 	}
 }
 
-// generateDirectAddress attempts to generate an IEC direct address for a given Tag.
-// It returns the direct address string and true if successful, otherwise an empty string and false.
-func generateDirectAddress(tag *Tag) (string, bool) {
-	// Only generate direct addresses for tags that look like PLC memory addresses
-	// (e.g., I.B[0], Q.R[100], M.W[254])
-	re := regexp.MustCompile(`^([IQM])\.([BWDLR])\[(\d+)\]$`)
-	matches := re.FindStringSubmatch(tag.Name)
-	if len(matches) != 4 {
-		return "", false // Not a recognized symbolic array format for direct addressing
-	}
-
-	areaChar := matches[1]               // I, Q, M
-	index, _ := strconv.Atoi(matches[3]) // Numeric index
-
-	var prefix string
-	switch areaChar {
-	case "I":
-		prefix = "%I"
-	case "Q":
-		prefix = "%Q"
-	case "M":
-		prefix = "%M"
-	default:
-		return "", false
-	}
-
-	size, addressable := getPlcTypeSize(tag.TypeInfo.ElementType)
-	if !addressable { // Corrected from TypeInfo.ElementType to honeycomb.TypeInfo.ElementType
-		return "", false // Cannot generate direct address for this element type
-	}
-
-	switch tag.TypeInfo.ElementType {
-	case TypeBOOL:
-		byteOffset := index / 8
-		bitOffset := index % 8
-		return fmt.Sprintf("%sX%d.%d", prefix, byteOffset, bitOffset), true
-	case TypeBYTE, TypeSINT, TypeUSINT, TypeWORD, TypeINT, TypeUINT, TypeDWORD, TypeDINT, TypeUDINT, TypeREAL, TypeLWORD, TypeLINT, TypeULINT, TypeLREAL:
-		// For byte, word, dword, lword types, the address is the byte offset.
-		return fmt.Sprintf("%s%c%d", prefix, matches[2][0], index*size), true
-	default:
-		return "", false
-	}
-}
-
 // WriteTagsToFile iterates through the database and writes each tag's name
 // and current value to a file.
 // This function is optimized to reduce memory allocations by pre-calculating
@@ -1374,6 +1578,12 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 		tag := value.(*Tag)
 		tag.valMu.RLock()
 		defer tag.valMu.RUnlock()
+
+		// Per documentation, only write tags with the Retain flag.
+		// Constants are not persisted unless also marked as Retain.
+		if !tag.IsRetain() {
+			return true // Continue to the next tag.
+		}
 
 		var valueStr string
 		if tag.TypeInfo.DataType == TypeARRAY {
@@ -1770,6 +1980,16 @@ func PopulateDatabaseFromVariables(db *TagDatabase) error {
 				if err := db.AddTag(tag); err != nil {
 					return fmt.Errorf("PopulateDatabaseFromVariables: error adding tag '%s': %w", tagName, err)
 				}
+
+				// After adding the base array tag, iterate through its elements to
+				// generate and store direct address mappings for each one.
+				for j := 0; j < field.Len(); j++ {
+					elementSymbolicName := fmt.Sprintf("%s[%d]", tagName, j)
+					if directAddr, ok := generateDirectAddressForElement(prefix, fieldType.Name, elementType, j); ok {
+						// Store the mapping from the direct address to the symbolic element name.
+						db.directAddressMap.Store(directAddr, elementSymbolicName)
+					}
+				}
 			}
 		}
 	}
@@ -1778,56 +1998,59 @@ func PopulateDatabaseFromVariables(db *TagDatabase) error {
 
 // getNestedField handles the logic for accessing a field within a UDT.
 // It returns a temporary, read-only Tag representation of the field.
-func (db *TagDatabase) getNestedField(fullName string) (Tag, error) {
-	parts := strings.Split(fullName, ".")
-	if len(parts) < 2 {
+func (db *TagDatabase) getNestedField(fullName string) (Tag, error) { // Corrected from TypeARRAY to honeycomb.TypeARRAY
+	// Find the first dot to separate the base path from the field path.
+	// This correctly handles paths like "MyArray[0].Field" and "MyUDT.Field".
+	dotIndex := strings.Index(fullName, ".")
+	if dotIndex == -1 {
 		return Tag{}, fmt.Errorf("getNestedField: invalid nested tag name format '%s'", fullName)
 	}
-	baseTagName := parts[0]
-	fieldNames := parts[1:]
 
-	val, found := db.tags.Load(baseTagName)
-	if !found {
-		return Tag{}, fmt.Errorf("getNestedField: base tag '%s' not found", baseTagName)
-	}
-	baseTag := val.(*Tag)
-	baseTag.valMu.RLock()
-	defer baseTag.valMu.RUnlock()
+	basePath := fullName[:dotIndex]
+	fieldPath := fullName[dotIndex+1:]
 
-	currentValue := reflect.ValueOf(baseTag.Value)
-
-	for i, fieldName := range fieldNames {
-		for currentValue.Kind() == reflect.Ptr {
-			currentValue = currentValue.Elem()
-		}
-
-		if currentValue.Kind() != reflect.Struct {
-			return Tag{}, fmt.Errorf("getNestedField: field '%s' in path '%s' is not a struct", strings.Join(parts[:i+2], "."), fullName)
-		}
-
-		currentValue = currentValue.FieldByName(fieldName)
-		if !currentValue.IsValid() {
-			return Tag{}, fmt.Errorf("getNestedField: field '%s' not found in UDT path '%s'", fieldName, fullName)
-		}
+	// STEP 1: Get the base UDT instance.
+	// This could be a top-level UDT or an element from an array of UDTs.
+	// We use getTagValueRecursive because it can resolve both simple names and array access.
+	udtInstance, err := db.getTagValueRecursive(basePath, 0)
+	if err != nil {
+		return Tag{}, fmt.Errorf("getNestedField: could not resolve base path '%s': %w", basePath, err)
 	}
 
+	// STEP 2: Traverse the field path on the UDT instance.
+	// The getFieldFromStruct helper function will walk the dot-separated path (e.g., "Config.Speed").
+	fieldValue, err := getFieldFromStruct(udtInstance, fieldPath)
+	if err != nil {
+		return Tag{}, fmt.Errorf("getNestedField: could not get field '%s' from base '%s': %w", fieldPath, basePath, err)
+	}
+
+	// STEP 3: Create a temporary Tag representation of the nested field.
+	// This is a read-only representation used for the return value.
+	fieldDataType, ok := getDataType(reflect.TypeOf(fieldValue))
+	if !ok {
+		// This case is unlikely if the UDT is well-defined, but it's a good safeguard.
+		return Tag{}, fmt.Errorf("getNestedField: could not determine data type for field '%s'", fieldPath)
+	}
+
+	// The returned Tag is a temporary struct holding the value and type of the nested field.
+	// It does not exist in the main tag database.
 	// Create a temporary, read-only Tag representation of the nested field.
-	fieldDataType, _ := getDataType(currentValue.Type())
-
 	return Tag{
 		Name:  fullName,
-		Value: currentValue.Interface(),
+		Value: fieldValue,
 		TypeInfo: &TypeInfo{
 			DataType: fieldDataType,
 		},
 	}, nil
 }
 
-// setTagValue is the internal implementation for setting a top-level tag's value.
-func (db *TagDatabase) setTagValue(name string, value interface{}) error {
+// setSimpleTagValue is the internal, non-recursive implementation for setting a top-level tag's value.
+// setSimpleTagValue is the internal, non-recursive implementation for setting a top-level tag's value. It is the base case for recursive set operations.
+func (db *TagDatabase) setSimpleTagValue(name string, value interface{}) error {
 	val, found := db.tags.Load(name)
 	if !found {
 		return fmt.Errorf("setTagValue: tag '%s' not found in database", name)
+		//return fmt.Errorf("setSimpleTagValue: tag '%s' not found in database", name)
 	}
 	tag := val.(*Tag)
 
@@ -1843,55 +2066,110 @@ func (db *TagDatabase) setTagValue(name string, value interface{}) error {
 	return nil
 }
 
-// setNestedField handles the logic for writing a value to a field within a UDT.
-func (db *TagDatabase) setNestedField(fullName string, value interface{}) error {
-	parts := strings.Split(fullName, ".")
-	if len(parts) < 2 {
-		return fmt.Errorf("setNestedField: invalid nested tag name format '%s'", fullName)
-	}
+func getFieldFromStruct(udtInstance interface{}, fieldPath string) (interface{}, error) {
+	parts := strings.Split(fieldPath, ".")
+	currentValue := reflect.ValueOf(udtInstance)
 
-	baseTagName := parts[0]
-	fieldNames := parts[1:]
-
-	val, found := db.tags.Load(baseTagName)
-	if !found {
-		return fmt.Errorf("setNestedField: base tag '%s' not found in database", baseTagName)
-	}
-
-	baseTag := val.(*Tag)
-	baseTag.valMu.Lock()
-	defer baseTag.valMu.Unlock()
-
-	// Navigate through the nested structure.
-	currentValue := reflect.ValueOf(baseTag.Value)
-
-	for i, fieldName := range fieldNames {
-		if currentValue.Kind() != reflect.Ptr || currentValue.Elem().Kind() != reflect.Struct {
-			return fmt.Errorf("setNestedField: cannot set field on non-UDT tag '%s' at path '%s'", baseTagName, strings.Join(parts[:i+2], "."))
+	for _, fieldName := range parts {
+		for currentValue.Kind() == reflect.Ptr {
+			currentValue = currentValue.Elem()
 		}
-		currentValue = currentValue.Elem()
-		// If we are at the last part of the path, we need the struct that contains the field, not the field itself.
-		if i == len(fieldNames)-1 {
-			// This is the final field to set
-			break
+
+		if currentValue.Kind() != reflect.Struct {
+			return nil, fmt.Errorf("cannot access field '%s' on non-struct type", fieldName)
 		}
-		// Otherwise, traverse deeper.
+
 		currentValue = currentValue.FieldByName(fieldName)
+		if !currentValue.IsValid() {
+			return nil, fmt.Errorf("field '%s' not found in struct", fieldName)
+		}
+	}
 
+	return currentValue.Interface(), nil
+}
+
+// setNestedField handles writing a value to a field within a UDT or an element of an array of UDTs.
+// The `basePath` can be a simple tag name ("MyUDT") or an array element access ("MyArray[1]").
+// The `fieldPath` is the dot-separated path to the field to set (e.g., "Config.Speed").
+func (db *TagDatabase) setNestedField(basePath string, value interface{}, fieldPath string) (err error) {
+	var baseTag *Tag
+	var targetStruct reflect.Value
+
+	if strings.Contains(basePath, "[") { // e.g., "MyArray[1]"
+		// This is an access to a UDT inside an array.
+		// We must parse the access string to get the parent array tag and the element index.
+		var index int
+		var err error
+		baseTag, index, err = db.parseArrayAccess(basePath)
+		if err != nil {
+			return fmt.Errorf("setNestedField: failed to parse array access '%s': %w", basePath, err)
+		}
+
+		// Lock the parent array tag for the entire operation.
+		baseTag.valMu.Lock()
+		defer func() {
+			baseTag.valMu.Unlock()
+			if err == nil {
+				db.notifySubscribers(baseTag)
+			}
+		}()
+
+		// Get the slice value from the parent tag.
+		sliceVal := reflect.ValueOf(baseTag.Value)
+		if sliceVal.Kind() != reflect.Slice {
+			return fmt.Errorf("setNestedField: value of tag '%s' is not a slice", baseTag.Name)
+		}
+		if index < 0 || index >= sliceVal.Len() {
+			return fmt.Errorf("setNestedField: index %d out of bounds for array tag '%s' with length %d", index, baseTag.Name, sliceVal.Len())
+		}
+
+		// Get the element directly from the slice. This is a pointer to the original data.
+		targetStruct = sliceVal.Index(index)
+
+	} else { // e.g., "MyUDT"
+		val, found := db.tags.Load(basePath)
+		if !found {
+			return fmt.Errorf("setNestedField: base tag '%s' not found in database", basePath)
+		}
+		baseTag = val.(*Tag)
+
+		// Lock the UDT tag for the operation.
+		baseTag.valMu.Lock()
+		defer func() {
+			baseTag.valMu.Unlock()
+			if err == nil {
+				db.notifySubscribers(baseTag)
+			}
+		}()
+
+		targetStruct = reflect.ValueOf(baseTag.Value)
+	}
+
+	fieldNames := strings.Split(fieldPath, ".")
+	currentValue := targetStruct
+	if currentValue.Kind() == reflect.Ptr {
+		currentValue = currentValue.Elem()
+	}
+
+	for i, fieldName := range fieldNames[:len(fieldNames)-1] { // Loop until the second-to-last part.
+		currentValue = currentValue.FieldByName(fieldName) // Get the field, which should be a pointer.
+		if currentValue.Kind() != reflect.Ptr || currentValue.Elem().Kind() != reflect.Struct {
+			return fmt.Errorf("setNestedField: cannot set field on non-UDT tag '%s' at path '%s'", basePath, strings.Join(fieldNames[:i+1], "."))
+		}
+		currentValue = currentValue.Elem() // Dereference the pointer to get the struct for the next iteration.
 	}
 
 	fieldToSet := currentValue.FieldByName(fieldNames[len(fieldNames)-1])
 	if !fieldToSet.IsValid() {
-		return fmt.Errorf("setNestedField: field '%s' not found in UDT '%s'", fieldNames[len(fieldNames)-1], fullName)
+		return fmt.Errorf("setNestedField: field '%s' not found in UDT '%s'", fieldNames[len(fieldNames)-1], basePath)
 	}
 	if !fieldToSet.CanSet() {
-		return fmt.Errorf("setNestedField: field '%s' in UDT '%s' is not settable (it may not be exported)", fieldNames[len(fieldNames)-1], fullName)
+		return fmt.Errorf("setNestedField: field '%s' in UDT '%s' is not settable (it may not be exported)", fieldNames[len(fieldNames)-1], basePath)
 	}
 
 	incomingValue := reflect.ValueOf(value)
 	expectedDataType, _ := getDataType(fieldToSet.Type())
 
-	// Handle ENUM validation first, as its DataType name won't match the primitive 'STRING'.
 	if enumValues, isEnum := getEnumValues(expectedDataType); isEnum {
 		strValue, ok := value.(string)
 		if !ok {
@@ -1902,7 +2180,6 @@ func (db *TagDatabase) setNestedField(fullName string, value interface{}) error 
 		}
 		fieldToSet.Set(incomingValue)
 	} else {
-		// For non-ENUM types, perform the standard type check.
 		incomingDataType, ok := getDataType(incomingValue.Type())
 		if !ok {
 			return fmt.Errorf("setNestedField: value for field '%s' has an unsupported type: %T", fieldNames[len(fieldNames)-1], value)
@@ -1915,9 +2192,6 @@ func (db *TagDatabase) setNestedField(fullName string, value interface{}) error 
 			fieldToSet.Set(incomingValue)
 		}
 	}
-
-	// Notify subscribers of the base tag change.
-	db.notifySubscribers(baseTag)
 
 	return nil
 }

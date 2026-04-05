@@ -1,4 +1,4 @@
-# TagDatabase - IEC 61131-3 Compliant PLC Tag Management in Go
+# Honeycomb TagDatabase - IEC 61131-3 Compliant PLC Tag Management in Go
 
 The `TagDatabase` project provides a robust, thread-safe, and feature-rich in-memory database for managing PLC-like tags, adhering closely to the specifications outlined in IEC 61131-3. Developed in Go, it offers a flexible and performant solution for applications requiring structured data management with industrial control system paradigms.
 
@@ -35,6 +35,7 @@ This database is designed to encapsulate the complexities of PLC tag management,
 *   **Subscription Mechanism**: Clients can subscribe to tag value changes, receiving notifications via Go channels, enabling reactive programming models.
 *   **Persistence**: Tags and their values can be written to and read from a file, facilitating application restarts and configuration loading. This includes proper serialization/deserialization of UDTs and arrays.
 *   **Flexible Tag Access**: Tags can be accessed by their symbolic name, alias, direct address, or even nested UDT field paths (e.g., `Motor.Config.MaxSpeed`).
+*   **Cross-Database Aliasing**: A tag in one database instance can act as a transparent alias for a tag in a completely different database instance, enabling distributed and modular system architectures.
 
 ## Core Concepts
 
@@ -65,18 +66,29 @@ type UDT interface {
 ```
 Any Go struct intended to be used as a User-Defined Type (IEC 61131-3 STRUCT) must implement this interface, returning a unique `DataType` string for its type.
 
+## Advanced Features
+
+### Cross-Database Aliasing
+A powerful feature of the `honeycomb` `TagDatabase` is the ability to create remote aliases. A tag in one database instance can be defined as an alias for a tag residing in a separate database instance. This allows for building complex, distributed systems where different modules or services can interact with each other's data seamlessly and transparently.
+
+```go
+// In Service A, which has a TagDatabase instance `db1`
+db1.AddTag(&honeycomb.Tag{Name: "SourceTag", Value: plc.DINT(100), ...})
+
+// In Service B, which has a TagDatabase instance `db2`
+// First, register db1 with db2
+db2.RegisterDatabase("DB1_ID", db1)
+// Now, create an alias that points to the tag in db1
+db2.AddTag(&honeycomb.Tag{Name: "AliasToDB1", IsRemoteAlias: true, RemoteDBID: "DB1_ID", RemoteTagName: "SourceTag"})
+
+// Reading/writing "AliasToDB1" in db2 will now transparently access "SourceTag" in db1.
+val, _ := db2.GetTagValue("AliasToDB1") // val will be plc.DINT(100)
+```
+
 ## Installation
 
 To use `TagDatabase`, you need to have Go installed. Then, you can fetch the library using `go get`:
 
-```bash
-type UDT interface {
-	TypeName() DataType
-}
-```
-Any Go struct intended to be used as a User-Defined Type (IEC 61131-3 STRUCT) must implement this interface, returning a unique `DataType` string for its type.
-
-## Usage
 ```bash
 go get github.com/apiarytech/honeycomb
 ```
@@ -142,11 +154,11 @@ val, err := db.GetTagValue("MyDINT") // Returns plc.DINT(100)
 // Set a tag's value
 err = db.SetTagValue("MyDINT", plc.DINT(200))
 
-// Access a nested UDT field
-motorSpeed, err := db.GetTagValue("MotorLine.Speed") // Returns plc.REAL(1500.0)
+// Access a field on a UDT within an array
+motorSpeed, err := db.GetTagValue("MotorLine[0].Speed") // Accesses the 'Speed' of the first motor. Returns plc.REAL(1500.0)
 
-// Set a nested UDT field
-err = db.SetTagValue("MotorLine.Running", plc.BOOL(true))
+// Set a field on a UDT within an array
+err = db.SetTagValue("MotorLine[1].Running", plc.BOOL(true)) // Sets the 'Running' status of the second motor.
 ```
 
 ### Persistence
