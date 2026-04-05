@@ -30,7 +30,7 @@ jobs:
           - '1.26.1' # minimum version
           - 'oldstable'
           - 'stable'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.name }}
 
     steps:
     - uses: actions/checkout@v4
