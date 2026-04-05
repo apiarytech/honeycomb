@@ -24,7 +24,7 @@ jobs:
           - {os: windows, arch: 386,   name: windows-latest}
           - {os: darwin,  arch: amd64, name: macos-latest}
           - {os: darwin,  arch: arm64, name: macos-latest}
-          - {os: darwin,  arch: 386, name: macos-latest}
+          #- {os: darwin,  arch: 386, name: macos-latest}
         go:
           - '1.26.1' # minimum version
           - 'oldstable'
