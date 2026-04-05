@@ -14,17 +14,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Define specific supported pairs to avoid invalid combinations
-        include:
-          - {os: linux,   arch: amd64, name: ubuntu-latest}
-          - {os: linux,   arch: arm64,   name: ubuntu-latest}
-          - {os: linux,   arch: 386,   name: ubuntu-latest}
-          - {os: windows, arch: amd64, name: windows-latest}
-          - {os: windows, arch: arm64,   name: windows-latest}
-          - {os: windows, arch: 386,   name: windows-latest}
-          - {os: darwin,  arch: amd64, name: macos-latest}
-          - {os: darwin,  arch: arm64, name: macos-latest}
-          #- {os: darwin,  arch: 386, name: macos-latest}
+        # 386 and arm are 32-bit; amd64 and arm64 are 64-bit
+        goarch: [amd64, 386, arm, arm64]
+        goos: [linux, windows, darwin]
+        name: [widows-latets, ubuntu-latest, macos-latest]
         go:
           - '1.26.1' # minimum version
           - 'oldstable'
@@ -45,12 +38,12 @@ jobs:
         go install .
         go build -v ./...
       env:
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
 
     - name: Test
       run: |
         go test -v ./...
       env:
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
