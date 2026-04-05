@@ -21,9 +21,6 @@ jobs:
           - arm64
           - riscv
           - riscv64
-          - wasm
-          - wasm32
-          - wasm64
           - 386
         goos:
           - linux
