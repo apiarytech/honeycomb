@@ -1,11 +1,10 @@
 /*
  * Copyright (C) 2026 Franklin D. Amador
  *
- * This software is dual-licensed under:
- * - GPL v2.0
- * - Commercial
+ * This software is dual-licensed under the terms of the GPL v2.0 and
+ * a commercial license. You may choose to use this software under either
+ * license.
  *
- * You may choose to use this software under the terms of either license.
  * See the LICENSE files in the project root for full license text.
  */
 
@@ -14,6 +13,9 @@ package honeycomb
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
 	"os"
 	"reflect"
 	"regexp"
@@ -522,6 +524,18 @@ type TagDatabase struct {
 	dbRegistry       sync.Map // Instance-level registry: map[string]*TagDatabase
 }
 
+// DatabaseAccessor defines the interface for any object that can be registered
+// as a remote database, allowing for both in-process and networked aliasing.
+type DatabaseAccessor interface {
+	getTagValueRecursive(name string, depth int) (interface{}, error)
+	setTagValueRecursive(name string, value interface{}, depth int) error
+}
+
+// NetworkDatabaseClient is an implementation of DatabaseAccessor that communicates
+// with a remote TagDatabase server over a network.
+// This is a conceptual example; a real implementation would require a network
+// protocol (e.g., HTTP, gRPC) and corresponding server-side handlers.
+
 // NewTagDatabase creates and returns a new TagDatabase instance.
 func NewTagDatabase() *TagDatabase {
 	return &TagDatabase{
@@ -530,7 +544,7 @@ func NewTagDatabase() *TagDatabase {
 }
 
 // RegisterDatabase adds a database instance to this instance's local registry.
-func (db *TagDatabase) RegisterDatabase(id string, remoteDB *TagDatabase) error {
+func (db *TagDatabase) RegisterDatabase(id string, remoteDB DatabaseAccessor) error {
 	if _, loaded := db.dbRegistry.LoadOrStore(id, remoteDB); loaded {
 		return fmt.Errorf("a database with ID '%s' is already registered with this instance", id)
 	}
@@ -538,12 +552,12 @@ func (db *TagDatabase) RegisterDatabase(id string, remoteDB *TagDatabase) error 
 }
 
 // getDatabase retrieves a database instance from this instance's local registry.
-func (db *TagDatabase) getDatabase(id string) (*TagDatabase, bool) {
+func (db *TagDatabase) getDatabase(id string) (DatabaseAccessor, bool) {
 	val, found := db.dbRegistry.Load(id)
 	if !found {
 		return nil, false
 	}
-	return val.(*TagDatabase), true
+	return val.(DatabaseAccessor), true
 }
 
 // SubscribeToTag allows a client to register a callback function to be notified
@@ -2252,4 +2266,213 @@ func setArrayElementValue(baseTag *Tag, index int, value interface{}) error {
 	sliceVal.Index(index).Set(reflect.ValueOf(value))
 
 	return nil
+}
+
+// NewValueFromDataType creates a pointer to a zero value of the given DataType.
+// This is particularly useful for unmarshaling JSON into a strongly-typed variable.
+// For primitive types, it returns a pointer to the corresponding plc type (e.g., *plc.DINT).
+// For UDTs, it returns a pointer to a new instance of the UDT struct (e.g., *MotorData).
+func NewValueFromDataType(dataType DataType) (interface{}, error) {
+	// First, check if it's a registered UDT.
+	if udtInstance, isUDT := newUDTInstance(dataType); isUDT {
+		return udtInstance, nil
+	}
+
+	// Next, check if it's a primitive Go type.
+	if goType, ok := getGoType(dataType); ok {
+		// Create a new pointer to a value of that type.
+		return reflect.New(goType).Interface(), nil
+	}
+
+	// If it's an ENUM, it's fundamentally a string.
+	if _, isEnum := getEnumValues(dataType); isEnum {
+		var s string
+		return &s, nil
+	}
+
+	// If the type is not found, return an error.
+	return nil, fmt.Errorf("unrecognized or unsupported DataType '%s'", dataType)
+}
+
+// Dereference takes an interface that is expected to be a pointer and returns
+// the value it points to. If the input is not a pointer, it returns the input itself.
+// This is a helper function to simplify getting the underlying value after unmarshaling
+// into a pointer, as is common in the `handleSetTagValue` HTTP handler.
+func Dereference(ptr interface{}) interface{} {
+	if ptr == nil {
+		return nil
+	}
+
+	val := reflect.ValueOf(ptr)
+
+	// If the interface holds a pointer, dereference it.
+	if val.Kind() == reflect.Ptr {
+		// If the pointer is nil, return nil.
+		if val.IsNil() {
+			return nil
+		}
+		// Otherwise, return the element it points to.
+		return val.Elem().Interface()
+	}
+
+	// If it's not a pointer, return the value as is.
+	return ptr
+}
+
+// --- Internal Network Server Implementation ---
+
+// tagServer holds the server's TagDatabase and configuration. It is not exported.
+type tagServer struct {
+	db          *TagDatabase
+	validTokens []string
+}
+
+// tagHandler is the main router for the `/tags/` endpoint.
+func (ts *tagServer) tagHandler(w http.ResponseWriter, r *http.Request) {
+	// All requests to this handler have `/tags/` as a prefix.
+	// We trim it to get the actual tag name being requested.
+	tagName := strings.TrimPrefix(r.URL.Path, "/tags/")
+	if tagName == "" {
+		http.Error(w, "Tag name is required.", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		ts.handleGetTagValue(w, r, tagName)
+	case http.MethodPut:
+		ts.handleSetTagValue(w, r, tagName)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// authMiddleware protects server endpoints with Bearer Token authentication.
+func (ts *tagServer) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			http.Error(w, "Authorization header is required", http.StatusUnauthorized)
+			return
+		}
+		parts := strings.Split(authHeader, " ")
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			http.Error(w, "Authorization header format must be Bearer {token}", http.StatusUnauthorized)
+			return
+		}
+		token := parts[1]
+		isValid := false
+		for _, validToken := range ts.validTokens {
+			if token == validToken {
+				isValid = true
+				break
+			}
+		}
+		if !isValid {
+			http.Error(w, "Invalid authentication token", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// handleGetTagValue handles GET requests to read a tag's value.
+func (ts *tagServer) handleGetTagValue(w http.ResponseWriter, r *http.Request, tagName string) {
+	log.Printf("[Server] GET /tags/%s", tagName)
+	value, err := ts.db.GetTagValue(tagName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	response := map[string]interface{}{"value": value}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleSetTagValue handles PUT requests to update a tag's value.
+func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, tagName string) {
+	log.Printf("[Server] PUT /tags/%s", tagName)
+	// Get the base tag to correctly determine the type for unmarshaling,
+	// even if the write is to a nested field (e.g., "MyUDT.Field").
+	tag, found := ts.db.getBaseTag(tagName)
+	if !found {
+		http.Error(w, fmt.Sprintf("Tag '%s' not found", tagName), http.StatusNotFound)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+		return
+	}
+
+	// The request body is expected to be a JSON object like {"value": ...}.
+	var requestPayload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &requestPayload); err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	valueJSON, ok := requestPayload["value"]
+	if !ok {
+		http.Error(w, "Missing 'value' field", http.StatusBadRequest)
+		return
+	}
+
+	// To correctly unmarshal the value, especially for UDTs, we need a variable
+	// of the correct type. We can get this from the tag's current value.
+	// For a nested write, we unmarshal into a generic interface{}.
+	// For a whole-tag write, we unmarshal into a new instance of the tag's type.
+	if strings.Contains(tagName, ".") || strings.Contains(tagName, "[") {
+		// Handle nested writes (e.g., "MyUDT.Speed", "MyArray[0].Field").
+		// The value is just the raw JSON value. We unmarshal it into a generic interface.
+		var value interface{}
+		if err := json.Unmarshal(valueJSON, &value); err != nil {
+			http.Error(w, "Invalid JSON value for nested write", http.StatusBadRequest)
+			return
+		}
+		if err := ts.db.SetTagValue(tagName, value); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	} else {
+		// Handle whole-tag writes (e.g., "MyUDT", "MyDINT").
+		newValuePtr, err := NewValueFromDataType(tag.TypeInfo.DataType)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Internal server error: could not create instance for type '%s': %v", tag.TypeInfo.DataType, err), http.StatusInternalServerError)
+			return
+		}
+		if err := json.Unmarshal(valueJSON, newValuePtr); err != nil {
+			http.Error(w, "JSON value is not compatible with tag type", http.StatusBadRequest)
+			return
+		}
+		if err := ts.db.SetTagValue(tagName, Dereference(newValuePtr)); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "Tag value updated successfully.")
+}
+
+// getBaseTag is an internal helper that finds the top-level tag associated with a given name,
+// even if the name represents a nested field or array element (e.g., "MyUDT.Field" or "MyArray[0]").
+// It returns a pointer to the actual tag in the database, not a copy.
+func (db *TagDatabase) getBaseTag(name string) (*Tag, bool) {
+	// The base tag name is the part before the first dot or bracket.
+	var baseTagName string
+	if dotIndex := strings.Index(name, "."); dotIndex != -1 {
+		baseTagName = name[:dotIndex]
+	} else if bracketIndex := strings.Index(name, "["); bracketIndex != -1 {
+		baseTagName = name[:bracketIndex]
+	} else {
+		baseTagName = name
+	}
+
+	if val, found := db.tags.Load(baseTagName); found {
+		return val.(*Tag), true
+	}
+	return nil, false
 }

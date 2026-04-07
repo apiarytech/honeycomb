@@ -16,6 +16,8 @@ The `TagDatabase` project provides a robust, thread-safe, and feature-rich in-me
   - [Creating and Adding Tags](#creating-and-adding-tags)
   - [Accessing and Modifying Tag Values](#accessing-and-modifying-tag-values)
   - [Persistence](#persistence)
+  - [Subscriptions (Event-Driven Updates)](#subscriptions-event-driven-updates)
+  - [Networking Features](#networking-features)
 - [Licensing](#licensing)
 - [Contributing](#contributing)
 
@@ -109,66 +111,22 @@ func (m *MotorData) TypeName() DataType {
 	return "MotorData"
 }
 
-// In your main function or init block:
-honeycomb.RegisterUDT(&MotorData{})
-honeycomb.RegisterENUM("MotorState", []string{"Stopped", "Running", "Faulted"})
-```
+This library includes several examples in the `examples/` directory to demonstrate its capabilities.
 
-### Creating and Adding Tags
+### Core Features (`examples/simple`)
 
-```go
-db := honeycomb.NewTagDatabase()
+The `examples/simple/main.go` application is the best starting point. It provides a comprehensive walkthrough of the core, in-memory features of the `honeycomb` package.
 
-// Add a simple DINT tag
-dintTag := &honeycomb.Tag{
-	Name:  "MyDINT",
-	Value: plc.DINT(100),
-	TypeInfo: &honeycomb.TypeInfo{
-		DataType: honeycomb.TypeDINT,
-	},
-}
-db.AddTag(dintTag)
+It demonstrates:
+-   **Type Registration**: Defining and registering custom `UDT` and `ENUM` types.
+-   **Tag Management**: Creating and adding simple tags, arrays, and UDTs to the database.
+-   **Value Access**: Reading from and writing to tags, including nested fields within arrays and UDTs (e.g., `MyArray[0].Field`).
+-   **Persistence**: Marking tags with `Retain: true` and using `WriteTagsToFile` and `ReadTagsFromFile` to save and load tag values.
+-   **In-Process Aliasing**: Using the cross-database aliasing feature between two database instances running in the same application.
 
-// Add an array of UDTs
-motorArrayValue := []*MotorData{
-	{Speed: 1500.0, Current: 30.5, Running: true},
-	{Speed: 0.0, Current: 0.1, Running: false},
-}
-motorArrayTag := &honeycomb.Tag{
-	Name:        "MotorLine",
-	TypeInfo: &honeycomb.TypeInfo{
-		DataType:    honeycomb.TypeARRAY,
-		ElementType: "MotorData", // The registered UDT name
-	},
-	Value: motorArrayValue,
-}
-db.AddTag(motorArrayTag)
-```
-
-### Accessing and Modifying Tag Values
-
-```go
-// Get a tag's value
-val, err := db.GetTagValue("MyDINT") // Returns plc.DINT(100)
-
-// Set a tag's value
-err = db.SetTagValue("MyDINT", plc.DINT(200))
-
-// Access a field on a UDT within an array
-motorSpeed, err := db.GetTagValue("MotorLine[0].Speed") // Accesses the 'Speed' of the first motor. Returns plc.REAL(1500.0)
-
-// Set a field on a UDT within an array
-err = db.SetTagValue("MotorLine[1].Running", plc.BOOL(true)) // Sets the 'Running' status of the second motor.
-```
-
-### Persistence
-
-```go
-// Write all retain-qualified tags to a file
-err := db.WriteTagsToFile("tags.txt")
-
-// Read tags from a file (tags must be pre-added to the database for type inference)
-err = db.ReadTagsFromFile("tags.txt")
+To run this example, navigate to `examples/simple` and run:
+```bash
+go run main.go
 ```
 
 ## Licensing

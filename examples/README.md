@@ -1,47 +1,56 @@
-# Honeycomb TagDatabase Usage Example
+# Honeycomb TagDatabase - Examples
 
-This directory contains example programs demonstrating the features of the `honeycomb` TagDatabase package.
+This directory contains a set of examples demonstrating the various features of the `honeycomb` TagDatabase library.
 
-## `main.go` - Core Features Demonstration
+## One-Time Setup for Network Examples
 
-The `main.go` program is a comprehensive example that walks through several of the most common and powerful features of the `honeycomb` package. It is structured to be read from top to bottom, with comments explaining each step.
+The `network_server` and `network_client` examples require a TLS certificate and private key to enable secure HTTPS communication. Before running them, you must generate these files.
 
-### How to Run
+1.  Navigate to the `examples/shared` directory:
+    ```bash
+    cd examples/shared
+    ```
+2.  Run the following `openssl` command to generate `server.crt` and `server.key`:
+    ```bash
+    openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -sha256 -days 365 -nodes -subj "/CN=localhost"
+    ```
 
-To run the example, navigate to this directory in your terminal and execute:
+These two files will be used by both network examples but should **not** be committed to version control.
 
-```bash
-go run main.go
-```
+## Available Examples
 
-### Demonstrated Functionalities
+1.  **`simple/`**: The best starting point for new users. This example covers the core, in-memory features of the library.
+2.  **`network_server/`**: Demonstrates how to expose a `TagDatabase` over a secure HTTPS network interface.
+3.  **`network_client/`**: Shows how to use the powerful networked aliasing feature to connect a local tag to a tag on a remote server.
 
-This example showcases the following key features:
+### `shared/`
 
-1.  **Custom Type Registration**:
-    *   It defines a custom Go struct `MotorData` and implements the `tags.UDT` interface, turning it into a User-Defined Type.
-    *   It registers the `MotorData` UDT and a new `MotorState` ENUM type with the `honeycomb` system, making them available for use in tags.
+This directory contains Go code, such as the `MotorData` UDT definition, that is shared across multiple examples. It is not a runnable example itself.
 
-2.  **Tag Creation and Management**:
-    *   It initializes a new `TagDatabase` instance.
-    *   It adds a simple tag of type `DINT` (`MyDINT`).
-    *   It demonstrates creating and adding a more complex tag: an `ARRAY` of the custom `MotorData` UDT (`MotorLine`).
+## Recommended Learning Path
 
-3.  **Tag Value Access and Modification**:
-    *   It shows how to get and set the value of a simple tag (`MyDINT`).
-    *   It demonstrates the powerful nested access feature by reading a field from a UDT within an array (`MotorLine[0].Speed`).
-    *   It also shows how to write to a nested field within an array element (`MotorLine[1].Running`).
+1.  **Start with the `simple` example.**
+    It provides a comprehensive, heavily commented walkthrough of fundamental concepts:
+    *   Registering custom User-Defined Types (UDTs).
+    *   Creating tags (simple types, arrays, UDTs).
+    *   Reading and writing tag values, including nested fields.
+    *   Persisting tag values to a file.
+    *   Creating in-process aliases between two database instances.
 
-4.  **Persistence**:
-    *   It marks tags with the `Retain: true` flag to make them eligible for persistence.
-    *   It writes all retain-qualified tags and their current values to a file (`tags.txt`) using `WriteTagsToFile`.
-    *   To simulate an application restart, it creates a second `TagDatabase` instance, pre-populates it with the tag definitions, and then uses `ReadTagsFromFile` to load the persisted values.
-    *   Finally, it verifies that the values were loaded correctly in the new database instance.
+2.  **Next, review the `network_server` example.**
+    This shows how to build a standalone server application that exposes a `TagDatabase` to the network. It demonstrates:
+    *   Setting up a secure HTTPS server.
+    *   Implementing bearer token authentication.
+    *   Handling `GET` (read) and `PUT` (write) requests for tags.
 
-5.  **Cross-Database Aliasing**:
-    *   It demonstrates a distributed system pattern by creating two separate database instances (`db1` and `db2`).
-    *   It registers `db1` with `db2`, allowing `db2` to reference it.
-    *   It creates a "remote alias" tag in `db2` that points to a source tag in `db1`.
-    *   It shows that reading from and writing to the alias in `db2` transparently affects the source tag in `db1`, showcasing a powerful feature for building modular applications.
+3.  **Finally, explore the `network_client` example.**
+    This example showcases one of the most powerful features of `honeycomb`: transparently linking a local application's tag to a tag on a remote server. It demonstrates:
+    *   Configuring a secure network client.
+    *   Creating a "remote alias" tag.
+    *   Reading and writing to the remote tag as if it were a local tag.
 
-This example serves as a great starting point for understanding how to integrate the `honeycomb` TagDatabase into your own Go applications.
+By following this path, you will gain a solid understanding of both the core capabilities and the advanced distributed features of the `honeycomb` library.
+
+---
+
+To run any example, navigate to its specific directory (`simple`, `network_server`, etc.) and follow the instructions in its local `README.md` file.

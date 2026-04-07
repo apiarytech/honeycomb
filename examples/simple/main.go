@@ -7,28 +7,15 @@ import (
 	"runtime"
 
 	tags "github.com/apiarytech/honeycomb"
+	"github.com/apiarytech/honeycomb/examples/shared"
 	plc "github.com/apiarytech/royaljelly"
 )
-
-// --- 1. Define and Register Custom Types (from README) ---
-
-// MotorData is a User-Defined Type (UDT) that implements the tags.UDT interface.
-type MotorData struct {
-	Speed   plc.REAL
-	Current plc.REAL
-	Running plc.BOOL
-}
-
-// TypeName returns the unique name for the MotorData UDT.
-func (m *MotorData) TypeName() tags.DataType {
-	return "MotorData"
-}
 
 func main() {
 	fmt.Println("--- tags TagDatabase Usage Example ---")
 
 	// Register custom types before using them.
-	tags.RegisterUDT(&MotorData{})
+	tags.RegisterUDT(&shared.MotorData{})
 	tags.RegisterENUM("MotorState", []string{"Stopped", "Running", "Faulted"})
 	fmt.Println("Registered UDT 'MotorData' and ENUM 'MotorState'.")
 
@@ -51,7 +38,7 @@ func main() {
 	fmt.Println("Added tag 'MyDINT' with value 100.")
 
 	// Add an array of UDTs
-	motorArrayValue := []*MotorData{
+	motorArrayValue := []*shared.MotorData{
 		{Speed: 1500.0, Current: 30.5, Running: true},
 		{Speed: 0.0, Current: 0.1, Running: false},
 	}
