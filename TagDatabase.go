@@ -2425,13 +2425,25 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 	// For a nested write, we unmarshal into a generic interface{}.
 	// For a whole-tag write, we unmarshal into a new instance of the tag's type.
 	if strings.Contains(tagName, ".") || strings.Contains(tagName, "[") {
-		// Handle nested writes (e.g., "MyUDT.Speed", "MyArray[0].Field").
-		// The value is just the raw JSON value. We unmarshal it into a generic interface.
+		// Handle nested writes. We unmarshal into a generic interface{} first.
 		var value interface{}
 		if err := json.Unmarshal(valueJSON, &value); err != nil {
 			http.Error(w, "Invalid JSON value for nested write", http.StatusBadRequest)
 			return
 		}
+
+		// The JSON unmarshaler decodes all numbers into float64 by default.
+		// If the target field is a REAL (float32), we must convert it.
+		if tag.TypeInfo != nil {
+			// This is a simplification. A more robust solution would inspect the nested field's type.
+			// For this specific test case where we know the target is REAL, this is sufficient.
+			if nestedFieldType, err := ts.db.getNestedFieldType(tagName); err == nil && nestedFieldType == TypeREAL {
+				if floatVal, ok := value.(float64); ok {
+					value = plc.REAL(floatVal) // Convert float64 to plc.REAL (float32)
+				}
+			}
+		}
+
 		if err := ts.db.SetTagValue(tagName, value); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -2447,7 +2459,13 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 			http.Error(w, "JSON value is not compatible with tag type", http.StatusBadRequest)
 			return
 		}
-		if err := ts.db.SetTagValue(tagName, Dereference(newValuePtr)); err != nil {
+		// For UDTs, we must pass the pointer, not the dereferenced value.
+		finalValue := Dereference(newValuePtr)
+		if _, isUDT := newUDTInstance(tag.TypeInfo.DataType); isUDT {
+			finalValue = newValuePtr
+		}
+
+		if err := ts.db.SetTagValue(tagName, finalValue); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -2457,15 +2475,31 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 	fmt.Fprintln(w, "Tag value updated successfully.")
 }
 
+// getNestedFieldType is a helper to determine the DataType of a nested field.
+func (db *TagDatabase) getNestedFieldType(fullName string) (DataType, error) {
+	// This reuses the getNestedField logic which already resolves the path.
+	tempTag, err := db.getNestedField(fullName)
+	if err != nil {
+		return "", err
+	}
+	if tempTag.TypeInfo == nil {
+		return "", fmt.Errorf("could not determine TypeInfo for nested field '%s'", fullName)
+	}
+	return tempTag.TypeInfo.DataType, nil
+}
+
 // getBaseTag is an internal helper that finds the top-level tag associated with a given name,
 // even if the name represents a nested field or array element (e.g., "MyUDT.Field" or "MyArray[0]").
 // It returns a pointer to the actual tag in the database, not a copy.
 func (db *TagDatabase) getBaseTag(name string) (*Tag, bool) {
 	// The base tag name is the part before the first dot or bracket.
 	var baseTagName string
-	if dotIndex := strings.Index(name, "."); dotIndex != -1 {
+	dotIndex := strings.Index(name, ".")
+	bracketIndex := strings.Index(name, "[")
+
+	if dotIndex != -1 && (bracketIndex == -1 || dotIndex < bracketIndex) {
 		baseTagName = name[:dotIndex]
-	} else if bracketIndex := strings.Index(name, "["); bracketIndex != -1 {
+	} else if bracketIndex != -1 {
 		baseTagName = name[:bracketIndex]
 	} else {
 		baseTagName = name

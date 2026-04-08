@@ -11,7 +11,7 @@ import (
 	"time"
 
 	tags "github.com/apiarytech/honeycomb"
-	"github.com/apiarytech/honeycomb/examples/shared"
+	"github.com/apiarytech/honeycomb/shared"
 	plc "github.com/apiarytech/royaljelly"
 )
 

@@ -7,9 +7,9 @@ This directory contains a set of examples demonstrating the various features of 
 The `network_server` and `network_client` examples require a TLS certificate and private key to enable secure HTTPS communication. Before running them, you must generate these files.
 
 1.  Navigate to the `examples/shared` directory:
-    ```bash
-    cd examples/shared
-    ```
+    ```bash 
+    cd shared
+    ``` 
 2.  Run the following `openssl` command to generate `server.crt` and `server.key`:
     ```bash
     openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -sha256 -days 365 -nodes -subj "/CN=localhost"
@@ -22,10 +22,6 @@ These two files will be used by both network examples but should **not** be comm
 1.  **`simple/`**: The best starting point for new users. This example covers the core, in-memory features of the library.
 2.  **`network_server/`**: Demonstrates how to expose a `TagDatabase` over a secure HTTPS network interface.
 3.  **`network_client/`**: Shows how to use the powerful networked aliasing feature to connect a local tag to a tag on a remote server.
-
-### `shared/`
-
-This directory contains Go code, such as the `MotorData` UDT definition, that is shared across multiple examples. It is not a runnable example itself.
 
 ## Recommended Learning Path
 

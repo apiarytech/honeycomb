@@ -26,6 +26,19 @@ import (
 	plc "github.com/apiarytech/royaljelly" // Assuming this is an external dependency
 )
 
+// MotorData is a test-local UDT struct. It is defined here to allow
+// the honeycomb package's tests to validate UDT functionality without
+// creating a circular dependency on the shared package.
+type MotorData struct {
+	Speed    plc.REAL
+	Current  plc.REAL
+	Running  plc.BOOL
+	TestName string // Added for specific tests
+}
+
+// TypeName implements the UDT interface for the test-local MotorData.
+func (m *MotorData) TypeName() DataType { return "MotorData" }
+
 // TestNewTagDatabase verifies that the constructor creates a valid, empty database.
 func TestNewTagDatabase(t *testing.T) {
 	db := NewTagDatabase()
@@ -1279,22 +1292,6 @@ func TestReadTags_ParseError(t *testing.T) {
 	if !strings.Contains(err.Error(), "line error for tag 'MyTag'") {
 		t.Errorf("Expected a parsing error, but got: %v", err)
 	}
-}
-
-// MotorData is an example of a User-Defined Type (UDT).
-// It's a struct that will be used as a tag's value.
-type MotorData struct {
-	Speed    plc.REAL // Corrected from TypeREAL to TypeREAL
-	Current  plc.REAL
-	Temp     plc.REAL
-	Running  plc.BOOL
-	Tripped  plc.BOOL
-	TestName string
-}
-
-// TypeName implements the UDT interface, returning the unique name for this type.
-func (m *MotorData) TypeName() DataType {
-	return "MotorData"
 }
 
 // TestUDTPersistence verifies that a UDT can be added, persisted to a file, and read back correctly.

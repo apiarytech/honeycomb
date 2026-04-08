@@ -20,7 +20,6 @@ import (
 	"testing"
 
 	plc "github.com/apiarytech/royaljelly"
-	"github.com/apiarytech/royaljelly/examples/shared"
 )
 
 // setupTestServer creates a tagServer instance with a pre-populated database for testing.
@@ -29,15 +28,15 @@ func setupTestServer() *tagServer {
 	db.AddTag(&Tag{Name: "TestDINT", TypeInfo: &TypeInfo{DataType: TypeDINT}, Value: plc.DINT(100)})
 	db.AddTag(&Tag{Name: "TestREAL", TypeInfo: &TypeInfo{DataType: TypeREAL}, Value: plc.REAL(123.45)})
 	// Add a UDT for testing JSON unmarshaling on the server
-	RegisterUDT(&shared.MotorData{})
+	RegisterUDT(&MotorData{})
 	db.AddTag(&Tag{
 		Name: "MotorLine",
 		TypeInfo: &TypeInfo{
 			DataType:    TypeARRAY,
 			ElementType: "MotorData",
 		},
-		Value: []*shared.MotorData{{Speed: 1800.5}, {Speed: 0.0}}})
-	udtTag := &Tag{Name: "TestUDT", TypeInfo: &TypeInfo{DataType: "MotorData"}, Value: &shared.MotorData{Speed: 100}}
+		Value: []*MotorData{{Speed: 1800.5}, {Speed: 0.0}}})
+	udtTag := &Tag{Name: "TestUDT", TypeInfo: &TypeInfo{DataType: "MotorData"}, Value: &MotorData{Speed: 100}}
 	db.AddTag(udtTag)
 
 	return &tagServer{
@@ -158,7 +157,8 @@ func TestHandleSetTagValue(t *testing.T) {
 		rr := httptest.NewRecorder()
 		ts.handleSetTagValue(rr, req, nestedTagName)
 
-		if status := rr.Code; status != http.StatusOK {
+		status := rr.Code
+		if status != http.StatusOK {
 			t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
 		}
 

@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	tags "github.com/apiarytech/honeycomb"
-	"github.com/apiarytech/honeycomb/examples/shared"
+	"github.com/apiarytech/honeycomb/shared"
 )
 
 func main() {
