@@ -152,7 +152,13 @@ func main() {
 	fmt.Println("Registered db1 with db2.")
 
 	// Now, create an alias that points to the tag in db1
-	db2.AddTag(&tags.Tag{Name: "AliasToDB1", IsRemoteAlias: true, RemoteDBID: "DB1_ID", RemoteTagName: "SourceTag", Retain: true})
+	aliasTag := &tags.Tag{
+		Name: "AliasToDB1",
+		RemoteAlias: &tags.RemoteAliasInfo{DBID: "DB1_ID",
+			TagName: "SourceTag"},
+		Retain: true,
+	}
+	db2.AddTag(aliasTag)
 	fmt.Println("Created 'AliasToDB1' in db2 pointing to 'SourceTag' in db1.")
 
 	// Reading "AliasToDB1" in db2 will now transparently access "SourceTag" in db1.

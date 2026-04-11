@@ -79,10 +79,12 @@ func main() {
 	// --- 5. Create a remote alias tag ---
 	// This tag lives in our clientDB but points to a tag on the server.
 	aliasTag := &tags.Tag{
-		Name:          "RemoteMotorSpeed",
-		IsRemoteAlias: true,
-		RemoteDBID:    "ServerDB",           // The ID we just registered.
-		RemoteTagName: "MotorLine[0].Speed", // The full name of the tag on the server.
+		Name: "RemoteMotorSpeed",
+		RemoteAlias: &tags.RemoteAliasInfo{
+			DBID:    "ServerDB",
+			TagName: "MotorLine[0].Speed",
+		},
+		Retain: true,
 	}
 	if err := clientDB.AddTag(aliasTag); err != nil {
 		log.Fatalf("[Client] Failed to add alias tag: %v", err)

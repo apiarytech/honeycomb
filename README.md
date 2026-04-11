@@ -81,7 +81,10 @@ db1.AddTag(&honeycomb.Tag{Name: "SourceTag", Value: plc.DINT(100), ...})
 // First, register db1 with db2
 db2.RegisterDatabase("DB1_ID", db1)
 // Now, create an alias that points to the tag in db1
-db2.AddTag(&honeycomb.Tag{Name: "AliasToDB1", IsRemoteAlias: true, RemoteDBID: "DB1_ID", RemoteTagName: "SourceTag"})
+db2.AddTag(&honeycomb.Tag{
+    Name: "AliasToDB1",
+    RemoteAlias: &honeycomb.RemoteAliasInfo{DBID: "DB1_ID", TagName: "SourceTag"},
+})
 
 // Reading/writing "AliasToDB1" in db2 will now transparently access "SourceTag" in db1.
 val, _ := db2.GetTagValue("AliasToDB1") // val will be plc.DINT(100)
