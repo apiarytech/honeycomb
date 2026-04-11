@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -60,7 +61,6 @@ func TestAddAndGetTag(t *testing.T) {
 			DataType: TypeDINT,
 		},
 		Description: "A test tag",
-		Forced:      false,
 	}
 
 	// Test adding a new tag
@@ -405,7 +405,6 @@ func TestTaggerInterfaceImplementation(t *testing.T) {
 			DataType: TypeLREAL,
 		},
 		Description: "A sample description.",
-		Forced:      false,
 	}
 
 	// Assign to the interface to check for compile-time satisfaction.
@@ -437,7 +436,7 @@ func TestTaggerInterfaceImplementation(t *testing.T) {
 	}
 
 	// Test with a true Forced flag
-	tag.Forced = true
+	tag.Force = &ForceInfo{}
 	if tag.IsForced() != true {
 		t.Errorf("IsForced() with Forced true = %v; want true", tag.IsForced())
 	}
@@ -468,8 +467,7 @@ func TestTaggerInterfaceUsage(t *testing.T) {
 		},
 		Value:       plc.REAL(1500.0),
 		Description: "Current speed of the main motor in RPM.",
-		ForceValue:  plc.REAL(0.0),
-		Forced:      true, // The tag is forced.
+		Force:       &ForceInfo{Value: plc.REAL(0.0)}, // The tag is forced.
 	}
 
 	// 2. Pass the concrete type (*Tag) to a function that expects the
@@ -535,9 +533,8 @@ func TestTagGetValueForced(t *testing.T) {
 		TypeInfo: &TypeInfo{
 			DataType: TypeDINT,
 		},
-		Value:      plc.DINT(100),
-		Forced:     true,
-		ForceValue: plc.DINT(999),
+		Value: plc.DINT(100),
+		Force: &ForceInfo{Value: plc.DINT(999)},
 	}
 
 	// 2. Call GetValue and check if it returns the ForceValue.
@@ -552,9 +549,8 @@ func TestTagGetValueForced(t *testing.T) {
 		TypeInfo: &TypeInfo{
 			DataType: TypeDINT,
 		},
-		Value:      plc.DINT(100),
-		Forced:     false,
-		ForceValue: plc.DINT(999), // ForceValue is set but should be ignored.
+		Value: plc.DINT(100),
+		Force: nil, // Not forced
 	}
 
 	// 4. Call GetValue and check if it returns the regular Value.
@@ -684,14 +680,14 @@ func TestGetAndSetTagForced(t *testing.T) {
 	tagName := "MyForcedTag"
 
 	// Add a tag, initially not forced.
-	db.AddTag(&Tag{Name: tagName, TypeInfo: &TypeInfo{DataType: TypeBOOL}, Forced: false})
+	db.AddTag(&Tag{Name: tagName, TypeInfo: &TypeInfo{DataType: TypeBOOL}})
 
 	// 1. Set Forced to true.
 	updatedTag, err := db.SetTagForced(tagName, true)
 	if err != nil {
 		t.Fatalf("SetTagForced(true) returned an unexpected error: %v", err)
 	}
-	if !updatedTag.Forced {
+	if updatedTag.Force == nil {
 		t.Error("Returned tag from SetTagForced(true) was not marked as forced.")
 	}
 
@@ -709,7 +705,7 @@ func TestGetAndSetTagForced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetTagForced(false) returned an unexpected error: %v", err)
 	}
-	if updatedTag.Forced {
+	if updatedTag.Force != nil {
 		t.Error("Returned tag from SetTagForced(false) was still marked as forced.")
 	}
 
@@ -740,8 +736,8 @@ func TestGetAndSetTagForceValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetTagForceValue returned an unexpected error: %v", err)
 	}
-	if updatedTag.ForceValue != forceValue {
-		t.Errorf("Returned tag from SetTagForceValue has incorrect ForceValue. Got %v, want %v", updatedTag.ForceValue, forceValue)
+	if updatedTag.Force == nil || updatedTag.Force.Value != forceValue {
+		t.Errorf("Returned tag from SetTagForceValue has incorrect ForceValue. Got %v, want %v", updatedTag.Force, forceValue)
 	}
 
 	// Verify the change using GetTagForceValue.
@@ -1089,9 +1085,10 @@ func benchmarkDB(b *testing.B) (*TagDatabase, string) {
 		TypeInfo: &TypeInfo{
 			DataType: TypeLREAL,
 		},
-		Value:      plc.LREAL(123.456),
-		Forced:     true,
-		ForceValue: plc.LREAL(789.012),
+		Value: plc.LREAL(123.456),
+		Force: &ForceInfo{
+			Value: plc.LREAL(789.012),
+		},
 	}
 	if err := db.AddTag(tag); err != nil {
 		b.Fatalf("Failed to add tag for benchmark: %v", err)
@@ -1133,6 +1130,154 @@ func BenchmarkGetTagAlias(b *testing.B) {
 	}
 }
 
+// setupBenchmarkDatabase is a helper function to create a database with a specified number of tags for benchmarking.
+func setupBenchmarkDatabase(b *testing.B, numTags int) (*TagDatabase, []string) {
+	b.Helper()
+	db := NewTagDatabase()
+	tagNames := make([]string, numTags)
+	for i := 0; i < numTags; i++ {
+		name := fmt.Sprintf("Tag_%d", i)
+		tagNames[i] = name
+		tag := &Tag{
+			Name:     name,
+			TypeInfo: &TypeInfo{DataType: TypeDINT},
+			Value:    plc.DINT(i),
+		}
+		if err := db.AddTag(tag); err != nil {
+			b.Fatalf("Failed to add tag for benchmark: %v", err)
+		}
+	}
+	return db, tagNames
+}
+
+// setupBenchmarkDatabaseForPersistence is a helper to create a database with a specified number of retainable tags.
+func setupBenchmarkDatabaseForPersistence(b *testing.B, numTags int) (*TagDatabase, []string) {
+	b.Helper()
+	db := NewTagDatabase()
+	tagNames := make([]string, numTags)
+	for i := 0; i < numTags; i++ {
+		name := fmt.Sprintf("Tag_%d", i)
+		tagNames[i] = name
+		tag := &Tag{
+			Name:     name,
+			TypeInfo: &TypeInfo{DataType: TypeDINT},
+			Value:    plc.DINT(i),
+			Retain:   true, // Mark for persistence
+		}
+		if err := db.AddTag(tag); err != nil {
+			b.Fatalf("Failed to add tag for benchmark: %v", err)
+		}
+	}
+	return db, tagNames
+}
+
+// BenchmarkBulkOperations provides a test bench for large-scale database operations.
+func BenchmarkBulkOperations(b *testing.B) {
+	tagCounts := []int{1000, 10000, 100000}
+
+	// --- Benchmark for Adding Tags ---
+	b.Run("AddTags", func(b *testing.B) {
+		for _, numTags := range tagCounts {
+			b.Run(fmt.Sprintf("%d_Tags", numTags), func(b *testing.B) {
+				b.ReportAllocs()
+				for n := 0; n < b.N; n++ {
+					// In each iteration, we create a new DB and add tags to it
+					// to measure the pure cost of adding.
+					db := NewTagDatabase()
+					for i := 0; i < numTags; i++ {
+						db.AddTag(&Tag{
+							Name:     fmt.Sprintf("Tag_%d", i),
+							TypeInfo: &TypeInfo{DataType: TypeDINT},
+							Value:    plc.DINT(i),
+						})
+					}
+				}
+			})
+		}
+	})
+
+	// --- Benchmark for Writing (SetTagValue) ---
+	b.Run("WriteTags", func(b *testing.B) {
+		for _, numTags := range tagCounts {
+			b.Run(fmt.Sprintf("%d_Tags", numTags), func(b *testing.B) {
+				db, tagNames := setupBenchmarkDatabase(b, numTags)
+				b.ResetTimer()
+				b.ReportAllocs()
+
+				for n := 0; n < b.N; n++ {
+					for _, name := range tagNames {
+						db.SetTagValue(name, plc.DINT(n)) // Write a new value
+					}
+				}
+			})
+		}
+	})
+
+	// --- Benchmark for Reading (GetTagValue) ---
+	b.Run("ReadTags", func(b *testing.B) {
+		for _, numTags := range tagCounts {
+			b.Run(fmt.Sprintf("%d_Tags", numTags), func(b *testing.B) {
+				db, tagNames := setupBenchmarkDatabase(b, numTags)
+				b.ResetTimer()
+				b.ReportAllocs()
+
+				for n := 0; n < b.N; n++ {
+					for _, name := range tagNames {
+						db.GetTagValue(name) // Read the value
+					}
+				}
+			})
+		}
+	})
+
+	// --- Benchmark for Writing to File (WriteTagsToFile) ---
+	b.Run("WriteToFile", func(b *testing.B) {
+		for _, numTags := range tagCounts {
+			b.Run(fmt.Sprintf("%d_Tags", numTags), func(b *testing.B) {
+				db, _ := setupBenchmarkDatabaseForPersistence(b, numTags)
+				tempDir := b.TempDir()
+				filePath := filepath.Join(tempDir, "benchmark_tags.txt")
+
+				b.ResetTimer()
+				b.ReportAllocs()
+
+				for n := 0; n < b.N; n++ {
+					if err := db.WriteTagsToFile(filePath); err != nil {
+						b.Fatalf("WriteTagsToFile failed: %v", err)
+					}
+				}
+			})
+		}
+	})
+
+	// --- Benchmark for Reading from File (ReadTagsFromFile) ---
+	b.Run("ReadFromFile", func(b *testing.B) {
+		for _, numTags := range tagCounts {
+			b.Run(fmt.Sprintf("%d_Tags", numTags), func(b *testing.B) {
+				// Setup: Create the file to be read once, outside the benchmark loop.
+				sourceDB, _ := setupBenchmarkDatabaseForPersistence(b, numTags)
+				tempDir := b.TempDir()
+				filePath := filepath.Join(tempDir, "benchmark_tags_read.txt")
+				if err := sourceDB.WriteTagsToFile(filePath); err != nil {
+					b.Fatalf("Setup for ReadFromFile failed during write: %v", err)
+				}
+
+				b.ResetTimer()
+				b.ReportAllocs()
+
+				for n := 0; n < b.N; n++ {
+					// In each iteration, simulate a restart: create a new DB with tag definitions
+					// and read the values into it.
+					readDB, _ := setupBenchmarkDatabaseForPersistence(b, numTags) // Re-create to get definitions
+					if err := readDB.ReadTagsFromFile(filePath); err != nil {
+						b.Fatalf("ReadTagsFromFile failed: %v", err)
+					}
+				}
+			})
+		}
+	})
+}
+
 // BenchmarkGetTagDescription measures the performance of retrieving only the tag's description.
 func BenchmarkGetTagDescription(b *testing.B) {
 	db, tagName := benchmarkDB(b)
@@ -1142,6 +1287,64 @@ func BenchmarkGetTagDescription(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _ = db.GetTagDescription(tagName)
 	}
+}
+
+// BenchmarkPersistenceWorkers compares the performance of file persistence
+// with different numbers of worker goroutines.
+func BenchmarkPersistenceWorkers(b *testing.B) {
+	numTags := 100000 // Use a large, fixed number of tags to highlight performance differences.
+	workerCounts := []int{1, 2, 4, 8, runtime.NumCPU()}
+
+	// --- Benchmark for Writing to File with different worker counts ---
+	b.Run("WriteToFile", func(b *testing.B) {
+		for _, workers := range workerCounts {
+			b.Run(fmt.Sprintf("%d_Workers", workers), func(b *testing.B) {
+				db, _ := setupBenchmarkDatabaseForPersistence(b, numTags)
+				db.PersistenceWorkers = workers // Set the number of workers for this run.
+				tempDir := b.TempDir()
+				filePath := filepath.Join(tempDir, "benchmark_tags.txt")
+
+				b.ResetTimer()
+				b.ReportAllocs()
+
+				for n := 0; n < b.N; n++ {
+					if err := db.WriteTagsToFile(filePath); err != nil {
+						b.Fatalf("WriteTagsToFile failed: %v", err)
+					}
+				}
+			})
+		}
+	})
+
+	// --- Benchmark for Reading from File with different worker counts ---
+	b.Run("ReadFromFile", func(b *testing.B) {
+		for _, workers := range workerCounts {
+			b.Run(fmt.Sprintf("%d_Workers", workers), func(b *testing.B) {
+				// Setup: Create the file to be read once, outside the benchmark loop.
+				// We use the same number of workers for writing the test file to be consistent.
+				sourceDB, _ := setupBenchmarkDatabaseForPersistence(b, numTags)
+				sourceDB.PersistenceWorkers = workers
+				tempDir := b.TempDir()
+				filePath := filepath.Join(tempDir, "benchmark_tags_read.txt")
+				if err := sourceDB.WriteTagsToFile(filePath); err != nil {
+					b.Fatalf("Setup for ReadFromFile failed during write: %v", err)
+				}
+
+				b.ResetTimer()
+				b.ReportAllocs()
+
+				for n := 0; n < b.N; n++ {
+					// In each iteration, simulate a restart: create a new DB with tag definitions
+					// and read the values into it using the specified number of workers.
+					readDB, _ := setupBenchmarkDatabaseForPersistence(b, numTags)
+					readDB.PersistenceWorkers = workers // Set the number of workers for reading.
+					if err := readDB.ReadTagsFromFile(filePath); err != nil {
+						b.Fatalf("ReadTagsFromFile failed: %v", err)
+					}
+				}
+			})
+		}
+	})
 }
 
 // TestWriteAndReadTags verifies the entire persistence cycle.
@@ -2306,8 +2509,7 @@ func TestConstantAndRetainQualifiers(t *testing.T) {
 	}
 
 	// 4. Add and verify a RETAIN tag.
-	retainTag := &Tag{Name: retainTagName, TypeInfo: &TypeInfo{DataType: TypeREAL}}
-	retainTag.Retain = true
+	retainTag := &Tag{Name: retainTagName, TypeInfo: &TypeInfo{DataType: TypeREAL}, Retain: true}
 	db.AddTag(retainTag)
 	tag, found := db.GetTag(retainTagName)
 	if !found || !tag.IsRetain() {
@@ -2361,7 +2563,7 @@ func TestStringLengthLimit(t *testing.T) {
 		Name:  tagName, // Corrected from TypeSTRING to TypeSTRING
 		Value: plc.STRING("initial"),
 		TypeInfo: &TypeInfo{
-			DataType:  TypeSTRING,
+			DataType:  TypeSTRING, // Corrected from TypeSTRING to TypeSTRING
 			MaxLength: maxLength,
 		},
 	}
@@ -2399,9 +2601,9 @@ func TestStringLengthLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetTagForceValue failed for long string: %v", err)
 	}
-	tagAfterForce, _ := db.GetTag(tagName)
-	if tagAfterForce.ForceValue != expectedForceTruncated {
-		t.Errorf("ForceValue truncation failed. Got '%s', want '%s'", tagAfterForce.ForceValue, expectedForceTruncated)
+	forceVal, _ := db.GetTagForceValue(tagName)
+	if forceVal != expectedForceTruncated {
+		t.Errorf("ForceValue truncation failed. Got '%s', want '%s'", forceVal, expectedForceTruncated)
 	}
 
 	// 5. Test persistence of MaxLength.
@@ -2553,10 +2755,9 @@ func TestCrossDatabaseAliasing(t *testing.T) {
 	// 3. Add a remote alias tag to the second database (db2).
 	aliasTagName := "AliasForDB1Tag"
 	aliasTag := &Tag{
-		Name:          aliasTagName,
-		IsRemoteAlias: true,
-		RemoteDBID:    "DB1_ID",
-		RemoteTagName: sourceTagName,
+		Name: aliasTagName,
+		RemoteAlias: &RemoteAliasInfo{DBID: "DB1_ID",
+			TagName: sourceTagName},
 		// Note: Value, TypeInfo, etc., are ignored for remote aliases.
 	}
 	if err := db2.AddTag(aliasTag); err != nil {
@@ -2594,10 +2795,9 @@ func TestRebuildCrossDatabaseAlias(t *testing.T) {
 	sourceDB.AddTag(sourceTag)
 
 	aliasTag := &Tag{
-		Name:          "MyAlias",
-		IsRemoteAlias: true,
-		RemoteDBID:    "SourceDB_v1",
-		RemoteTagName: "SourceTag",
+		Name: "MyAlias",
+		RemoteAlias: &RemoteAliasInfo{DBID: "SourceDB_v1",
+			TagName: "SourceTag"},
 	}
 	aliasDB.AddTag(aliasTag)
 
@@ -2647,10 +2847,9 @@ func TestRemoteAliasToNonExistentTag(t *testing.T) {
 
 	// 2. Add a remote alias tag to db2 that points to a tag that does NOT exist in db1.
 	aliasTag := &Tag{
-		Name:          "AliasToNowhere",
-		IsRemoteAlias: true,
-		RemoteDBID:    "DB1_ID",
-		RemoteTagName: "NonExistentTag",
+		Name: "AliasToNowhere",
+		RemoteAlias: &RemoteAliasInfo{DBID: "DB1_ID",
+			TagName: "NonExistentTag"},
 	}
 	if err := db2.AddTag(aliasTag); err != nil {
 		t.Fatalf("AddTag for remote alias failed unexpectedly: %v", err)
@@ -2710,10 +2909,9 @@ func TestChainedCrossDatabaseAliasing(t *testing.T) {
 	// 4. Add a remote alias in db2 that points to the source tag in db1.
 	aliasInDB2Name := "AliasInDB2"
 	aliasInDB2 := &Tag{
-		Name:          aliasInDB2Name,
-		IsRemoteAlias: true,
-		RemoteDBID:    "DB1_ID",
-		RemoteTagName: sourceTagName,
+		Name: aliasInDB2Name,
+		RemoteAlias: &RemoteAliasInfo{DBID: "DB1_ID",
+			TagName: sourceTagName},
 	}
 	if err := db2.AddTag(aliasInDB2); err != nil {
 		t.Fatalf("Failed to add alias tag to db2: %v", err)
@@ -2722,10 +2920,9 @@ func TestChainedCrossDatabaseAliasing(t *testing.T) {
 	// 5. Add a remote alias in db3 that points to the alias in db2.
 	aliasInDB3Name := "AliasInDB3"
 	aliasInDB3 := &Tag{
-		Name:          aliasInDB3Name,
-		IsRemoteAlias: true,
-		RemoteDBID:    "DB2_ID",
-		RemoteTagName: aliasInDB2Name,
+		Name: aliasInDB3Name,
+		RemoteAlias: &RemoteAliasInfo{DBID: "DB2_ID",
+			TagName: aliasInDB2Name},
 	}
 	if err := db3.AddTag(aliasInDB3); err != nil {
 		t.Fatalf("Failed to add alias tag to db3: %v", err)
@@ -2758,10 +2955,9 @@ func TestAddRemoteAliasTag(t *testing.T) {
 
 	// 3. Add remote alias tag to db2. This should not panic.
 	aliasTag := &Tag{
-		Name:          "AliasToSource",
-		IsRemoteAlias: true,
-		RemoteDBID:    "DB1_ID",
-		RemoteTagName: "Source",
+		Name: "AliasToSource",
+		RemoteAlias: &RemoteAliasInfo{DBID: "DB1_ID",
+			TagName: "Source"},
 	}
 	if err := db2.AddTag(aliasTag); err != nil {
 		t.Fatalf("AddTag for remote alias failed unexpectedly: %v", err)
@@ -2779,5 +2975,145 @@ func TestAddRemoteAliasTag(t *testing.T) {
 	// 5. Verify writing through the alias works.
 	if err := db2.SetTagValue("AliasToSource", plc.INT(200)); err != nil {
 		t.Fatalf("SetTagValue on alias failed: %v", err)
+	}
+}
+
+// TestSetTagValue_CompoundAccessError verifies error handling for compound access.
+func TestSetTagValue_CompoundAccessError(t *testing.T) {
+	RegisterUDT(&MotorData{})
+	db := NewTagDatabase()
+
+	motorArrayTag := &Tag{
+		Name: "MotorLine",
+		TypeInfo: &TypeInfo{
+			DataType:    TypeARRAY,
+			ElementType: "MotorData",
+		},
+		Value: []*MotorData{
+			{Speed: 1500.0, Current: 30.5, Running: true},
+		},
+	}
+	db.AddTag(motorArrayTag)
+
+	// Attempt to set a non-existent field on a UDT within an array.
+	err := db.SetTagValue("MotorLine[0].NonExistentField", plc.INT(123))
+	if err == nil {
+		t.Fatal("Expected an error when setting a non-existent field in a compound access path, but got nil")
+	}
+
+	expectedError := "field 'NonExistentField' not found"
+	if !strings.Contains(err.Error(), expectedError) {
+		t.Errorf("Expected error to contain '%s', but got: %v", expectedError, err)
+	}
+}
+
+// TestGetNestedField_InvalidName tests the error path for getNestedField.
+func TestGetNestedField_InvalidName(t *testing.T) {
+	db := NewTagDatabase()
+	// getNestedField expects a dot in the name, so a name without a dot should fail.
+	// This path is not typically hit because GetTag handles it, but we test the unit directly.
+	_, err := db.getNestedField("InvalidName")
+	if err == nil {
+		t.Fatal("Expected an error for invalid nested tag name format, but got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid nested tag name format") {
+		t.Errorf("Expected error about invalid format, but got: %v", err)
+	}
+}
+
+// TestCalculateFlatIndex_Errors tests error conditions for calculateFlatIndex.
+func TestCalculateFlatIndex_Errors(t *testing.T) {
+	dims := []int{2, 3, 4} // A 2x3x4 array
+
+	testCases := []struct {
+		name        string
+		indices     []int
+		expectedErr string
+	}{
+		{
+			"IncorrectNumberOfIndices",
+			[]int{1, 1},
+			"incorrect number of indices",
+		},
+		{
+			"IndexOutOfBounds_Negative",
+			[]int{1, -1, 2},
+			"index -1 is out of bounds",
+		},
+		{
+			"IndexOutOfBounds_TooLarge",
+			[]int{1, 3, 0}, // Second dimension is size 3 (0-2)
+			"index 3 is out of bounds",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := calculateFlatIndex(dims, tc.indices)
+			if err == nil {
+				t.Fatalf("Expected an error but got nil")
+			}
+			if !strings.Contains(err.Error(), tc.expectedErr) {
+				t.Errorf("Expected error to contain '%s', but got: %v", tc.expectedErr, err)
+			}
+		})
+	}
+}
+
+// TestNewValueFromDataType tests the creation of new values from a DataType.
+func TestNewValueFromDataType(t *testing.T) {
+	RegisterUDT(&MotorData{})
+
+	t.Run("PrimitiveType", func(t *testing.T) {
+		val, err := NewValueFromDataType(TypeDINT)
+		if err != nil {
+			t.Fatalf("Failed to create new value for DINT: %v", err)
+		}
+		if _, ok := val.(*plc.DINT); !ok {
+			t.Errorf("Expected *plc.DINT, but got %T", val)
+		}
+	})
+
+	t.Run("UDTType", func(t *testing.T) {
+		val, err := NewValueFromDataType("MotorData")
+		if err != nil {
+			t.Fatalf("Failed to create new value for MotorData UDT: %v", err)
+		}
+		if _, ok := val.(*MotorData); !ok {
+			t.Errorf("Expected *MotorData, but got %T", val)
+		}
+	})
+
+	t.Run("UnrecognizedType", func(t *testing.T) {
+		_, err := NewValueFromDataType("NonExistentType")
+		if err == nil {
+			t.Fatal("Expected an error for an unrecognized data type, but got nil")
+		}
+	})
+}
+
+// TestDereference tests the Dereference helper function.
+func TestDereference(t *testing.T) {
+	dintVal := plc.DINT(123)
+	var nilPtr *plc.DINT
+
+	testCases := []struct {
+		name     string
+		input    interface{}
+		expected interface{}
+	}{
+		{"PointerToValue", &dintVal, dintVal},
+		{"ValueItself", dintVal, dintVal},
+		{"NilPointer", nilPtr, nil},
+		{"NilInterface", nil, nil},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := Dereference(tc.input)
+			if result != tc.expected {
+				t.Errorf("Dereference failed. Got %v (%T), want %v (%T)", result, result, tc.expected, tc.expected)
+			}
+		})
 	}
 }

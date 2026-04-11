@@ -34,9 +34,12 @@ func StartServer(db *TagDatabase, validTokens []string, port, certFile, keyFile 
 	// 2. Create a new HTTP request multiplexer (router).
 	mux := http.NewServeMux()
 	// 3. Register the handler for the `/tags/` endpoint. All requests to this path
-	//    will first pass through the authentication middleware and then be handled
-	//    by the `tagHandler` method.
+	//    (for individual tags) will pass through auth and be handled by `tagHandler`.
 	mux.Handle("/tags/", server.authMiddleware(http.HandlerFunc(server.tagHandler)))
+
+	// 4. Register a new handler for the `/tags` endpoint (for listing all tags).
+	//    This also goes through the authentication middleware.
+	mux.Handle("/tags", server.authMiddleware(http.HandlerFunc(server.handleGetAllTags)))
 
 	// 4. Configure the HTTP server.
 	httpServer := &http.Server{

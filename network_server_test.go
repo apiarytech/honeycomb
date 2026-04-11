@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 
@@ -76,6 +77,71 @@ func TestHandleGetTagValue(t *testing.T) {
 		if status := rr.Code; status != http.StatusNotFound {
 			t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusNotFound)
 		}
+	})
+}
+
+// TestHandleGetAllTags tests the server's GET /tags handler for listing all tags.
+func TestHandleGetAllTags(t *testing.T) {
+	ts := setupTestServer()
+
+	t.Run("Success", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, "/tags", nil)
+		rr := httptest.NewRecorder()
+		ts.handleGetAllTags(rr, req)
+
+		if status := rr.Code; status != http.StatusOK {
+			t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
+		}
+
+		var response []Tag
+		if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+			t.Fatalf("Failed to unmarshal response: %v", err)
+		}
+
+		// The test server adds 4 tags in setupTestServer()
+		if len(response) != 4 {
+			t.Errorf("handler returned wrong number of tags: got %d want 4", len(response))
+		}
+
+		// Sort by name for predictable checking
+		sort.Slice(response, func(i, j int) bool {
+			return response[i].Name < response[j].Name
+		})
+
+		expectedNames := []string{"MotorLine", "TestDINT", "TestREAL", "TestUDT"}
+		for i, name := range expectedNames {
+			if response[i].Name != name {
+				t.Errorf("Expected tag name '%s' at index %d, but got '%s'", name, i, response[i].Name)
+			}
+		}
+	})
+
+	t.Run("EmptyDatabase", func(t *testing.T) {
+		// Create a server with a completely empty database
+		emptyDB := NewTagDatabase()
+		emptyTS := &tagServer{
+			db:          emptyDB,
+			validTokens: []string{"test-token"},
+		}
+
+		req, _ := http.NewRequest(http.MethodGet, "/tags", nil)
+		rr := httptest.NewRecorder()
+		emptyTS.handleGetAllTags(rr, req)
+
+		if status := rr.Code; status != http.StatusOK {
+			t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
+		}
+
+		// The response for an empty database should be an empty JSON array "[]".
+		if body := strings.TrimSpace(rr.Body.String()); body != "[]" {
+			t.Errorf("handler returned wrong body for empty db: got %s want []", body)
+		}
+	})
+
+	t.Run("UnsupportedMethod", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodPost, "/tags", nil)
+		rr := httptest.NewRecorder()
+		ts.handleGetAllTags(rr, req)
 	})
 }
 

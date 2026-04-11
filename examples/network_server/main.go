@@ -19,6 +19,11 @@ func main() {
 	// Initialize a new TagDatabase for the server.
 	db := tags.NewTagDatabase()
 
+	// Optionally, configure the number of workers for persistence operations.
+	// It defaults to the number of CPU cores (runtime.NumCPU()).
+	db.PersistenceWorkers = 2 // For this example, we'll set it to 2.
+	fmt.Printf("Set persistence workers to %d.\n", db.PersistenceWorkers)
+
 	// Populate the database with some sample tags.
 	shared.PopulateDB(db)
 

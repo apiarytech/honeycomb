@@ -69,7 +69,7 @@ func PopulateDB(db *tags.TagDatabase) {
 
 // StartServer is a helper function used by the network_client example to launch
 // a server instance in the background for testing purposes.
-func StartServer(serverReady *sync.WaitGroup) {
+func StartServer(ctx context.Context, serverReady *sync.WaitGroup) {
 	db := tags.NewTagDatabase()
 	// Ensure the server started by the client example has the same tags
 	// as the standalone server example.
@@ -82,7 +82,5 @@ func StartServer(serverReady *sync.WaitGroup) {
 	keyFile := "../shared/server.key"
 	validTokens := []string{"super-secret-token-123"}
 
-	// The context.Background() is used because this server runs for the lifetime
-	// of the example and is not otherwise managed.
-	tags.StartServer(db, validTokens, port, certFile, keyFile, serverReady, context.Background())
+	tags.StartServer(db, validTokens, port, certFile, keyFile, serverReady, ctx)
 }

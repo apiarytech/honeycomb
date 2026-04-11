@@ -19,6 +19,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -98,25 +99,33 @@ type TypeInfo struct {
 	Dimensions  []int       // Dimensions holds the sizes of each dimension for multi-dimensional arrays (e.g., [2, 3] for a 2x3 array).
 }
 
+// ForceInfo encapsulates the state related to forcing a tag's value.
+// A non-nil pointer to this struct indicates the tag is forced.
+type ForceInfo struct {
+	Value interface{} // Value stores the value that overrides the actual Value when the tag is Forced.
+}
+
+// RemoteAliasInfo encapsulates the configuration for a remote alias tag.
+// A non-nil pointer to this struct indicates the tag is a remote alias.
+type RemoteAliasInfo struct {
+	DBID    string // The ID of the remote database.
+	TagName string // The name of the tag in the remote database.
+}
+
 // Tag represents a single variable (tag) in the system.
 // It encapsulates all properties and the current state of a PLC tag.
 type Tag struct {
-	valMu         sync.RWMutex // valMu provides read/write mutex protection for the tag's internal state.
-	Name          string       // Name is the unique symbolic name of the tag.
-	Value         interface{}  // Value holds the current data value of the tag.
-	Alias         string       // Alias provides an alternative, often shorter, name for the tag.
-	DirectAddress string       // DirectAddress stores the IEC 61131-3 direct address (e.g., %IX0.0, %MW10) if applicable.
-	TypeInfo      *TypeInfo    // TypeInfo is a pointer to the shared TypeInfo struct defining the tag's data type characteristics.
-	Path          string       // Path represents the hierarchical location of the tag within a larger structure or namespace.
-	Description   string       // Description provides a human-readable explanation or purpose of the tag.
-	Forced        bool         // Forced indicates whether the tag's value is currently being overridden by ForceValue.
-	Constant      bool         // Constant, if true, prevents any modification to the tag's Value or ForceValue after creation.
-	Retain        bool         // Retain, if true, marks the tag's value for persistence across application restarts.
-	ForceValue    interface{}  // ForceValue stores the value that overrides the actual Value when the tag is Forced.
-	// Fields for cross-database aliasing
-	IsRemoteAlias bool   // If true, this tag is an alias for a tag in another database.
-	RemoteDBID    string // The ID of the remote database.
-	RemoteTagName string // The name of the tag in the remote database.
+	valMu         sync.RWMutex     // valMu provides read/write mutex protection for the tag's internal state.
+	Name          string           // Name is the unique symbolic name of the tag.
+	Value         interface{}      // Value holds the current data value of the tag.
+	Alias         string           // Alias provides an alternative, often shorter, name for the tag.
+	DirectAddress string           // DirectAddress stores the IEC 61131-3 direct address (e.g., %IX0.0, %MW10) if applicable.
+	TypeInfo      *TypeInfo        // TypeInfo is a pointer to the shared TypeInfo struct defining the tag's data type characteristics.
+	Description   string           // Description provides a human-readable explanation or purpose of the tag.
+	Constant      bool             // Constant, if true, prevents any modification to the tag's Value or ForceValue after creation.
+	Retain        bool             // Retain, if true, marks the tag's value for persistence across application restarts.
+	Force         *ForceInfo       // If not nil, the tag's value is forced with the value in this struct.
+	RemoteAlias   *RemoteAliasInfo // If not nil, this tag is an alias for a tag in another database.
 }
 
 // UDT (User-Defined Type) defines the interface that any struct-based tag
@@ -244,14 +253,14 @@ func (t *Tag) GetName() string {
 func (t *Tag) GetValue() interface{} {
 	t.valMu.RLock()
 	defer t.valMu.RUnlock()
-	if t.Forced {
+	if t.Force != nil {
 		// Remote aliases do not have their own force values.
 		// The forcing is handled on the remote tag itself.
-		if t.IsRemoteAlias {
+		if t.RemoteAlias != nil {
 			// This path should ideally not be hit if GetTagValue is used, but as a safeguard:
 			return nil
 		}
-		return t.ForceValue
+		return t.Force.Value
 	}
 	return t.Value
 }
@@ -334,7 +343,7 @@ func (t *Tag) SetValue(value interface{}) error {
 func (t *Tag) GetForceValue() interface{} {
 	t.valMu.RLock()
 	defer t.valMu.RUnlock()
-	return t.ForceValue
+	return t.Force.Value
 }
 
 // SetForceValue updates the forced value of the tag.
@@ -349,8 +358,8 @@ func (t *Tag) SetForceValue(value interface{}) error {
 	}
 
 	// Allow nil to clear the force honeycomb.Value
-	if value == nil {
-		t.ForceValue = nil
+	if value == nil && t.Force != nil {
+		t.Force.Value = nil
 		return nil
 	}
 
@@ -408,7 +417,10 @@ func (t *Tag) SetForceValue(value interface{}) error {
 		return fmt.Errorf("force value for tag '%s' is out of range: %w", t.Name, err)
 	}
 
-	t.ForceValue = value
+	if t.Force == nil {
+		t.Force = &ForceInfo{}
+	}
+	t.Force.Value = value
 	return nil
 }
 
@@ -437,7 +449,7 @@ func (t *Tag) GetDescription() string {
 func (t *Tag) IsForced() bool {
 	t.valMu.RLock()
 	defer t.valMu.RUnlock()
-	return t.Forced
+	return t.Force != nil
 }
 
 // IsConstant checks if the tag is immutable.
@@ -466,13 +478,6 @@ func (t *Tag) GetTypeInfo() *TypeInfo {
 	t.valMu.RLock()
 	defer t.valMu.RUnlock()
 	return t.TypeInfo
-}
-
-// GetPath returns the hierarchical path of the tag.
-func (t *Tag) GetPath() string {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
-	return t.Path
 }
 
 // Tagger defines the interface for interacting with a single tag.
@@ -517,18 +522,21 @@ type TagDatabaseManager interface {
 // TagDatabase is a thread-safe implementation of the TagDatabaseManager.
 type TagDatabase struct {
 	tags             sync.Map
-	directAddressMap sync.Map                       // map[string]string (direct address -> symbolic name)
-	typeRegistry     sync.Map                       // map[DataType]*TypeInfo
-	subscriptions    map[string]map[uint64]chan Tag // Changed to chan Tag
+	directAddressMap sync.Map // map[string]string (direct address -> symbolic name)
+	typeRegistry     sync.Map // map[DataType]*TypeInfo
+	subscriptions    map[string]map[uint64]chan Tag
 	subMu            sync.RWMutex
-	dbRegistry       sync.Map // Instance-level registry: map[string]*TagDatabase
+	dbRegistry       sync.Map // Instance-level registry: map[string]DatabaseAccessor
+	// PersistenceWorkers specifies the number of worker goroutines to use for
+	// file read/write operations. It defaults to runtime.NumCPU().
+	PersistenceWorkers int
 }
 
 // DatabaseAccessor defines the interface for any object that can be registered
 // as a remote database, allowing for both in-process and networked aliasing.
 type DatabaseAccessor interface {
-	getTagValueRecursive(name string, depth int) (interface{}, error)
-	setTagValueRecursive(name string, value interface{}, depth int) error
+	getTagValueRecursive(name string, depth int) (any, error)
+	setTagValueRecursive(name string, value any, depth int) error
 }
 
 // NetworkDatabaseClient is an implementation of DatabaseAccessor that communicates
@@ -539,7 +547,8 @@ type DatabaseAccessor interface {
 // NewTagDatabase creates and returns a new TagDatabase instance.
 func NewTagDatabase() *TagDatabase {
 	return &TagDatabase{
-		subscriptions: make(map[string]map[uint64]chan Tag),
+		subscriptions:      make(map[string]map[uint64]chan Tag),
+		PersistenceWorkers: runtime.NumCPU(), // Default to the number of CPU cores.
 	}
 }
 
@@ -618,7 +627,7 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 	// For non-alias tags, if TypeInfo is not already provided, resolve and assign it.
 	// If it is provided (common when pre-adding tags for persistence), we still need to
 	// ensure it's registered in the type registry.
-	if !tag.IsRemoteAlias && tag.TypeInfo == nil {
+	if tag.RemoteAlias == nil && tag.TypeInfo == nil {
 		typeInfo, err := db.getOrRegisterTypeInfo(tag)
 		if err != nil {
 			return fmt.Errorf("error processing type for tag '%s': %w", tag.Name, err)
@@ -640,7 +649,7 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 
 	tagPtr.valMu.Lock()
 	// Only attempt to auto-instantiate UDTs for non-alias tags with valid TypeInfo.
-	if !tagPtr.IsRemoteAlias && tagPtr.TypeInfo != nil {
+	if tagPtr.RemoteAlias == nil && tagPtr.TypeInfo != nil {
 		_, isUDT := newUDTInstance(tagPtr.TypeInfo.DataType)
 		if isUDT && tagPtr.Value == nil {
 			if instance, ok := newUDTInstance(tagPtr.TypeInfo.DataType); ok {
@@ -742,15 +751,16 @@ func (db *TagDatabase) GetTag(name string) (Tag, bool) {
 		tagPtr.valMu.RLock() // Corrected from TypeARRAY to honeycomb.TypeARRAY
 		defer tagPtr.valMu.RUnlock()
 		return Tag{
-			Name:        tagPtr.Name,
-			Value:       tagPtr.Value,
-			Alias:       tagPtr.Alias,
-			TypeInfo:    tagPtr.TypeInfo,
-			Description: tagPtr.Description,
-			Forced:      tagPtr.Forced,
-			Constant:    tagPtr.Constant,
-			Retain:      tagPtr.Retain,
-			ForceValue:  tagPtr.ForceValue,
+			Name:          tagPtr.Name,
+			Value:         tagPtr.Value,
+			Alias:         tagPtr.Alias,
+			TypeInfo:      tagPtr.TypeInfo,
+			Description:   tagPtr.Description, // This could be the field's description if we add it
+			Force:         tagPtr.Force,
+			Retain:        tagPtr.Retain,
+			DirectAddress: tagPtr.DirectAddress,
+			RemoteAlias:   tagPtr.RemoteAlias,
+			Constant:      tagPtr.Constant,
 		}, true
 	}
 
@@ -768,8 +778,7 @@ func (db *TagDatabase) GetTag(name string) (Tag, bool) {
 			Alias:       nestedtag.Alias,
 			TypeInfo:    nestedtag.TypeInfo,
 			Description: nestedtag.Description, // This could be the field's description if we add it
-			Forced:      nestedtag.Forced,
-			ForceValue:  nestedtag.ForceValue,
+			Force:       nestedtag.Force,
 		}, true
 	}
 
@@ -796,8 +805,8 @@ func (db *TagDatabase) GetTag(name string) (Tag, bool) {
 
 // GetAllTags returns a slice of all tags currently in the database.
 func (db *TagDatabase) GetAllTags() []Tag {
-	var tags []Tag
-	db.tags.Range(func(key, value interface{}) bool {
+	tags := make([]Tag, 0) // Initialize as an empty slice, not a nil slice.
+	db.tags.Range(func(_, value interface{}) bool {
 		tagPtr := value.(*Tag)
 		tagPtr.valMu.RLock()
 		tags = append(tags, Tag{
@@ -806,10 +815,9 @@ func (db *TagDatabase) GetAllTags() []Tag {
 			Alias:       tagPtr.Alias,
 			TypeInfo:    tagPtr.TypeInfo,
 			Description: tagPtr.Description,
-			Forced:      tagPtr.Forced,
 			Constant:    tagPtr.Constant,
 			Retain:      tagPtr.Retain,
-			ForceValue:  tagPtr.ForceValue,
+			Force:       tagPtr.Force,
 		})
 		tagPtr.valMu.RUnlock()
 		return true
@@ -834,8 +842,7 @@ func (db *TagDatabase) GetTags(names []string) map[string]Tag {
 				Description: tagPtr.Description,
 				Constant:    tagPtr.Constant,
 				Retain:      tagPtr.Retain,
-				Forced:      tagPtr.Forced,
-				ForceValue:  tagPtr.ForceValue,
+				Force:       tagPtr.Force,
 			}
 			tagPtr.valMu.RUnlock()
 		}
@@ -858,8 +865,7 @@ func (db *TagDatabase) GetTagsByType(dataType DataType) []Tag {
 				Description: tag.Description,
 				Constant:    tag.Constant,
 				Retain:      tag.Retain,
-				Forced:      tag.Forced,
-				ForceValue:  tag.ForceValue,
+				Force:       tag.Force,
 			})
 			tag.valMu.RUnlock()
 		}
@@ -1002,8 +1008,7 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 		Description: tagPtr.Description,
 		Constant:    tagPtr.Constant,
 		Retain:      tagPtr.Retain,
-		Forced:      tagPtr.Forced,
-		ForceValue:  tagPtr.ForceValue,
+		Force:       tagPtr.Force,
 	}, nil
 }
 
@@ -1027,16 +1032,16 @@ func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, dept
 	// Check for remote alias before any other processing.
 	if val, found := db.tags.Load(name); found {
 		tag := val.(*Tag)
-		if tag.IsRemoteAlias {
+		if tag.RemoteAlias != nil {
 			if depth > 10 { // Prevent infinite recursion
 				return fmt.Errorf("max recursion depth exceeded for remote alias '%s'", name)
 			}
-			remoteDB, found := db.getDatabase(tag.RemoteDBID)
+			remoteDB, found := db.getDatabase(tag.RemoteAlias.DBID)
 			if !found {
-				return fmt.Errorf("remote database with ID '%s' not found for alias '%s'", tag.RemoteDBID, name)
+				return fmt.Errorf("remote database with ID '%s' not found for alias '%s'", tag.RemoteAlias.DBID, name)
 			}
 			// Call the remote database's SetTagValue.
-			return remoteDB.setTagValueRecursive(tag.RemoteTagName, value, depth+1)
+			return remoteDB.setTagValueRecursive(tag.RemoteAlias.TagName, value, depth+1)
 		}
 	}
 
@@ -1119,17 +1124,17 @@ func (db *TagDatabase) getTagValueRecursive(name string, depth int) (interface{}
 	if found {
 		tag := val.(*Tag)
 		// STEP 3: Remote Alias Resolution.
-		// If the found tag is a remote alias, we must delegate the request to the target database.
-		if tag.IsRemoteAlias {
+		// If the found tag is a remote alias, we must delegate the request to the target database. // Corrected from IsRemoteAlias to RemoteAlias
+		if tag.RemoteAlias != nil {
 			if depth > 10 { // Safety check to prevent infinite loops in alias chains.
 				return nil, fmt.Errorf("max recursion depth exceeded for remote alias '%s'", name)
 			}
-			remoteDB, found := db.getDatabase(tag.RemoteDBID)
+			remoteDB, found := db.getDatabase(tag.RemoteAlias.DBID)
 			if !found {
-				return nil, fmt.Errorf("remote database with ID '%s' not found for alias '%s'", tag.RemoteDBID, name)
+				return nil, fmt.Errorf("remote database with ID '%s' not found for alias '%s'", tag.RemoteAlias.DBID, name)
 			}
 			// Recursively call this function on the remote DB with the remote tag name.
-			return remoteDB.getTagValueRecursive(tag.RemoteTagName, depth+1)
+			return remoteDB.getTagValueRecursive(tag.RemoteAlias.TagName, depth+1)
 		}
 		// If it's a regular tag, return its value, respecting the forced status.
 		return tag.GetValue(), nil // Use GetValue() to respect forcing
@@ -1199,8 +1204,7 @@ func (db *TagDatabase) SetTagDescription(name string, description string) (Tag, 
 		Description: tagPtr.Description,
 		Constant:    tagPtr.Constant,
 		Retain:      tagPtr.Retain,
-		Forced:      tagPtr.Forced,
-		ForceValue:  tagPtr.ForceValue,
+		Force:       tagPtr.Force,
 	}, nil
 }
 
@@ -1236,20 +1240,18 @@ func (db *TagDatabase) SetTagForced(name string, forced bool) (Tag, error) {
 	}
 	tag := val.(*Tag)
 	tag.valMu.Lock() // Corrected from TypeARRAY to honeycomb.TypeARRAY
-	tag.Forced = forced
+	if forced {
+		if tag.Force == nil {
+			tag.Force = &ForceInfo{} // Initialize if it doesn't exist
+		}
+	} else {
+		tag.Force = nil // Clear the force state
+	}
 	tag.valMu.Unlock()
 	// Create and return a safe copy of the tag's state.
-	return Tag{
-		Name:        tag.Name,
-		Value:       tag.Value,
-		Alias:       tag.Alias,
-		TypeInfo:    tag.TypeInfo,
-		Description: tag.Description,
-		Forced:      tag.Forced,
-		Constant:    tag.Constant,
-		Retain:      tag.Retain,
-		ForceValue:  tag.ForceValue,
-	}, nil
+	tag.valMu.RLock()
+	defer tag.valMu.RUnlock()
+	return *tag, nil
 }
 
 // GetTagDescription retrieves the Description of a tag by its name.
@@ -1271,7 +1273,7 @@ func (db *TagDatabase) GetTagForced(name string) (bool, error) {
 	tag := val.(*Tag)
 	tag.valMu.RLock()
 	defer tag.valMu.RUnlock()
-	return tag.Forced, nil
+	return tag.Force != nil, nil
 }
 
 // SetTagForceValue updates the ForceValue for a given tag.
@@ -1292,8 +1294,11 @@ func (db *TagDatabase) SetTagForceValue(name string, value interface{}) (Tag, er
 	defer tag.valMu.Unlock()
 
 	// Allow nil to clear the force honeycomb.Value
-	if value == nil {
-		tag.ForceValue = nil
+	if value == nil && tag.Force != nil {
+		tag.Force.Value = nil
+	} else if value == nil {
+		// Do nothing if trying to set a nil value on a non-forced tag.
+		// Or, we could clear the force state entirely: tag.Force = nil
 	} else {
 		if tag.TypeInfo.DataType == TypeARRAY {
 			val := reflect.ValueOf(value)
@@ -1308,7 +1313,10 @@ func (db *TagDatabase) SetTagForceValue(name string, value interface{}) (Tag, er
 					return Tag{}, fmt.Errorf("type mismatch for element %d in array force value for tag '%s': expects DataType %s, but got %T", i, tag.Name, tag.TypeInfo.ElementType, elem)
 				}
 			}
-			tag.ForceValue = value
+			if tag.Force == nil {
+				tag.Force = &ForceInfo{}
+			}
+			tag.Force.Value = value
 		} else {
 			actualDataType, ok := getDataType(reflect.TypeOf(value))
 			if !ok {
@@ -1334,21 +1342,14 @@ func (db *TagDatabase) SetTagForceValue(name string, value interface{}) (Tag, er
 					}
 				}
 			}
-			tag.ForceValue = value
+			if tag.Force == nil {
+				tag.Force = &ForceInfo{}
+			}
+			tag.Force.Value = value
 		}
 	}
-	// Create and return a safe copy of the tag's state.
-	return Tag{
-		Name:        tag.Name,
-		Value:       tag.Value,
-		Alias:       tag.Alias,
-		TypeInfo:    tag.TypeInfo,
-		Description: tag.Description,
-		Forced:      tag.Forced,
-		Constant:    tag.Constant,
-		Retain:      tag.Retain,
-		ForceValue:  tag.ForceValue,
-	}, nil
+	// Return a safe copy.
+	return *tag, nil
 }
 
 // GetTagForceValue retrieves the ForceValue of a tag by its name.
@@ -1360,7 +1361,10 @@ func (db *TagDatabase) GetTagForceValue(name string) (interface{}, error) {
 	tag := val.(*Tag)
 	tag.valMu.RLock()
 	defer tag.valMu.RUnlock()
-	return tag.ForceValue, nil
+	if tag.Force != nil {
+		return tag.Force.Value, nil
+	}
+	return nil, nil
 }
 
 // notifySubscribers iterates through all subscriptions for a given tag and invokes their callbacks.
@@ -1376,10 +1380,9 @@ func (db *TagDatabase) notifySubscribers(tag *Tag) {
 		Alias:       tag.Alias,
 		TypeInfo:    tag.TypeInfo,
 		Description: tag.Description,
-		Forced:      tag.Forced,
-		ForceValue:  tag.ForceValue,
 		Constant:    tag.Constant,
 		Retain:      tag.Retain,
+		Force:       tag.Force,
 	}
 	tag.valMu.RUnlock()
 
@@ -1591,6 +1594,7 @@ type persistentTag struct {
 // and current value to a file.
 // This function is optimized to reduce memory allocations by pre-calculating
 // the required buffer size and writing directly to a strings.Builder.
+// It uses a worker pool to parallelize JSON marshaling for performance.
 func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 	// Pre-allocate a slice to hold the lines. This avoids repeated allocations
 	// during the Range loop. We can't know the exact size if tags are added/removed
@@ -1598,35 +1602,61 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 	lines := make([]string, 0, 1024) // Start with a reasonable capacity.
 	estimatedSize := 0
 
-	db.tags.Range(func(key, value interface{}) bool {
-		tag := value.(*Tag)
-		tag.valMu.RLock()
-		defer tag.valMu.RUnlock()
+	// Use a worker pool to parallelize JSON marshaling.
+	numWorkers := db.PersistenceWorkers
+	if numWorkers < 1 {
+		numWorkers = 1 // Ensure at least one worker is used.
+	}
 
-		// Per documentation, only write tags with the Retain flag.
-		// Constants are not persisted unless also marked as Retain.
-		if !tag.IsRetain() {
-			return true // Continue to the next tag.
-		}
+	tagsChan := make(chan *Tag, numWorkers)
+	resultsChan := make(chan []byte, numWorkers)
+	var wg sync.WaitGroup
 
-		// Create a serializable representation of the tag.
-		pTag := persistentTag{
-			Name:     tag.Name,
-			TypeInfo: tag.TypeInfo,
-			Value:    tag.GetValue(), // Use GetValue to respect forcing if needed, though usually not for persistence.
-		}
+	// Start worker goroutines.
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for tag := range tagsChan {
+				tag.valMu.RLock()
+				pTag := persistentTag{
+					Name:     tag.Name,
+					TypeInfo: tag.TypeInfo,
+					Value:    tag.GetValue(),
+				}
+				tag.valMu.RUnlock()
 
-		// Marshal the entire persistentTag struct to JSON for a complete representation.
-		jsonData, err := json.Marshal(pTag)
-		if err != nil {
-			// Optionally log the error, but continue to the next tag.
+				jsonData, err := json.Marshal(pTag)
+				if err == nil {
+					resultsChan <- jsonData
+				}
+			}
+		}()
+	}
+
+	// Producer: Iterate over tags and send them to workers.
+	go func() {
+		db.tags.Range(func(key, value interface{}) bool {
+			tag := value.(*Tag)
+			if tag.IsRetain() {
+				tagsChan <- tag
+			}
 			return true
-		}
+		})
+		close(tagsChan)
+	}()
 
-		lines = append(lines, string(jsonData))
-		estimatedSize += len(jsonData) + 1 // +1 for the newline character
-		return true
-	})
+	// Closer: Wait for all workers to finish, then close the results channel.
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	// Consumer: Collect results from workers.
+	for result := range resultsChan {
+		lines = append(lines, string(result))
+		estimatedSize += len(result) + 1 // +1 for newline
+	}
 
 	// Sort lines for a consistent file output, which is good for debugging and version control.
 	sort.Strings(lines)
@@ -1654,48 +1684,83 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 	lines := strings.Split(string(data), "\n")
 	var errorList []string
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	numWorkers := db.PersistenceWorkers
+	if numWorkers < 1 {
+		numWorkers = 1 // Ensure at least one worker is used.
+	}
+
+	// Define a struct to pass results (and errors) from workers to the consumer.
+	type parseResult struct {
+		pTag persistentTag
+		err  error
+	}
+
+	linesChan := make(chan string, numWorkers)
+	resultsChan := make(chan parseResult, numWorkers)
+	var wg sync.WaitGroup
+
+	// Start worker goroutines to unmarshal JSON lines concurrently.
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for line := range linesChan {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				var pTag persistentTag
+				if err := json.Unmarshal([]byte(line), &pTag); err != nil {
+					resultsChan <- parseResult{err: fmt.Errorf("failed to unmarshal JSON: %w", err)}
+				} else {
+					resultsChan <- parseResult{pTag: pTag}
+				}
+			}
+		}()
+	}
+
+	// Producer: Feed lines from the file into the lines channel.
+	go func() {
+		for _, line := range lines {
+			linesChan <- line
+		}
+		close(linesChan)
+	}()
+
+	// Closer: Wait for all workers to finish, then close the results channel.
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	// Consumer: Process the parsed tags from the results channel.
+	for result := range resultsChan {
+		if result.err != nil {
+			errorList = append(errorList, fmt.Sprintf("line error: %v", result.err))
 			continue
 		}
 
-		// Each line is now a self-contained JSON object representing a persistentTag.
-		var pTag persistentTag
-		if err := json.Unmarshal([]byte(line), &pTag); err != nil {
-			errorList = append(errorList, fmt.Sprintf("line error: failed to unmarshal JSON: %v", err))
-			continue
-		}
-
+		pTag := result.pTag
 		tagName := pTag.Name
 		valueData := pTag.Value
 
-		// Get the tag to determine its expected data type.
 		val, found := db.tags.Load(tagName)
 		if !found {
-			// If the tag doesn't exist in the database, we can't load its value.
-			// This is expected if the application's tag configuration has changed.
-			continue
+			continue // Tag from file doesn't exist in current config, skip.
 		}
 		tag := val.(*Tag)
 
-		// Convert the string value from the file back to the tag's native type.
 		var newValue interface{}
 		var parseErr error
 
-		_, isUDT := newUDTInstance(tag.TypeInfo.DataType)
-
-		if isUDT {
-			// For UDTs, we unmarshal the JSON data back into the existing tag's value pointer.
+		if _, isUDT := newUDTInstance(tag.TypeInfo.DataType); isUDT {
 			tag.valMu.Lock()
-			// The value from JSON is a map[string]interface{}, so we re-marshal and unmarshal.
 			udtJSON, _ := json.Marshal(valueData)
 			if jsonErr := json.Unmarshal(udtJSON, tag.Value); jsonErr != nil {
 				parseErr = fmt.Errorf("failed to process UDT data for '%s': %w", tagName, jsonErr)
 			}
 			tag.valMu.Unlock()
 		} else if tag.TypeInfo.DataType == TypeARRAY {
-			// For arrays, convert the []interface{} from JSON into a strongly-typed slice.
 			if genericSlice, ok := valueData.([]interface{}); ok {
 				if elemGoType, ok := getGoType(tag.TypeInfo.ElementType); ok {
 					newSlice := reflect.MakeSlice(reflect.SliceOf(elemGoType), len(genericSlice), len(genericSlice))
@@ -2388,6 +2453,21 @@ func (ts *tagServer) handleGetTagValue(w http.ResponseWriter, r *http.Request, t
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
+}
+
+// handleGetAllTags handles GET requests to list all available tags.
+func (ts *tagServer) handleGetAllTags(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Server] GET /tags")
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	allTags := ts.db.GetAllTags() // This method returns a safe copy.
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(allTags)
 }
 
 // handleSetTagValue handles PUT requests to update a tag's value.

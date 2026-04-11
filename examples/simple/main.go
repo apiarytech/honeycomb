@@ -23,6 +23,11 @@ func main() {
 	db := tags.NewTagDatabase()
 	fmt.Println("\n--- Creating and Adding Tags ---")
 
+	// Optionally, configure the number of workers for persistence operations.
+	// It defaults to the number of CPU cores (runtime.NumCPU()).
+	db.PersistenceWorkers = 2 // For this example, we'll set it to 2.
+	fmt.Printf("Set persistence workers to %d.\n", db.PersistenceWorkers)
+
 	// Add a simple DINT tag
 	dintTag := &tags.Tag{
 		Name:  "MyDINT",

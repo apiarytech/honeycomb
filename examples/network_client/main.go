@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -19,11 +20,15 @@ import (
 // The main function acts as the client application.
 func main() {
 	// --- 1. Start the server in the background ---
+	// Create a context that can be cancelled to gracefully shut down the server.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Ensure the server is shut down when the client finishes.
+
 	// Use a WaitGroup to ensure the client doesn't start making requests
 	// before the server is ready to listen.
 	var serverReady sync.WaitGroup
 	serverReady.Add(1)
-	go shared.StartServer(&serverReady)
+	go shared.StartServer(ctx, &serverReady)
 	// Wait for the server to signal that it's ready.
 	serverReady.Wait()
 
