@@ -1,0 +1,60 @@
+name: Security Checks
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 9 AM UTC
+
+jobs:
+  gosec:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Gosec Security Scanner
+        uses: securego/gosec@master
+        with:
+          args: '-no-fail -fmt sarif -out gosec-results.sarif ./...'
+
+      - name: Upload Gosec results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: gosec-results.sarif
+          category: gosec
+
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+
+      - name: Verify go.mod integrity
+        run: |
+          go mod verify
+          go mod tidy
+          if [ -n "$(git diff go.mod go.sum)" ]; then
+            echo "go.mod or go.sum has uncommitted changes after tidy"
+            git diff go.mod go.sum
+            exit 1
+          fi
+
+      - name: Install nancy (dependency vulnerability scanner)
+        run: go install github.com/sonatype-nexus-community/nancy@latest
+
+      - name: Run nancy for dependency vulnerabilities
+        run: nancy sleuth -output text
+        continue-on-error: true
