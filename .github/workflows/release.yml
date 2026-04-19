@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+
+      - name: Run tests before release
+        run: go test -v -race ./...
+
+      - name: Create Release Notes
+        id: release_notes
+        run: |
+          TAG=${{ github.ref_name }}
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
+          if [ -z "$PREV_TAG" ]; then
+            CHANGELOG=$(git log --oneline --format="%h %s")
+          else
+            CHANGELOG=$(git log $PREV_TAG..HEAD --oneline --format="%h %s")
+          fi
+          
+          RELEASE_NOTES="## Changes in $TAG\n\n$CHANGELOG"
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
+          echo -e "$RELEASE_NOTES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          body: ${{ env.RELEASE_NOTES }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}

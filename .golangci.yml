@@ -1,0 +1,82 @@
+run:
+  timeout: 5m
+  go: '1.22'
+
+linters:
+  enable-all: true
+  disable:
+    - execinquery
+    - wsl
+    - gocognit
+    - lll
+    - ireturn
+
+linters-settings:
+  cyclop:
+    max-complexity: 15
+  gocyclo:
+    min-complexity: 15
+  gocognit:
+    min-complexity: 20
+  govet:
+    check-shadowing: true
+  golint:
+    min-confidence: 0.8
+  varcheck:
+    max-blank-identifiers: 2
+  dupl:
+    threshold: 150
+  errcheck:
+    check-type-assertions: false
+    check-blank: true
+  errorlint:
+    errorf: true
+  exhaustive:
+    check-generated: false
+  gofmt:
+    rewrite-rules:
+      - pattern: 'interface{}'
+        replacement: 'any'
+  goimports:
+    local-prefixes: github.com/apiarytech/honeycomb
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - opinionated
+      - performance
+      - experimental
+  gosimple:
+    go: '1.22'
+  gosmopolitan:
+    allow-unresolved: false
+  gosec:
+    severity: medium
+    confidence: medium
+  lll:
+    line-length: 120
+  nilnil:
+    check-desc: true
+  nolintlint:
+    require-explanation: true
+    require-specific: true
+  prealloc:
+    simple: true
+    range-loops: true
+    for-loops: true
+  tagliatelle:
+    case: snake
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - dupl
+        - gocyclo
+        - gosec
+        - testpackage
+    - source: 'nolint'
+  exclude-dirs:
+    - vendor
+  max-same-issues: 0
+  max-issues-per-linter: 0

@@ -1,0 +1,40 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go-version: ['1.22', '1.23']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Build library
+        run: go build -v .
+
+      - name: Build simple example
+        run: |
+          cd examples/simple
+          go build -v .
+
+      - name: Build on Windows
+        if: runner.os == 'Windows'
+        run: |
+          go build -v -o honeycomb.exe .
