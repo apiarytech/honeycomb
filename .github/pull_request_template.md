@@ -30,9 +30,9 @@ Please describe the changes you've made:
 - [ ] Added unit tests
 - [ ] Added integration tests
 - [ ] All tests pass locally with my changes
-- [ ] Tested on Go 1.22
-- [ ] Tested on Go 1.23
+- [ ] Tested on the minimum Go version (see `go.mod`) and the latest stable Go
 - [ ] No new test coverage gaps introduced
+- [ ] If the change touches the PLC4X connector, its tests pass (`cd connectors/plc4x && go test ./...`)
 
 ## Documentation
 
@@ -59,4 +59,4 @@ Any additional context or guidance for reviewers?
 
 ---
 
-**Note:** PRs must pass all GitHub Actions checks (tests, linting, security, build) before merging.
+**Note:** PRs must pass all GitHub Actions checks before merging: tests on Linux, macOS and Windows, the race detector, gofmt, the Raspberry Pi builds and the security checks.

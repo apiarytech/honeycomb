@@ -34,6 +34,7 @@ type StoredTag struct {
 	TypeInfo      json.RawMessage // JSON of *TypeInfo; nil for remote aliases.
 	Value         json.RawMessage // JSON of the tag's actual (not forced) value.
 	Quality       Quality         // Quality of Value when it was saved.
+	Timestamp     time.Time       // When Value or Quality last changed (the device time if a driver supplied it); zero if unknown.
 	Alias         string
 	Description   string
 	DirectAddress string
@@ -43,7 +44,7 @@ type StoredTag struct {
 	ForceValue    json.RawMessage // JSON of the force value; nil if not forced.
 	RemoteDBID    string
 	RemoteTagName string
-	UpdatedAt     time.Time
+	UpdatedAt     time.Time // When the record was saved.
 }
 
 // TagStore is the contract a durable backend must satisfy. Implementations
@@ -216,7 +217,7 @@ func (p *Persister) restoreTag(rec StoredTag) error {
 		return err
 	}
 	if value != nil {
-		if err := p.db.setSimpleTagValue(rec.Name, value, rec.Quality.restored()); err != nil {
+		if err := p.db.setSimpleTagValue(rec.Name, value, rec.Quality.restored(), rec.Timestamp); err != nil {
 			return err
 		}
 	}
@@ -278,6 +279,7 @@ func (p *Persister) tagFromStored(rec StoredTag) (*Tag, error) {
 	}
 	tag.Value = value
 	tag.Quality = rec.Quality.restored()
+	tag.Timestamp = rec.Timestamp
 
 	if p.opts.RestoreForces && rec.Forced {
 		force, err := decodeStoredValue(typeInfo, nil, rec.ForceValue)
@@ -465,6 +467,7 @@ func (p *Persister) snapshot(tag *Tag) (StoredTag, bool, error) {
 		return StoredTag{}, false, fmt.Errorf("encode value: %w", err)
 	}
 	rec.Quality = tag.Quality
+	rec.Timestamp = tag.Timestamp
 	if tag.Force != nil && tag.Force.Value != nil {
 		if rec.ForceValue, err = json.Marshal(tag.Force.Value); err != nil {
 			return StoredTag{}, false, fmt.Errorf("encode force value: %w", err)

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // NetworkDatabaseClient is an implementation of DatabaseAccessor that communicates
@@ -63,8 +64,12 @@ func (ndc *NetworkDatabaseClient) getTagQualityRecursive(name string, depth int)
 
 // setTagValueRecursive implements the DatabaseAccessor interface. It is called by a
 // local TagDatabase when a value is set on a remote alias tag.
-func (ndc *NetworkDatabaseClient) setTagValueRecursive(name string, value interface{}, quality Quality, depth int) error {
-	return ndc.putTag(name, map[string]interface{}{"value": value, "quality": quality})
+func (ndc *NetworkDatabaseClient) setTagValueRecursive(name string, value interface{}, quality Quality, timestamp time.Time, depth int) error {
+	payload := map[string]interface{}{"value": value, "quality": quality}
+	if !timestamp.IsZero() {
+		payload["timestamp"] = timestamp // otherwise the server stamps the write itself
+	}
+	return ndc.putTag(name, payload)
 }
 
 // setTagQualityRecursive implements the DatabaseAccessor interface. It changes the

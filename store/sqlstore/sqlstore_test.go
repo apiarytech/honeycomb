@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apiarytech/honeycomb"
 	"github.com/apiarytech/honeycomb/store/sqlstore"
@@ -151,7 +152,8 @@ func TestPersisterPowerCycle(t *testing.T) {
 	}
 	must(t, db.SetTagValue("Counter", plc.DINT(41)))
 	must(t, p.Flush(ctx))
-	must(t, db.SetTagValueQuality("Counter", plc.DINT(42), honeycomb.QualityBad))
+	device := time.Date(2026, 9, 30, 3, 12, 45, 250_000_000, time.UTC)
+	must(t, db.SetTagValueQualityAt("Counter", plc.DINT(42), honeycomb.QualityBad, device))
 	must(t, db.SetTagValue("Setpoint", plc.LREAL(12.5)))
 	must(t, db.SetTagValue("Motors[1].Speed", plc.REAL(1500)))
 	must(t, db.SetTagValue("Scratch", plc.DINT(7)))
@@ -190,6 +192,10 @@ func TestPersisterPowerCycle(t *testing.T) {
 		if got, err := db.GetTagQuality(name); err != nil || got != want {
 			t.Errorf("%s quality = %v (%v), want %v", name, got, err, want)
 		}
+	}
+	// The device timestamp survives the power cycle.
+	if got, _ := db.GetTag("Counter"); !got.Timestamp.Equal(device) {
+		t.Errorf("Counter timestamp = %v, want %v", got.Timestamp, device)
 	}
 	if forced, _ := db.GetTagForced("Setpoint"); forced {
 		t.Error("force state restored although RestoreForces is false")

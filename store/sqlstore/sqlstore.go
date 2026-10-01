@@ -35,7 +35,7 @@ const DefaultInstanceID = "default"
 
 // columns lists TagsTable's columns in bind-parameter order. The first two form the primary key.
 var columns = []string{
-	"instance_id", "tag_name", "data_type", "type_info", "tag_value", "quality", "alias",
+	"instance_id", "tag_name", "data_type", "type_info", "tag_value", "quality", "value_time", "alias",
 	"description", "direct_address", "is_retain", "is_constant", "is_forced",
 	"force_value", "remote_db_id", "remote_tag_name", "updated_at",
 }
@@ -162,9 +162,9 @@ func (s *Store) LoadTags(ctx context.Context) ([]honeycomb.StoredTag, error) {
 			dataType                    string
 			typeInfo, value, forceValue sql.NullString
 			quality                     int64
-			updatedAt                   any
+			valueTime, updatedAt        any
 		)
-		err := rows.Scan(&t.Name, &dataType, &typeInfo, &value, &quality, &t.Alias, &t.Description,
+		err := rows.Scan(&t.Name, &dataType, &typeInfo, &value, &quality, &valueTime, &t.Alias, &t.Description,
 			&t.DirectAddress, &t.Retain, &t.Constant, &t.Forced, &forceValue,
 			&t.RemoteDBID, &t.RemoteTagName, &updatedAt)
 		if err != nil {
@@ -174,8 +174,9 @@ func (s *Store) LoadTags(ctx context.Context) ([]honeycomb.StoredTag, error) {
 		t.TypeInfo = rawJSON(typeInfo)
 		t.Value = rawJSON(value)
 		t.Quality = honeycomb.Quality(quality)
+		t.Timestamp = asTime(valueTime)
 		t.ForceValue = rawJSON(forceValue)
-		if ts, ok := updatedAt.(time.Time); ok {
+		if ts := asTime(updatedAt); !ts.IsZero() {
 			t.UpdatedAt = ts
 		}
 		tags = append(tags, t)
@@ -203,7 +204,7 @@ func (s *Store) SaveTags(ctx context.Context, tags []honeycomb.StoredTag) error 
 				updatedAt = time.Now().UTC()
 			}
 			_, err := stmt.ExecContext(ctx, s.instance, t.Name, string(t.DataType),
-				nullJSON(t.TypeInfo), nullJSON(t.Value), int64(t.Quality), t.Alias, t.Description,
+				nullJSON(t.TypeInfo), nullJSON(t.Value), int64(t.Quality), nullTime(t.Timestamp), t.Alias, t.Description,
 				t.DirectAddress, t.Retain, t.Constant, t.Forced, nullJSON(t.ForceValue),
 				t.RemoteDBID, t.RemoteTagName, updatedAt)
 			if err != nil {
@@ -248,6 +249,45 @@ func (s *Store) Close() error {
 		return s.db.Close()
 	}
 	return nil
+}
+
+// nullTime stores a zero time as NULL ("unknown") and other times in UTC.
+func nullTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t.UTC()
+}
+
+// timeLayouts are text forms a driver may return for a timestamp column
+// instead of a time.Time (SQLite has no time type of its own).
+var timeLayouts = []string{
+	time.RFC3339Nano,
+	"2006-01-02 15:04:05.999999999-07:00",
+	"2006-01-02 15:04:05.999999999 -0700 MST",
+	"2006-01-02 15:04:05.999999999",
+}
+
+// asTime converts a scanned timestamp column to a time.Time. NULL and
+// unrecognized values give the zero time.
+func asTime(v any) time.Time {
+	var text string
+	switch v := v.(type) {
+	case time.Time:
+		return v
+	case string:
+		text = v
+	case []byte:
+		text = string(v)
+	default:
+		return time.Time{}
+	}
+	for _, layout := range timeLayouts {
+		if t, err := time.Parse(layout, text); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 func nullJSON(b json.RawMessage) any {

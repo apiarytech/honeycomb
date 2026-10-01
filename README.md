@@ -13,6 +13,8 @@ The `TagDatabase` project provides a robust, thread-safe, and feature-rich in-me
 - [Advanced Features](#advanced-features)
   - [Cross-Database Aliasing](#cross-database-aliasing)
   - [Tag Quality](#tag-quality)
+  - [Timestamps](#timestamps)
+  - [Subscriptions](#subscriptions)
 - [Installation](#installation)
 - [Usage](#usage)
   - [Initializing and Registering Types](#initializing-and-registering-types)
@@ -121,7 +123,37 @@ Quality converts to and from the industrial protocols without depending on their
 | OPC UA   | `q.OPCUA() uint32`     | `QualityFromOPCUA(uint32)`               | By severity bits; Unknown is `BadWaitingForInitialData` (`0x80320000`). |
 | PLC4X    | —                      | `QualityFromPLC4X(code.GetName())`       | `OK` → Good; `REMOTE_BUSY`, `RESPONSE_PENDING`, `REQUEST_TIMEOUT` → Uncertain; everything else → Bad. |
 
-Over the network API, `GET /tags/{name}` returns `{"value": ..., "quality": 1}`, and `PUT` accepts an optional `"quality"` (default Good), or `"quality"` alone to change only the quality.
+Over the network API, `GET /tags/{name}` returns `{"value": ..., "quality": 1, "timestamp": "..."}`, and `PUT` accepts an optional `"quality"` (default Good) and `"timestamp"` (RFC 3339, default now), or `"quality"` alone to change only the quality.
+
+### Timestamps
+Every tag carries a `Timestamp`: when its value or quality last changed. A plain write stamps the current time. A driver that knows when the device saw the change passes that time through, so a sequence-of-events record shows the device's time rather than the time honeycomb received the value:
+
+```go
+db.SetTagValueQualityAt("Pump1.Tripped", plc.BOOL(true), honeycomb.QualityGood, deviceTime)
+```
+
+A quality change (`SetTagQuality`) is stamped too. The timestamp is zero until the tag's first write, and it survives restarts through both the TagStore and tag files.
+
+### Subscriptions
+`SubscribeToTag` returns a channel that always delivers the tag's **newest** state:
+
+- The channel holds one update. If a newer update arrives before the subscriber has received the previous one, it replaces it. A spike that returns to normal while the subscriber is busy therefore leaves the subscriber with the normal value, never the stale one.
+- Updates for a tag arrive in order, even with concurrent writers. Each carries a `Sequence` number that rises by one per update, so a gap tells the subscriber how many updates it missed.
+- Each update is a complete copy of the tag, including `Quality`, `Timestamp` and `DirectAddress`.
+- Writes never block on slow subscribers.
+- A remote alias cannot be subscribed to, because its writes happen in the remote database; subscribe on the database that owns the tag.
+
+```go
+ch, id, _ := db.SubscribeToTag("Level")
+defer db.UnsubscribeFromTag("Level", id)
+var last uint64
+for update := range ch {
+    if update.Sequence > last+1 {
+        // update.Sequence - last - 1 updates were replaced before we received them.
+    }
+    last = update.Sequence
+}
+```
 
 ## Installation
 

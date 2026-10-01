@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	plc "github.com/apiarytech/royaljelly/iec"
 	"github.com/apiarytech/royaljelly/vars"
@@ -122,6 +123,8 @@ type Tag struct {
 	Name          string           // Name is the unique symbolic name of the tag.
 	Value         interface{}      // Value holds the current data value of the tag.
 	Quality       Quality          // Quality reports how trustworthy Value is. A new tag starts as QualityUnknown.
+	Timestamp     time.Time        // Timestamp is when Value or Quality last changed: the device's time if a driver supplied it (SetTagValueQualityAt), else the time of the write. Zero until the first write.
+	Sequence      uint64           // Sequence numbers the updates sent to subscribers; it is set only on those copies. It rises by one per update, so a gap means newer updates replaced ones the subscriber had not received.
 	Alias         string           // Alias provides an alternative, often shorter, name for the tag.
 	DirectAddress string           // DirectAddress stores the IEC 61131-3 direct address (e.g., %IX0.0, %MW10) if applicable.
 	TypeInfo      *TypeInfo        // TypeInfo is a pointer to the shared TypeInfo struct defining the tag's data type characteristics.
@@ -130,6 +133,36 @@ type Tag struct {
 	Retain        bool             // Retain, if true, marks the tag's value for persistence across application restarts.
 	Force         *ForceInfo       // If not nil, the tag's value is forced with the value in this struct.
 	RemoteAlias   *RemoteAliasInfo // If not nil, this tag is an alias for a tag in another database.
+
+	notifyMu sync.Mutex // serializes notifications, so subscribers receive updates in order
+	seq      uint64     // Sequence of the last update sent to subscribers; guarded by notifyMu
+}
+
+// snapshot returns a copy of the tag's state without its locks or internal
+// counters. The caller must hold valMu.
+func (t *Tag) snapshot() Tag {
+	return Tag{
+		Name:          t.Name,
+		Value:         t.Value,
+		Quality:       t.Quality,
+		Timestamp:     t.Timestamp,
+		Alias:         t.Alias,
+		DirectAddress: t.DirectAddress,
+		TypeInfo:      t.TypeInfo,
+		Description:   t.Description,
+		Constant:      t.Constant,
+		Retain:        t.Retain,
+		Force:         t.Force,
+		RemoteAlias:   t.RemoteAlias,
+	}
+}
+
+// stamp returns ts, or the current time if ts is zero.
+func stamp(ts time.Time) time.Time {
+	if ts.IsZero() {
+		return time.Now()
+	}
+	return ts
 }
 
 // UDT (User-Defined Type) defines the interface that any struct-based tag
@@ -257,6 +290,12 @@ func (t *Tag) GetName() string {
 func (t *Tag) GetValue() interface{} {
 	t.valMu.RLock()
 	defer t.valMu.RUnlock()
+	return t.presentedValue()
+}
+
+// presentedValue is GetValue for a caller that already holds valMu. (Taking a
+// read lock twice deadlocks if a writer queues in between.)
+func (t *Tag) presentedValue() interface{} {
 	if t.Force != nil {
 		// Remote aliases do not have their own force values.
 		// The forcing is handled on the remote tag itself.
@@ -278,9 +317,15 @@ func (t *Tag) SetValue(value interface{}) error {
 	return t.SetValueQuality(value, QualityGood)
 }
 
-// SetValueQuality updates the value and quality of the tag together.
-// It performs the same checks as SetValue.
+// SetValueQuality updates the value and quality of the tag together and sets
+// its Timestamp to now. It performs the same checks as SetValue.
 func (t *Tag) SetValueQuality(value interface{}, quality Quality) error {
+	return t.SetValueQualityAt(value, quality, time.Time{})
+}
+
+// SetValueQualityAt is SetValueQuality with the time the value was produced,
+// e.g. a device's source timestamp. A zero timestamp means now.
+func (t *Tag) SetValueQualityAt(value interface{}, quality Quality, timestamp time.Time) error {
 	if !quality.IsValid() {
 		return fmt.Errorf("invalid quality %d for tag '%s'", uint8(quality), t.Name)
 	}
@@ -344,6 +389,7 @@ func (t *Tag) SetValueQuality(value interface{}, quality Quality) error {
 
 	t.Value = value
 	t.Quality = quality
+	t.Timestamp = stamp(timestamp)
 	return nil
 }
 
@@ -352,6 +398,13 @@ func (t *Tag) GetQuality() Quality {
 	t.valMu.RLock()
 	defer t.valMu.RUnlock()
 	return t.Quality
+}
+
+// GetTimestamp returns when the tag's value or quality last changed.
+func (t *Tag) GetTimestamp() time.Time {
+	t.valMu.RLock()
+	defer t.valMu.RUnlock()
+	return t.Timestamp
 }
 
 // GetForceValue returns the forced value of the tag.
@@ -496,6 +549,7 @@ type Tagger interface {
 	IsForced() bool
 	GetValue() interface{}
 	GetQuality() Quality
+	GetTimestamp() time.Time
 	GetForceValue() interface{}
 	GetDirectAddress() string
 	GetTypeInfo() *TypeInfo
@@ -516,6 +570,7 @@ type TagDatabaseManager interface {
 	SetTagValue(name string, value interface{}) error
 	GetTagValue(name string) (interface{}, error)
 	SetTagValueQuality(name string, value interface{}, quality Quality) error
+	SetTagValueQualityAt(name string, value interface{}, quality Quality, timestamp time.Time) error
 	SetTagQuality(name string, quality Quality) error
 	GetTagQuality(name string) (Quality, error)
 	SetTagDescription(name string, description string) error
@@ -549,7 +604,7 @@ type TagDatabase struct {
 // as a remote database, allowing for both in-process and networked aliasing.
 type DatabaseAccessor interface {
 	getTagValueRecursive(name string, depth int) (any, error)
-	setTagValueRecursive(name string, value any, quality Quality, depth int) error
+	setTagValueRecursive(name string, value any, quality Quality, timestamp time.Time, depth int) error
 	getTagQualityRecursive(name string, depth int) (Quality, error)
 	setTagQualityRecursive(name string, quality Quality, depth int) error
 }
@@ -593,9 +648,20 @@ func (db *TagDatabase) getDatabase(id string) (DatabaseAccessor, bool) {
 // directAddressRegex matches IEC direct addresses like %IX1.0, %QW10, %MD20
 var directAddressRegex = regexp.MustCompile(`^%([IQM])([XBWDL])(\d+)(?:\.(\d+))?$`)
 
+// The channel holds one update. If an update arrives before the subscriber has
+// received the previous one, the newer update replaces it: the subscriber always
+// gets the tag's latest state, and Tag.Sequence shows how many updates it missed.
+// Updates for a tag are delivered in order.
+//
+// A remote alias cannot be subscribed to, since its writes happen in the remote
+// database; subscribe on the database that owns the tag instead.
 func (db *TagDatabase) SubscribeToTag(tagName string) (<-chan Tag, uint64, error) {
-	if _, found := db.tags.Load(tagName); !found {
+	val, found := db.tags.Load(tagName)
+	if !found {
 		return nil, 0, fmt.Errorf("tag '%s' not found for subscription", tagName)
+	}
+	if alias := val.(*Tag).RemoteAlias; alias != nil {
+		return nil, 0, fmt.Errorf("tag '%s' is a remote alias; subscribe to '%s' on database '%s' instead", tagName, alias.TagName, alias.DBID)
 	}
 
 	db.subMu.Lock()
@@ -673,6 +739,7 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 	// A Constant is never written, so its configured value is Good from the start.
 	if tagPtr.Constant && tagPtr.Value != nil && tagPtr.Quality == QualityUnknown {
 		tagPtr.Quality = QualityGood
+		tagPtr.Timestamp = stamp(tagPtr.Timestamp)
 	}
 	tagPtr.valMu.Unlock()
 
@@ -766,21 +833,9 @@ func (db *TagDatabase) GetTag(name string) (Tag, bool) {
 	val, found := db.tags.Load(name)
 	if found {
 		tagPtr := val.(*Tag)
-		tagPtr.valMu.RLock() // Corrected from TypeARRAY to honeycomb.TypeARRAY
+		tagPtr.valMu.RLock()
 		defer tagPtr.valMu.RUnlock()
-		return Tag{
-			Name:          tagPtr.Name,
-			Value:         tagPtr.Value,
-			Quality:       tagPtr.Quality,
-			Alias:         tagPtr.Alias,
-			TypeInfo:      tagPtr.TypeInfo,
-			Description:   tagPtr.Description, // This could be the field's description if we add it
-			Force:         tagPtr.Force,
-			Retain:        tagPtr.Retain,
-			DirectAddress: tagPtr.DirectAddress,
-			RemoteAlias:   tagPtr.RemoteAlias,
-			Constant:      tagPtr.Constant,
-		}, true
+		return tagPtr.snapshot(), true
 	}
 
 	// If not found, check for nested UDT field access (e.g., "MyUDT.Field").
@@ -796,6 +851,7 @@ func (db *TagDatabase) GetTag(name string) (Tag, bool) {
 			Name:        nestedtag.Name,
 			Value:       nestedtag.Value, // This is the field's value
 			Quality:     quality,
+			Timestamp:   db.tagTimestamp(name),
 			Alias:       nestedtag.Alias,
 			TypeInfo:    nestedtag.TypeInfo,
 			Description: nestedtag.Description, // This could be the field's description if we add it
@@ -813,9 +869,10 @@ func (db *TagDatabase) GetTag(name string) (Tag, bool) {
 		elemDataType, _ := getDataType(reflect.TypeOf(element))
 		quality, _ := db.GetTagQuality(name) // An element shares its array's quality.
 		return Tag{
-			Name:    name,
-			Value:   element,
-			Quality: quality,
+			Name:      name,
+			Value:     element,
+			Quality:   quality,
+			Timestamp: db.tagTimestamp(name),
 			TypeInfo: &TypeInfo{
 				DataType:    elemDataType,
 				ElementType: elemDataType, // For a single element, ElementType is the same
@@ -832,17 +889,7 @@ func (db *TagDatabase) GetAllTags() []Tag {
 	db.tags.Range(func(_, value interface{}) bool {
 		tagPtr := value.(*Tag)
 		tagPtr.valMu.RLock()
-		tags = append(tags, Tag{
-			Name:        tagPtr.Name,
-			Value:       tagPtr.Value,
-			Quality:     tagPtr.Quality,
-			Alias:       tagPtr.Alias,
-			TypeInfo:    tagPtr.TypeInfo,
-			Description: tagPtr.Description,
-			Constant:    tagPtr.Constant,
-			Retain:      tagPtr.Retain,
-			Force:       tagPtr.Force,
-		})
+		tags = append(tags, tagPtr.snapshot())
 		tagPtr.valMu.RUnlock()
 		return true
 	})
@@ -858,17 +905,7 @@ func (db *TagDatabase) GetTags(names []string) map[string]Tag {
 		if val, found := db.tags.Load(name); found {
 			tagPtr := val.(*Tag)
 			tagPtr.valMu.RLock()
-			foundTags[name] = Tag{
-				Name:        tagPtr.Name,
-				Value:       tagPtr.Value,
-				Quality:     tagPtr.Quality,
-				Alias:       tagPtr.Alias,
-				TypeInfo:    tagPtr.TypeInfo,
-				Description: tagPtr.Description,
-				Constant:    tagPtr.Constant,
-				Retain:      tagPtr.Retain,
-				Force:       tagPtr.Force,
-			}
+			foundTags[name] = tagPtr.snapshot()
 			tagPtr.valMu.RUnlock()
 		}
 	}
@@ -879,22 +916,13 @@ func (db *TagDatabase) GetTags(names []string) map[string]Tag {
 func (db *TagDatabase) GetTagsByType(dataType DataType) []Tag {
 	matchingTags := make([]Tag, 0)
 	db.tags.Range(func(key, value interface{}) bool {
-		tag := value.(*Tag) // No need to lock for read-only properties
-		if tag.TypeInfo.DataType == dataType {
-			tag.valMu.RLock()
-			matchingTags = append(matchingTags, Tag{
-				Name:        tag.Name,
-				Value:       tag.Value,
-				Quality:     tag.Quality,
-				Alias:       tag.Alias,
-				TypeInfo:    tag.TypeInfo,
-				Description: tag.Description,
-				Constant:    tag.Constant,
-				Retain:      tag.Retain,
-				Force:       tag.Force,
-			})
-			tag.valMu.RUnlock()
+		tag := value.(*Tag)
+		tag.valMu.RLock()
+		// Remote aliases have no TypeInfo of their own.
+		if tag.TypeInfo != nil && tag.TypeInfo.DataType == dataType {
+			matchingTags = append(matchingTags, tag.snapshot())
 		}
+		tag.valMu.RUnlock()
 		return true
 	})
 	return matchingTags
@@ -1012,17 +1040,7 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 	}
 
 	// Create and return a safe copy of the tag's state.
-	return Tag{
-		Name:        tagPtr.Name,
-		Value:       tagPtr.Value,
-		Quality:     tagPtr.Quality,
-		Alias:       tagPtr.Alias,
-		TypeInfo:    tagPtr.TypeInfo,
-		Description: tagPtr.Description,
-		Constant:    tagPtr.Constant,
-		Retain:      tagPtr.Retain,
-		Force:       tagPtr.Force,
-	}, nil
+	return tagPtr.snapshot(), nil
 }
 
 // SetTagValue updates the value of an existing tag in the database and marks it
@@ -1030,20 +1048,28 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 // the tag's DataType. Writing an array element or UDT field sets the quality of the
 // whole tag, since quality is tracked per top-level tag.
 func (db *TagDatabase) SetTagValue(name string, value interface{}) error {
-	return db.setTagValueRecursive(name, value, QualityGood, 0)
+	return db.setTagValueRecursive(name, value, QualityGood, time.Time{}, 0)
 }
 
 // SetTagValueQuality updates a tag's value and quality together, so readers and
-// subscribers never see one without the other. Drivers and protocol bridges
-// should use it instead of SetTagValue.
+// subscribers never see one without the other, and sets its Timestamp to now.
+// Drivers and protocol bridges should use it instead of SetTagValue.
 func (db *TagDatabase) SetTagValueQuality(name string, value interface{}, quality Quality) error {
+	return db.SetTagValueQualityAt(name, value, quality, time.Time{})
+}
+
+// SetTagValueQualityAt is SetTagValueQuality with the time the value was
+// produced. Drivers pass the device's source timestamp here, so a
+// sequence-of-events record shows when the device saw the change rather than
+// when honeycomb received it. A zero timestamp means now.
+func (db *TagDatabase) SetTagValueQualityAt(name string, value interface{}, quality Quality, timestamp time.Time) error {
 	if !quality.IsValid() {
 		return fmt.Errorf("SetTagValueQuality: invalid quality %d for tag '%s'", uint8(quality), name)
 	}
-	return db.setTagValueRecursive(name, value, quality, 0)
+	return db.setTagValueRecursive(name, value, quality, timestamp, 0)
 }
 
-func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, quality Quality, depth int) (err error) {
+func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, quality Quality, timestamp time.Time, depth int) (err error) {
 	// First, check if the name is a direct address.
 	if name, err = db.resolveAddress(name); err != nil {
 		return fmt.Errorf("SetTagValue: %w", err)
@@ -1061,18 +1087,18 @@ func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, qual
 				return fmt.Errorf("remote database with ID '%s' not found for alias '%s'", tag.RemoteAlias.DBID, name)
 			}
 			// Call the remote database's SetTagValue.
-			return remoteDB.setTagValueRecursive(tag.RemoteAlias.TagName, value, quality, depth+1)
+			return remoteDB.setTagValueRecursive(tag.RemoteAlias.TagName, value, quality, timestamp, depth+1)
 		}
 		// An exact match is a whole-tag write even if the name contains '.' or '['
 		// (e.g. "Press1.Pressure"), matching the lookup order of GetTagValue.
-		return db.setSimpleTagValue(name, value, quality)
+		return db.setSimpleTagValue(name, value, quality, timestamp)
 	}
 
 	// If the value being set is itself a UDT, we should treat it as a wholesale
 	// replacement of the tag's value, not a nested field write, even if the name // Corrected from TypeARRAY to honeycomb.TypeARRAY
 	// contains dots (which it shouldn't for this case, but we check defensively).
 	if _, isUDT := value.(UDT); isUDT {
-		return db.setSimpleTagValue(name, value, quality)
+		return db.setSimpleTagValue(name, value, quality, timestamp)
 	}
 
 	// Handle compound access like "MyArray[1].MyField"
@@ -1085,7 +1111,7 @@ func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, qual
 
 			// This is a recursive call to handle the nested field part
 			// on the result of the array access part.
-			return db.setNestedField(arrayPart, value, fieldPart, quality)
+			return db.setNestedField(arrayPart, value, fieldPart, quality, timestamp)
 		}
 	}
 
@@ -1096,7 +1122,7 @@ func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, qual
 			return err
 		}
 		// Lock, type check, and set the value.
-		if err := setArrayElementValue(baseTag, index, value, quality); err != nil {
+		if err := setArrayElementValue(baseTag, index, value, quality, timestamp); err != nil {
 			return err
 		}
 		db.notifySubscribers(baseTag) // Notify subscribers of the base array tag
@@ -1108,11 +1134,11 @@ func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, qual
 		parts := strings.SplitN(name, ".", 2)
 		basePath := parts[0]
 		fieldPath := parts[1]
-		return db.setNestedField(basePath, value, fieldPath, quality)
+		return db.setNestedField(basePath, value, fieldPath, quality, timestamp)
 	}
 
 	// If not nested, proceed with updating the whole tag value.
-	return db.setSimpleTagValue(name, value, quality)
+	return db.setSimpleTagValue(name, value, quality, timestamp)
 }
 
 // GetTagValue retrieves the value of a tag by its name.
@@ -1252,12 +1278,26 @@ func (db *TagDatabase) setTagQualityRecursive(name string, quality Quality, dept
 
 	tag.valMu.Lock()
 	changed := tag.Quality != quality
-	tag.Quality = quality
+	if changed {
+		tag.Quality = quality
+		tag.Timestamp = time.Now() // A quality change is an event in its own right.
+	}
 	tag.valMu.Unlock()
 	if changed {
 		db.notifySubscribers(tag)
 	}
 	return nil
+}
+
+// tagTimestamp returns the Timestamp that applies to a tag name, direct address,
+// array element or UDT field: that of its top-level tag. It is zero for unknown
+// names and remote aliases, whose timestamps live in the remote database.
+func (db *TagDatabase) tagTimestamp(name string) time.Time {
+	tag, err := db.qualityTag(name)
+	if err != nil || tag.RemoteAlias != nil {
+		return time.Time{}
+	}
+	return tag.GetTimestamp()
 }
 
 // qualityTag resolves a tag name, direct address, array element or UDT field to
@@ -1302,22 +1342,12 @@ func (db *TagDatabase) SetTagDescription(name string, description string) (Tag, 
 	}
 
 	tagPtr := val.(*Tag)
-	tagPtr.valMu.Lock() // Corrected from TypeARRAY to honeycomb.TypeARRAY
+	tagPtr.valMu.Lock()
 	tagPtr.Description = description
+	copied := tagPtr.snapshot()
 	tagPtr.valMu.Unlock()
 	db.markChanged(name)
-	// Create and return a safe copy of the tag's state.
-	return Tag{
-		Name:        tagPtr.Name,
-		Value:       tagPtr.Value,
-		Quality:     tagPtr.Quality,
-		Alias:       tagPtr.Alias,
-		TypeInfo:    tagPtr.TypeInfo,
-		Description: tagPtr.Description,
-		Constant:    tagPtr.Constant,
-		Retain:      tagPtr.Retain,
-		Force:       tagPtr.Force,
-	}, nil
+	return copied, nil
 }
 
 // SetTagAlias updates the Alias for a given tag.
@@ -1360,12 +1390,12 @@ func (db *TagDatabase) SetTagForced(name string, forced bool) (Tag, error) {
 	} else {
 		tag.Force = nil // Clear the force state
 	}
+	// Copy the state without the mutex: a copy of a held mutex stays locked,
+	// and the caller's first locking call on it would deadlock.
+	copied := tag.snapshot()
 	tag.valMu.Unlock()
 	db.markChanged(name)
-	// Create and return a safe copy of the tag's state.
-	tag.valMu.RLock()
-	defer tag.valMu.RUnlock()
-	return *tag, nil
+	return copied, nil
 }
 
 // GetTagDescription retrieves the Description of a tag by its name.
@@ -1455,8 +1485,8 @@ func (db *TagDatabase) SetTagForceValue(name string, value interface{}) (Tag, er
 			tag.Force.Value = value
 		}
 	}
-	// Return a safe copy.
-	return *tag, nil
+	// Return a copy without the mutex, which is held here.
+	return tag.snapshot(), nil
 }
 
 // GetTagForceValue retrieves the ForceValue of a tag by its name.
@@ -1474,45 +1504,37 @@ func (db *TagDatabase) GetTagForceValue(name string) (interface{}, error) {
 	return nil, nil
 }
 
-// notifySubscribers iterates through all subscriptions for a given tag and invokes their callbacks.
-// It passes a copy of the tag's data to avoid external modification of the internal state.
+// notifySubscribers sends a copy of the tag's current state to its subscribers.
+// Each subscription channel holds one update; one the subscriber has not
+// received yet is replaced, so the newest state always wins. Sends never block.
 func (db *TagDatabase) notifySubscribers(tag *Tag) {
-	// First, create a safe, clean copy of the tag's data. This requires locking
-	// the individual tag's mutex. We do this *before* locking the global
-	// subscription mutex to maintain a consistent lock order and prevent deadlocks.
+	// Serializing notifications per tag keeps updates in order: the copy is
+	// taken under notifyMu, so a later notification always carries newer state.
+	tag.notifyMu.Lock()
+	defer tag.notifyMu.Unlock()
+
 	tag.valMu.RLock()
-	cleanTag := Tag{
-		Name:        tag.Name,
-		Value:       tag.Value,
-		Quality:     tag.Quality,
-		Alias:       tag.Alias,
-		TypeInfo:    tag.TypeInfo,
-		Description: tag.Description,
-		Constant:    tag.Constant,
-		Retain:      tag.Retain,
-		Force:       tag.Force,
-	}
+	update := tag.snapshot()
 	tag.valMu.RUnlock()
+	tag.seq++
+	update.Sequence = tag.seq
 
 	// Every value write funnels through here, so this is where changes are
 	// queued for the attached TagStore, if any.
-	db.markChanged(cleanTag.Name)
+	db.markChanged(update.Name)
 
-	// Now, lock the subscription map and launch a single goroutine to handle all notifications for this update.
-	// This is much more efficient than launching one goroutine per subscriber.
+	// Holding subMu keeps Unsubscribe and RemoveTag from closing a channel mid-send.
 	db.subMu.RLock()
 	defer db.subMu.RUnlock()
-
-	if subscriptions, ok := db.subscriptions[cleanTag.Name]; ok {
-		go func(subs map[uint64]chan Tag, t Tag) {
-			for _, ch := range subs {
-				select {
-				case ch <- t: // Non-blocking send
-				default:
-					// Channel is full, drop update to avoid blocking.
-				}
-			}
-		}(subscriptions, cleanTag)
+	for _, ch := range db.subscriptions[update.Name] {
+		select {
+		case <-ch: // Discard the update the subscriber has not received yet.
+		default:
+		}
+		select {
+		case ch <- update:
+		default: // Only reachable if another tag of the same name is notifying at the same moment.
+		}
 	}
 }
 
@@ -1729,6 +1751,8 @@ type persistentTag struct {
 	Value    any       `json:"Value"`
 	// Quality is nil in files written before quality existed.
 	Quality *Quality `json:"Quality,omitempty"`
+	// Timestamp is when Value or Quality last changed; absent if never written.
+	Timestamp time.Time `json:"Timestamp,omitzero"`
 }
 
 // WriteTagsToFile iterates through the database and writes each tag's name
@@ -1762,10 +1786,11 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 				tag.valMu.RLock()
 				quality := tag.Quality
 				pTag := persistentTag{
-					Name:     tag.Name,
-					TypeInfo: tag.TypeInfo,
-					Value:    tag.GetValue(),
-					Quality:  &quality,
+					Name:      tag.Name,
+					TypeInfo:  tag.TypeInfo,
+					Value:     tag.presentedValue(),
+					Quality:   &quality,
+					Timestamp: tag.Timestamp,
 				}
 				tag.valMu.RUnlock()
 
@@ -1908,6 +1933,7 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 				parseErr = fmt.Errorf("failed to process UDT data for '%s': %w", tagName, jsonErr)
 			} else {
 				tag.Quality = quality
+				tag.Timestamp = stamp(pTag.Timestamp)
 			}
 			tag.valMu.Unlock()
 		} else if tag.TypeInfo.DataType == TypeARRAY {
@@ -1939,7 +1965,7 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 		// For UDTs, the value is updated by reference, so we don't call SetTagValue.
 		// For primitives and arrays, newValue will be non-nil.
 		if newValue != nil {
-			if err := db.SetTagValueQuality(tagName, newValue, quality); err != nil {
+			if err := db.SetTagValueQualityAt(tagName, newValue, quality, pTag.Timestamp); err != nil {
 				errorList = append(errorList, fmt.Sprintf("set value error for tag '%s': %v", tagName, err))
 			}
 		} // Continue to the next line even if an error occurred on this one.
@@ -2208,7 +2234,7 @@ func (db *TagDatabase) getNestedField(fullName string) (Tag, error) { // Correct
 
 // setSimpleTagValue is the internal, non-recursive implementation for setting a top-level tag's value.
 // setSimpleTagValue is the internal, non-recursive implementation for setting a top-level tag's value. It is the base case for recursive set operations.
-func (db *TagDatabase) setSimpleTagValue(name string, value interface{}, quality Quality) error {
+func (db *TagDatabase) setSimpleTagValue(name string, value interface{}, quality Quality, timestamp time.Time) error {
 	val, found := db.tags.Load(name)
 	if !found {
 		return fmt.Errorf("setTagValue: tag '%s' not found in database", name)
@@ -2217,7 +2243,7 @@ func (db *TagDatabase) setSimpleTagValue(name string, value interface{}, quality
 	tag := val.(*Tag)
 
 	// Use the tag's own SetValueQuality method to perform type checking.
-	if err := tag.SetValueQuality(value, quality); err != nil {
+	if err := tag.SetValueQualityAt(value, quality, timestamp); err != nil {
 		return err
 	}
 
@@ -2253,7 +2279,7 @@ func getFieldFromStruct(udtInstance interface{}, fieldPath string) (interface{},
 // setNestedField handles writing a value to a field within a UDT or an element of an array of UDTs.
 // The `basePath` can be a simple tag name ("MyUDT") or an array element access ("MyArray[1]").
 // The `fieldPath` is the dot-separated path to the field to set (e.g., "Config.Speed").
-func (db *TagDatabase) setNestedField(basePath string, value interface{}, fieldPath string, quality Quality) (err error) {
+func (db *TagDatabase) setNestedField(basePath string, value interface{}, fieldPath string, quality Quality, timestamp time.Time) (err error) {
 	var baseTag *Tag
 	var targetStruct reflect.Value
 
@@ -2356,6 +2382,7 @@ func (db *TagDatabase) setNestedField(basePath string, value interface{}, fieldP
 	}
 
 	baseTag.Quality = quality
+	baseTag.Timestamp = stamp(timestamp)
 	return nil
 }
 
@@ -2451,7 +2478,7 @@ func getArrayElementValue(baseTag *Tag, index int) (interface{}, error) {
 
 // setArrayElementValue writes a value to an element of a tag's slice value and
 // sets the quality of the whole array.
-func setArrayElementValue(baseTag *Tag, index int, value interface{}, quality Quality) error {
+func setArrayElementValue(baseTag *Tag, index int, value interface{}, quality Quality, timestamp time.Time) error {
 	baseTag.valMu.Lock()
 	defer baseTag.valMu.Unlock()
 
@@ -2473,6 +2500,7 @@ func setArrayElementValue(baseTag *Tag, index int, value interface{}, quality Qu
 	// Set the value at the specified index.
 	sliceVal.Index(index).Set(reflect.ValueOf(value))
 	baseTag.Quality = quality
+	baseTag.Timestamp = stamp(timestamp)
 
 	return nil
 }
@@ -2595,6 +2623,9 @@ func (ts *tagServer) handleGetTagValue(w http.ResponseWriter, r *http.Request, t
 	}
 	quality, _ := ts.db.GetTagQuality(tagName)
 	response := map[string]interface{}{"value": value, "quality": quality}
+	if timestamp := ts.db.tagTimestamp(tagName); !timestamp.IsZero() {
+		response["timestamp"] = timestamp
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
@@ -2648,6 +2679,14 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 			return
 		}
 	}
+	// "timestamp" (RFC 3339) is optional: the time the value was produced. It defaults to now.
+	var timestamp time.Time
+	if timestampJSON, ok := requestPayload["timestamp"]; ok {
+		if err := json.Unmarshal(timestampJSON, &timestamp); err != nil {
+			http.Error(w, "Invalid 'timestamp' field (want RFC 3339)", http.StatusBadRequest)
+			return
+		}
+	}
 
 	valueJSON, ok := requestPayload["value"]
 	if !ok {
@@ -2688,7 +2727,7 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 			}
 		}
 
-		if err := ts.db.SetTagValueQuality(tagName, value, quality); err != nil {
+		if err := ts.db.SetTagValueQualityAt(tagName, value, quality, timestamp); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -2709,7 +2748,7 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 			finalValue = newValuePtr
 		}
 
-		if err := ts.db.SetTagValueQuality(tagName, finalValue, quality); err != nil {
+		if err := ts.db.SetTagValueQualityAt(tagName, finalValue, quality, timestamp); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}

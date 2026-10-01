@@ -1,60 +1,92 @@
-name: Security Checks
+name: Security
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [ "main" ]
   pull_request:
-    branches:
-      - main
-      - develop
+    branches: [ "main" ]
   schedule:
-    - cron: '0 9 * * 1'  # Every Monday at 9 AM UTC
+    - cron: '0 9 * * 1' # Every Monday at 09:00 UTC
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
 
 jobs:
+  govulncheck:
+    name: Known vulnerabilities (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [ ".", "connectors/plc4x" ]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+
+    # Reports only vulnerabilities in code the module actually calls.
+    - name: Run govulncheck
+      run: |
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        govulncheck ./...
+
   gosec:
+    name: Static security analysis
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload results to the Security tab
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: Run Gosec Security Scanner
-        uses: securego/gosec@master
-        with:
-          args: '-no-fail -fmt sarif -out gosec-results.sarif ./...'
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
 
-      - name: Upload Gosec results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v4
-        if: always()
-        with:
-          sarif_file: gosec-results.sarif
-          category: gosec
+    # Findings go to the Security tab instead of failing the build.
+    - name: Run gosec
+      run: |
+        go install github.com/securego/gosec/v2/cmd/gosec@latest
+        gosec -no-fail -fmt sarif -out gosec.sarif ./...
 
-  dependencies:
+    - name: Upload results
+      uses: github/codeql-action/upload-sarif@v4
+      if: always()
+      with:
+        sarif_file: gosec.sarif
+        category: gosec
+
+  tidy:
+    name: go.mod is tidy (${{ matrix.module }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [ ".", "connectors/plc4x" ]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: '1.22'
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
 
-      - name: Verify go.mod integrity
-        run: |
-          go mod verify
-          go mod tidy
-          if [ -n "$(git diff go.mod go.sum)" ]; then
-            echo "go.mod or go.sum has uncommitted changes after tidy"
-            git diff go.mod go.sum
-            exit 1
-          fi
+    - name: Verify module downloads
+      run: go mod verify
 
-      - name: Install nancy (dependency vulnerability scanner)
-        run: go install github.com/sonatype-nexus-community/nancy@latest
-
-      - name: Run nancy for dependency vulnerabilities
-        run: nancy sleuth -output text
-        continue-on-error: true
+    # Prints the needed changes and fails if go.mod or go.sum is not tidy.
+    - name: Check go mod tidy
+      run: go mod tidy -diff

@@ -44,7 +44,7 @@ body:
     attributes:
       label: Go Version
       description: "Output of `go version`"
-      placeholder: "go version go1.22.0 linux/amd64"
+      placeholder: "go version go1.27.1 linux/arm64"
     validations:
       required: true
   - type: input
@@ -54,6 +54,14 @@ body:
       placeholder: "Linux, macOS, Windows"
     validations:
       required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: "The machine honeycomb runs on, and `go env GOARCH` (plus `GOARM` on 32-bit ARM)"
+      placeholder: "Raspberry Pi 4, arm64 / x86-64 PC, amd64"
+    validations:
+      required: false
   - type: textarea
     id: additional
     attributes:

@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	plc "github.com/apiarytech/royaljelly/iec"
 )
@@ -107,7 +108,7 @@ func TestNetworkClient_SetTagValue(t *testing.T) {
 			Client:        server.Client(),
 		}
 
-		err := client.setTagValueRecursive("MyTag", plc.REAL(543.21), QualityGood, 0)
+		err := client.setTagValueRecursive("MyTag", plc.REAL(543.21), QualityGood, time.Time{}, 0)
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -125,7 +126,7 @@ func TestNetworkClient_SetTagValue(t *testing.T) {
 			Client:        server.Client(),
 		}
 
-		err := client.setTagValueRecursive("MyTag", plc.REAL(1.0), QualityGood, 0)
+		err := client.setTagValueRecursive("MyTag", plc.REAL(1.0), QualityGood, time.Time{}, 0)
 		if err == nil {
 			t.Fatal("Expected an error, but got nil")
 		}
@@ -171,7 +172,7 @@ func TestNetworkClient_Authentication(t *testing.T) {
 
 	// Test PUT
 	t.Run("PUT with Auth", func(t *testing.T) {
-		err := client.setTagValueRecursive("any-tag", plc.INT(1), QualityGood, 0)
+		err := client.setTagValueRecursive("any-tag", plc.INT(1), QualityGood, time.Time{}, 0)
 		if err != nil {
 			if strings.Contains(err.Error(), "Unauthorized") {
 				t.Fatalf("Authentication failed unexpectedly: %v", err)
