@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	plc "github.com/apiarytech/royaljelly"
 )
@@ -530,6 +531,8 @@ type TagDatabase struct {
 	// PersistenceWorkers specifies the number of worker goroutines to use for
 	// file read/write operations. It defaults to runtime.NumCPU().
 	PersistenceWorkers int
+	// persister is the attached TagStore's Persister, or nil. See AttachStore.
+	persister atomic.Pointer[Persister]
 }
 
 // DatabaseAccessor defines the interface for any object that can be registered
@@ -667,6 +670,7 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 	if tag.DirectAddress != "" {
 		db.directAddressMap.Store(tag.DirectAddress, tag.Name)
 	}
+	db.markChanged(tag.Name)
 	return nil
 }
 
@@ -891,6 +895,7 @@ func (db *TagDatabase) RemoveTag(name string) error {
 	if !loaded {
 		return fmt.Errorf("tag '%s' not found in database", name)
 	}
+	db.markRemoved(name)
 
 	// Also remove any active subscriptions for this tag.
 	db.subMu.Lock()
@@ -960,6 +965,8 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 
 	tagPtr.Name = newName
 	db.tags.Store(newName, tagPtr)
+	db.markRemoved(oldName)
+	db.markChanged(newName)
 
 	// Also migrate any active subscriptions from the old name to the new name.
 	db.subMu.Lock()
@@ -1195,6 +1202,7 @@ func (db *TagDatabase) SetTagDescription(name string, description string) (Tag, 
 	tagPtr.valMu.Lock() // Corrected from TypeARRAY to honeycomb.TypeARRAY
 	tagPtr.Description = description
 	tagPtr.valMu.Unlock()
+	db.markChanged(name)
 	// Create and return a safe copy of the tag's state.
 	return Tag{
 		Name:        tagPtr.Name,
@@ -1219,6 +1227,7 @@ func (db *TagDatabase) SetTagAlias(name string, alias string) error {
 	tagPtr.valMu.Lock() // Corrected from TypeARRAY to honeycomb.TypeARRAY
 	tagPtr.Alias = alias
 	tagPtr.valMu.Unlock()
+	db.markChanged(name)
 	return nil
 }
 
@@ -1248,6 +1257,7 @@ func (db *TagDatabase) SetTagForced(name string, forced bool) (Tag, error) {
 		tag.Force = nil // Clear the force state
 	}
 	tag.valMu.Unlock()
+	db.markChanged(name)
 	// Create and return a safe copy of the tag's state.
 	tag.valMu.RLock()
 	defer tag.valMu.RUnlock()
@@ -1292,6 +1302,7 @@ func (db *TagDatabase) SetTagForceValue(name string, value interface{}) (Tag, er
 	// Lock the tag to safely perform the type check and update.
 	tag.valMu.Lock()
 	defer tag.valMu.Unlock()
+	defer db.markChanged(name)
 
 	// Allow nil to clear the force honeycomb.Value
 	if value == nil && tag.Force != nil {
@@ -1385,6 +1396,10 @@ func (db *TagDatabase) notifySubscribers(tag *Tag) {
 		Force:       tag.Force,
 	}
 	tag.valMu.RUnlock()
+
+	// Every value write funnels through here, so this is where changes are
+	// queued for the attached TagStore, if any.
+	db.markChanged(cleanTag.Name)
 
 	// Now, lock the subscription map and launch a single goroutine to handle all notifications for this update.
 	// This is much more efficient than launching one goroutine per subscriber.
