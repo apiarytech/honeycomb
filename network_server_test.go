@@ -20,7 +20,7 @@ import (
 	"strings"
 	"testing"
 
-	plc "github.com/apiarytech/royaljelly"
+	plc "github.com/apiarytech/royaljelly/iec"
 )
 
 // setupTestServer creates a tagServer instance with a pre-populated database for testing.

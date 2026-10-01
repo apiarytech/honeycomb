@@ -17,7 +17,7 @@ import (
 	"sync"
 
 	tags "github.com/apiarytech/honeycomb"
-	plc "github.com/apiarytech/royaljelly"
+	plc "github.com/apiarytech/royaljelly/iec"
 )
 
 // MotorState represents the possible states of a motor.

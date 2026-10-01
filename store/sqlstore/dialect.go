@@ -46,6 +46,7 @@ var (
 func init() {
 	Register(sqliteDialect{}, "sqlite3")
 	Register(postgresDialect{}, "pgx", "postgresql")
+	Register(cockroachDialect{}, "cockroach", "crdb")
 	Register(mysqlDialect{}, "mariadb")
 	Register(sqlserverDialect{}, "mssql")
 }
@@ -114,7 +115,7 @@ func onConflictUpsert(d Dialect, table string, columns, keys []string) string {
 		strings.Join(keys, ", "), strings.Join(sets, ", "))
 }
 
-// sqliteDialect targets SQLite 3.24+ (modernc.org/sqlite or mattn/go-sqlite3).
+// sqliteDialect targets SQLite 3.35+ (modernc.org/sqlite or mattn/go-sqlite3).
 type sqliteDialect struct{}
 
 func (sqliteDialect) Name() string           { return "sqlite" }
@@ -140,6 +141,27 @@ func (d postgresDialect) Upsert(table string, columns, keys []string) string {
 func (postgresDialect) CreateMigrationsTable(table string) string {
 	return "CREATE TABLE IF NOT EXISTS " + table +
 		" (version BIGINT PRIMARY KEY, name VARCHAR(255) NOT NULL, applied_at TIMESTAMPTZ NOT NULL)"
+}
+
+// cockroachDialect targets CockroachDB 22.2+ over the PostgreSQL wire protocol
+// (pgx or lib/pq). Those drivers resolve to postgresDialect, so pass this
+// dialect explicitly in Options.Dialect.
+type cockroachDialect struct{}
+
+func (cockroachDialect) Name() string             { return "cockroachdb" }
+func (cockroachDialect) Placeholder(n int) string { return fmt.Sprintf("$%d", n) }
+func (cockroachDialect) Migrations() fs.FS        { return embeddedMigrations("cockroachdb") }
+
+// Upsert uses CockroachDB's native UPSERT, which writes the row without first
+// reading it. It matches ON CONFLICT DO UPDATE only because callers supply
+// every column; unlisted columns would be reset to their defaults.
+func (d cockroachDialect) Upsert(table string, columns, _ []string) string {
+	return fmt.Sprintf("UPSERT INTO %s (%s) VALUES (%s)",
+		table, strings.Join(columns, ", "), placeholders(d, len(columns)))
+}
+func (cockroachDialect) CreateMigrationsTable(table string) string {
+	return "CREATE TABLE IF NOT EXISTS " + table +
+		" (version INT8 PRIMARY KEY, name VARCHAR(255) NOT NULL, applied_at TIMESTAMPTZ NOT NULL)"
 }
 
 // mysqlDialect targets MySQL 5.7+ and MariaDB 10.2+ (go-sql-driver/mysql).

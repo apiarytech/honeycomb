@@ -9,7 +9,7 @@
  */
 
 // This file, persistence.go, connects a TagDatabase to a durable TagStore
-// (SQLite, PostgreSQL, MySQL, SQL Server, ...). The in-memory TagDatabase
+// (SQLite, PostgreSQL, CockroachDB, MySQL, SQL Server, ...). The in-memory TagDatabase
 // stays the system of record while the PLC runs; the Persister restores it
 // at power-up, writes changed tags behind the scan cycle at runtime, and
 // writes a final snapshot at shutdown.
@@ -33,6 +33,7 @@ type StoredTag struct {
 	DataType      DataType
 	TypeInfo      json.RawMessage // JSON of *TypeInfo; nil for remote aliases.
 	Value         json.RawMessage // JSON of the tag's actual (not forced) value.
+	Quality       Quality         // Quality of Value when it was saved.
 	Alias         string
 	Description   string
 	DirectAddress string
@@ -47,7 +48,7 @@ type StoredTag struct {
 
 // TagStore is the contract a durable backend must satisfy. Implementations
 // must be safe for concurrent use. See the store/sqlstore package for a
-// database/sql implementation covering SQLite, PostgreSQL, MySQL and SQL Server.
+// database/sql implementation covering SQLite, PostgreSQL, CockroachDB, MySQL and SQL Server.
 type TagStore interface {
 	// LoadTags returns every tag held by the store.
 	LoadTags(ctx context.Context) ([]StoredTag, error)
@@ -164,6 +165,8 @@ func (db *TagDatabase) markRemoved(name string) {
 // Restore loads persisted tags from the store into the database. Call it once at
 // power-up, after tags are configured and before the scan cycle starts.
 // Constant tags and remote aliases keep their configured values.
+// A value saved as Good is restored as Uncertain, since the process may have
+// changed while the runtime was down; other qualities are restored unchanged.
 func (p *Persister) Restore(ctx context.Context) error {
 	records, err := p.store.LoadTags(ctx)
 	if err != nil {
@@ -213,7 +216,7 @@ func (p *Persister) restoreTag(rec StoredTag) error {
 		return err
 	}
 	if value != nil {
-		if err := p.db.setSimpleTagValue(rec.Name, value); err != nil {
+		if err := p.db.setSimpleTagValue(rec.Name, value, rec.Quality.restored()); err != nil {
 			return err
 		}
 	}
@@ -274,6 +277,7 @@ func (p *Persister) tagFromStored(rec StoredTag) (*Tag, error) {
 		return nil, err
 	}
 	tag.Value = value
+	tag.Quality = rec.Quality.restored()
 
 	if p.opts.RestoreForces && rec.Forced {
 		force, err := decodeStoredValue(typeInfo, nil, rec.ForceValue)
@@ -460,6 +464,7 @@ func (p *Persister) snapshot(tag *Tag) (StoredTag, bool, error) {
 	if rec.Value, err = json.Marshal(tag.Value); err != nil {
 		return StoredTag{}, false, fmt.Errorf("encode value: %w", err)
 	}
+	rec.Quality = tag.Quality
 	if tag.Force != nil && tag.Force.Value != nil {
 		if rec.ForceValue, err = json.Marshal(tag.Force.Value); err != nil {
 			return StoredTag{}, false, fmt.Errorf("encode force value: %w", err)

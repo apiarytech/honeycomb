@@ -14,15 +14,17 @@ import (
 	apiValues "github.com/apache/plc4x/plc4go/pkg/api/values"
 	spiValues "github.com/apache/plc4x/plc4go/spi/values"
 	"github.com/apiarytech/honeycomb"
-	plc "github.com/apiarytech/royaljelly"
+	plc "github.com/apiarytech/royaljelly/iec"
 )
 
-// modbusServer is a minimal Modbus TCP server that answers "read holding
-// registers" (function 0x03) from an in-memory register table.
+// modbusServer is a minimal Modbus TCP server backed by an in-memory register
+// table. It answers "read holding registers" (0x03), "write single register"
+// (0x06) and "write multiple registers" (0x10), and counts the writes.
 type modbusServer struct {
 	listener net.Listener
 	mu       sync.Mutex
 	regs     [16]uint16
+	writes   int
 }
 
 func startModbusServer(t *testing.T) *modbusServer {
@@ -53,6 +55,18 @@ func (s *modbusServer) set(start int, words ...uint16) {
 	copy(s.regs[start:], words)
 }
 
+func (s *modbusServer) get(i int) uint16 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.regs[i]
+}
+
+func (s *modbusServer) writeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writes
+}
+
 func (s *modbusServer) serve(conn net.Conn) {
 	defer conn.Close()
 	header := make([]byte, 7) // transaction id, protocol id, length, unit id
@@ -65,26 +79,51 @@ func (s *modbusServer) serve(conn net.Conn) {
 			return
 		}
 
-		var reply []byte
-		start, count := int(binary.BigEndian.Uint16(pdu[1:3])), int(binary.BigEndian.Uint16(pdu[3:5]))
-		if pdu[0] != 0x03 || start+count > len(s.regs) {
-			reply = []byte{pdu[0] | 0x80, 0x02} // illegal data address
-		} else {
-			reply = []byte{0x03, byte(2 * count)}
-			s.mu.Lock()
-			for _, r := range s.regs[start : start+count] {
-				reply = binary.BigEndian.AppendUint16(reply, r)
-			}
-			s.mu.Unlock()
-		}
-
 		out := append([]byte{}, header[:4]...)
+		reply := s.handle(pdu)
 		out = binary.BigEndian.AppendUint16(out, uint16(len(reply)+1))
 		out = append(out, header[6])
 		if _, err := conn.Write(append(out, reply...)); err != nil {
 			return
 		}
 	}
+}
+
+func (s *modbusServer) handle(pdu []byte) []byte {
+	illegalAddress := []byte{pdu[0] | 0x80, 0x02}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	start := int(binary.BigEndian.Uint16(pdu[1:3]))
+	switch pdu[0] {
+	case 0x03:
+		count := int(binary.BigEndian.Uint16(pdu[3:5]))
+		if start+count > len(s.regs) {
+			return illegalAddress
+		}
+		reply := []byte{0x03, byte(2 * count)}
+		for _, r := range s.regs[start : start+count] {
+			reply = binary.BigEndian.AppendUint16(reply, r)
+		}
+		return reply
+	case 0x06:
+		if start >= len(s.regs) {
+			return illegalAddress
+		}
+		s.regs[start] = binary.BigEndian.Uint16(pdu[3:5])
+		s.writes++
+		return pdu // the reply echoes the request
+	case 0x10:
+		count := int(binary.BigEndian.Uint16(pdu[3:5]))
+		if start+count > len(s.regs) {
+			return illegalAddress
+		}
+		for i := range count {
+			s.regs[start+i] = binary.BigEndian.Uint16(pdu[6+2*i:])
+		}
+		s.writes++
+		return pdu[:5]
+	}
+	return []byte{pdu[0] | 0x80, 0x01} // illegal function
 }
 
 func addTag(t *testing.T, db *honeycomb.TagDatabase, name string, dt honeycomb.DataType, value any) {
@@ -141,6 +180,11 @@ func TestConnectorReadsModbusIntoTags(t *testing.T) {
 	if s, _ := connector.Status("sim"); !s.Connected || s.LastError != nil || s.LastRead.IsZero() {
 		t.Errorf("unexpected status %+v", s)
 	}
+	for name := range want {
+		if q, _ := db.GetTagQuality(name); q != honeycomb.QualityGood {
+			t.Errorf("%s quality = %v, want Good", name, q)
+		}
+	}
 }
 
 func TestConnectorReportsUnreachableDevice(t *testing.T) {
@@ -157,6 +201,9 @@ func TestConnectorReportsUnreachableDevice(t *testing.T) {
 	defer cancel()
 	go connector.Run(ctx)
 	waitFor(t, func() bool { s, ok := connector.Status("down"); return ok && s.LastError != nil && !s.Connected })
+	if q, _ := db.GetTagQuality("X"); q != honeycomb.QualityBad {
+		t.Errorf("quality of an unreachable input = %v, want Bad", q)
+	}
 }
 
 func TestConvertArrays(t *testing.T) {

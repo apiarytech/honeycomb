@@ -6,7 +6,7 @@ import (
 	"time"
 
 	tags "github.com/apiarytech/honeycomb"
-	plc "github.com/apiarytech/royaljelly"
+	plc "github.com/apiarytech/royaljelly/iec"
 )
 
 func main() {

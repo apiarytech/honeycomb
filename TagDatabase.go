@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"reflect"
@@ -26,7 +27,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	plc "github.com/apiarytech/royaljelly"
+	plc "github.com/apiarytech/royaljelly/iec"
+	"github.com/apiarytech/royaljelly/vars"
 )
 
 // DataType represents the type of a tag.
@@ -119,6 +121,7 @@ type Tag struct {
 	valMu         sync.RWMutex     // valMu provides read/write mutex protection for the tag's internal state.
 	Name          string           // Name is the unique symbolic name of the tag.
 	Value         interface{}      // Value holds the current data value of the tag.
+	Quality       Quality          // Quality reports how trustworthy Value is. A new tag starts as QualityUnknown.
 	Alias         string           // Alias provides an alternative, often shorter, name for the tag.
 	DirectAddress string           // DirectAddress stores the IEC 61131-3 direct address (e.g., %IX0.0, %MW10) if applicable.
 	TypeInfo      *TypeInfo        // TypeInfo is a pointer to the shared TypeInfo struct defining the tag's data type characteristics.
@@ -266,12 +269,21 @@ func (t *Tag) GetValue() interface{} {
 	return t.Value
 }
 
-// SetValue updates the value of the tag.
+// SetValue updates the value of the tag and marks it QualityGood.
 // It performs a type check to ensure the new value is compatible with the tag's DataType.
 // Note: This method modifies the Tag struct directly. If you retrieved this Tag from a
 // TagDatabase, you must use the database's SetTagValue method to ensure the change
 // is saved in the thread-safe map.
 func (t *Tag) SetValue(value interface{}) error {
+	return t.SetValueQuality(value, QualityGood)
+}
+
+// SetValueQuality updates the value and quality of the tag together.
+// It performs the same checks as SetValue.
+func (t *Tag) SetValueQuality(value interface{}, quality Quality) error {
+	if !quality.IsValid() {
+		return fmt.Errorf("invalid quality %d for tag '%s'", uint8(quality), t.Name)
+	}
 	t.valMu.Lock()
 	defer t.valMu.Unlock()
 
@@ -309,13 +321,7 @@ func (t *Tag) SetValue(value interface{}) error {
 
 	// String length enforcement
 	if (t.TypeInfo.DataType == TypeSTRING || t.TypeInfo.DataType == TypeWSTRING) && t.TypeInfo.MaxLength > 0 { // Corrected from TypeSTRING to honeycomb.TypeSTRING
-		if strVal, ok := value.(plc.STRING); ok {
-			if len(strVal) > t.TypeInfo.MaxLength {
-				value = strVal[:t.TypeInfo.MaxLength]
-			}
-		} else if strVal, ok := value.(string); ok {
-			value = strVal[:t.TypeInfo.MaxLength]
-		}
+		value = truncateString(value, t.TypeInfo.MaxLength)
 	}
 
 	// ENUM Type checking
@@ -337,7 +343,15 @@ func (t *Tag) SetValue(value interface{}) error {
 	}
 
 	t.Value = value
+	t.Quality = quality
 	return nil
+}
+
+// GetQuality returns the quality of the tag's value.
+func (t *Tag) GetQuality() Quality {
+	t.valMu.RLock()
+	defer t.valMu.RUnlock()
+	return t.Quality
 }
 
 // GetForceValue returns the forced value of the tag.
@@ -389,15 +403,7 @@ func (t *Tag) SetForceValue(value interface{}) error {
 
 	// String length enforcement for force value
 	if (t.TypeInfo.DataType == TypeSTRING || t.TypeInfo.DataType == TypeWSTRING) && t.TypeInfo.MaxLength > 0 {
-		if strVal, ok := value.(plc.STRING); ok {
-			if len(strVal) > t.TypeInfo.MaxLength {
-				value = strVal[:t.TypeInfo.MaxLength]
-			}
-		} else if strVal, ok := value.(string); ok {
-			if len(strVal) > t.TypeInfo.MaxLength {
-				value = strVal[:t.TypeInfo.MaxLength]
-			}
-		}
+		value = truncateString(value, t.TypeInfo.MaxLength)
 	}
 
 	// ENUM Type checking
@@ -489,6 +495,7 @@ type Tagger interface {
 	GetDescription() string
 	IsForced() bool
 	GetValue() interface{}
+	GetQuality() Quality
 	GetForceValue() interface{}
 	GetDirectAddress() string
 	GetTypeInfo() *TypeInfo
@@ -508,6 +515,9 @@ type TagDatabaseManager interface {
 	RenameTag(oldName, newName string) (Tag, error)
 	SetTagValue(name string, value interface{}) error
 	GetTagValue(name string) (interface{}, error)
+	SetTagValueQuality(name string, value interface{}, quality Quality) error
+	SetTagQuality(name string, quality Quality) error
+	GetTagQuality(name string) (Quality, error)
 	SetTagDescription(name string, description string) error
 	GetTagDescription(name string) (string, error)
 	SetTagAlias(name string, alias string) error
@@ -539,7 +549,9 @@ type TagDatabase struct {
 // as a remote database, allowing for both in-process and networked aliasing.
 type DatabaseAccessor interface {
 	getTagValueRecursive(name string, depth int) (any, error)
-	setTagValueRecursive(name string, value any, depth int) error
+	setTagValueRecursive(name string, value any, quality Quality, depth int) error
+	getTagQualityRecursive(name string, depth int) (Quality, error)
+	setTagQualityRecursive(name string, quality Quality, depth int) error
 }
 
 // NetworkDatabaseClient is an implementation of DatabaseAccessor that communicates
@@ -595,12 +607,10 @@ func (db *TagDatabase) SubscribeToTag(tagName string) (<-chan Tag, uint64, error
 
 	ch := make(chan Tag, 1) // Buffered channel to avoid blocking the publisher
 	// Use a random number for the ID to avoid overflow and make it unpredictable.
-	randVal, _ := plc.RAND(plc.ULINT(0))
-	id := reflect.ValueOf(randVal).Uint()
+	id := rand.Uint64()
 	// Ensure the ID is unique for this tag's subscriptions.
 	for _, exists := db.subscriptions[tagName][id]; exists; _, exists = db.subscriptions[tagName][id] {
-		randVal, _ = plc.RAND(plc.ULINT(0))
-		id = reflect.ValueOf(randVal).Uint()
+		id = rand.Uint64()
 	}
 	db.subscriptions[tagName][id] = ch
 	return ch, id, nil
@@ -660,6 +670,10 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 			}
 		}
 	}
+	// A Constant is never written, so its configured value is Good from the start.
+	if tagPtr.Constant && tagPtr.Value != nil && tagPtr.Quality == QualityUnknown {
+		tagPtr.Quality = QualityGood
+	}
 	tagPtr.valMu.Unlock()
 
 	// If the tag is a PLC memory address, generate and store its direct address mapping.
@@ -668,7 +682,7 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 	}
 
 	if tag.DirectAddress != "" {
-		db.directAddressMap.Store(tag.DirectAddress, tag.Name)
+		db.directAddressMap.Store(canonicalAddress(tag.DirectAddress), tag.Name)
 	}
 	db.markChanged(tag.Name)
 	return nil
@@ -757,6 +771,7 @@ func (db *TagDatabase) GetTag(name string) (Tag, bool) {
 		return Tag{
 			Name:          tagPtr.Name,
 			Value:         tagPtr.Value,
+			Quality:       tagPtr.Quality,
 			Alias:         tagPtr.Alias,
 			TypeInfo:      tagPtr.TypeInfo,
 			Description:   tagPtr.Description, // This could be the field's description if we add it
@@ -776,9 +791,11 @@ func (db *TagDatabase) GetTag(name string) (Tag, bool) {
 		if err != nil {
 			return Tag{}, false // The nested field was not found, so return false.
 		}
+		quality, _ := db.GetTagQuality(name) // A field shares its parent tag's quality.
 		return Tag{
 			Name:        nestedtag.Name,
 			Value:       nestedtag.Value, // This is the field's value
+			Quality:     quality,
 			Alias:       nestedtag.Alias,
 			TypeInfo:    nestedtag.TypeInfo,
 			Description: nestedtag.Description, // This could be the field's description if we add it
@@ -794,9 +811,11 @@ func (db *TagDatabase) GetTag(name string) (Tag, bool) {
 		}
 		// Return a temporary Tag representing the element.
 		elemDataType, _ := getDataType(reflect.TypeOf(element))
+		quality, _ := db.GetTagQuality(name) // An element shares its array's quality.
 		return Tag{
-			Name:  name,
-			Value: element,
+			Name:    name,
+			Value:   element,
+			Quality: quality,
 			TypeInfo: &TypeInfo{
 				DataType:    elemDataType,
 				ElementType: elemDataType, // For a single element, ElementType is the same
@@ -816,6 +835,7 @@ func (db *TagDatabase) GetAllTags() []Tag {
 		tags = append(tags, Tag{
 			Name:        tagPtr.Name,
 			Value:       tagPtr.Value,
+			Quality:     tagPtr.Quality,
 			Alias:       tagPtr.Alias,
 			TypeInfo:    tagPtr.TypeInfo,
 			Description: tagPtr.Description,
@@ -841,6 +861,7 @@ func (db *TagDatabase) GetTags(names []string) map[string]Tag {
 			foundTags[name] = Tag{
 				Name:        tagPtr.Name,
 				Value:       tagPtr.Value,
+				Quality:     tagPtr.Quality,
 				Alias:       tagPtr.Alias,
 				TypeInfo:    tagPtr.TypeInfo,
 				Description: tagPtr.Description,
@@ -864,6 +885,7 @@ func (db *TagDatabase) GetTagsByType(dataType DataType) []Tag {
 			matchingTags = append(matchingTags, Tag{
 				Name:        tag.Name,
 				Value:       tag.Value,
+				Quality:     tag.Quality,
 				Alias:       tag.Alias,
 				TypeInfo:    tag.TypeInfo,
 				Description: tag.Description,
@@ -913,22 +935,16 @@ func (db *TagDatabase) RemoveTag(name string) error {
 	if tag, ok := val.(*Tag); ok {
 		// If the tag itself has a direct address, remove it.
 		if tag.DirectAddress != "" {
-			db.directAddressMap.Delete(tag.DirectAddress)
+			db.directAddressMap.Delete(canonicalAddress(tag.DirectAddress))
 		}
 
-		// If the tag is an array, we must also remove the direct address mappings for all its elements.
-		// This is common for tags created by PopulateDatabaseFromVariables.
+		// If the tag is a process-image array (see PopulateDatabaseFromImage), we
+		// must also remove the direct address mappings for all its elements.
 		if tag.TypeInfo != nil && tag.TypeInfo.DataType == TypeARRAY {
 			if sliceVal := reflect.ValueOf(tag.Value); sliceVal.Kind() == reflect.Slice {
-				re := regexp.MustCompile(`^([IQM])\.([BWDLR])$`)
-				matches := re.FindStringSubmatch(tag.Name)
-				if len(matches) == 3 {
-					for i := 0; i < sliceVal.Len(); i++ {
-						if directAddr, ok := generateDirectAddressForElement(matches[1], matches[2], tag.TypeInfo.ElementType, i); ok {
-							db.directAddressMap.Delete(directAddr)
-						}
-					}
-				}
+				imageArrayAddresses(tag.Name, sliceVal.Len(), func(_ int, addr string) {
+					db.directAddressMap.Delete(addr)
+				})
 			}
 		}
 	}
@@ -983,26 +999,15 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 	// Update the directAddressMap for the new name.
 	if tagPtr.DirectAddress != "" {
 		// For a simple tag, just update the single mapping.
-		db.directAddressMap.Delete(tagPtr.DirectAddress)
-		db.directAddressMap.Store(tagPtr.DirectAddress, newName)
+		db.directAddressMap.Store(canonicalAddress(tagPtr.DirectAddress), newName)
 	} else if tagPtr.TypeInfo != nil && tagPtr.TypeInfo.DataType == TypeARRAY {
-		// For an array tag, we need to update the mapping for each element.
+		// For a process-image array, remap each element's address. The addresses
+		// come from the old name, since the tag's internal name was just changed.
 		if sliceVal := reflect.ValueOf(tagPtr.Value); sliceVal.Kind() == reflect.Slice {
-			re := regexp.MustCompile(`^([IQM])\.([BWDLR])$`)
-			// We check against the newName's potential prefix, but use oldName to find matches
-			// as the tag's internal name was just changed.
-			matches := re.FindStringSubmatch(oldName)
-			if len(matches) == 3 {
-				for i := 0; i < sliceVal.Len(); i++ {
-					if directAddr, ok := generateDirectAddressForElement(matches[1], matches[2], tagPtr.TypeInfo.ElementType, i); ok {
-						// Delete the old mapping (e.g., %IX0.0 -> I.B[0])
-						db.directAddressMap.Delete(directAddr)
-						// Add the new mapping (e.g., %IX0.0 -> MyInputs[0])
-						newElementName := fmt.Sprintf("%s[%d]", newName, i)
-						db.directAddressMap.Store(directAddr, newElementName)
-					}
-				}
-			}
+			imageArrayAddresses(oldName, sliceVal.Len(), func(i int, addr string) {
+				// e.g. %IX0 -> I.B[0] becomes %IX0 -> MyInputs[0]
+				db.directAddressMap.Store(addr, fmt.Sprintf("%s[%d]", newName, i))
+			})
 		}
 	}
 
@@ -1010,6 +1015,7 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 	return Tag{
 		Name:        tagPtr.Name,
 		Value:       tagPtr.Value,
+		Quality:     tagPtr.Quality,
 		Alias:       tagPtr.Alias,
 		TypeInfo:    tagPtr.TypeInfo,
 		Description: tagPtr.Description,
@@ -1019,21 +1025,28 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 	}, nil
 }
 
-// SetTagValue updates the value of an existing tag in the database.
-// It performs a type check to ensure the new value is compatible with the tag's DataType.
+// SetTagValue updates the value of an existing tag in the database and marks it
+// QualityGood. It performs a type check to ensure the new value is compatible with
+// the tag's DataType. Writing an array element or UDT field sets the quality of the
+// whole tag, since quality is tracked per top-level tag.
 func (db *TagDatabase) SetTagValue(name string, value interface{}) error {
-	// If the value being set is itself a UDT, we should treat it as a wholesale
-	return db.setTagValueRecursive(name, value, 0)
+	return db.setTagValueRecursive(name, value, QualityGood, 0)
 }
 
-func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, depth int) (err error) {
+// SetTagValueQuality updates a tag's value and quality together, so readers and
+// subscribers never see one without the other. Drivers and protocol bridges
+// should use it instead of SetTagValue.
+func (db *TagDatabase) SetTagValueQuality(name string, value interface{}, quality Quality) error {
+	if !quality.IsValid() {
+		return fmt.Errorf("SetTagValueQuality: invalid quality %d for tag '%s'", uint8(quality), name)
+	}
+	return db.setTagValueRecursive(name, value, quality, 0)
+}
+
+func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, quality Quality, depth int) (err error) {
 	// First, check if the name is a direct address.
-	if directAddressRegex.MatchString(name) {
-		if symbolicName, found := db.directAddressMap.Load(name); found {
-			name = symbolicName.(string) // Use the resolved symbolic name
-		} else {
-			return fmt.Errorf("SetTagValue: direct address '%s' not found in database", name)
-		}
+	if name, err = db.resolveAddress(name); err != nil {
+		return fmt.Errorf("SetTagValue: %w", err)
 	}
 
 	// Check for remote alias before any other processing.
@@ -1048,15 +1061,18 @@ func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, dept
 				return fmt.Errorf("remote database with ID '%s' not found for alias '%s'", tag.RemoteAlias.DBID, name)
 			}
 			// Call the remote database's SetTagValue.
-			return remoteDB.setTagValueRecursive(tag.RemoteAlias.TagName, value, depth+1)
+			return remoteDB.setTagValueRecursive(tag.RemoteAlias.TagName, value, quality, depth+1)
 		}
+		// An exact match is a whole-tag write even if the name contains '.' or '['
+		// (e.g. "Press1.Pressure"), matching the lookup order of GetTagValue.
+		return db.setSimpleTagValue(name, value, quality)
 	}
 
 	// If the value being set is itself a UDT, we should treat it as a wholesale
 	// replacement of the tag's value, not a nested field write, even if the name // Corrected from TypeARRAY to honeycomb.TypeARRAY
 	// contains dots (which it shouldn't for this case, but we check defensively).
 	if _, isUDT := value.(UDT); isUDT {
-		return db.setSimpleTagValue(name, value)
+		return db.setSimpleTagValue(name, value, quality)
 	}
 
 	// Handle compound access like "MyArray[1].MyField"
@@ -1069,7 +1085,7 @@ func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, dept
 
 			// This is a recursive call to handle the nested field part
 			// on the result of the array access part.
-			return db.setNestedField(arrayPart, value, fieldPart)
+			return db.setNestedField(arrayPart, value, fieldPart, quality)
 		}
 	}
 
@@ -1080,7 +1096,7 @@ func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, dept
 			return err
 		}
 		// Lock, type check, and set the value.
-		if err := setArrayElementValue(baseTag, index, value); err != nil {
+		if err := setArrayElementValue(baseTag, index, value, quality); err != nil {
 			return err
 		}
 		db.notifySubscribers(baseTag) // Notify subscribers of the base array tag
@@ -1092,11 +1108,11 @@ func (db *TagDatabase) setTagValueRecursive(name string, value interface{}, dept
 		parts := strings.SplitN(name, ".", 2)
 		basePath := parts[0]
 		fieldPath := parts[1]
-		return db.setNestedField(basePath, value, fieldPath)
+		return db.setNestedField(basePath, value, fieldPath, quality)
 	}
 
 	// If not nested, proceed with updating the whole tag value.
-	return db.setSimpleTagValue(name, value)
+	return db.setSimpleTagValue(name, value, quality)
 }
 
 // GetTagValue retrieves the value of a tag by its name.
@@ -1116,13 +1132,10 @@ func (db *TagDatabase) GetTagValue(name string) (interface{}, error) {
 func (db *TagDatabase) getTagValueRecursive(name string, depth int) (interface{}, error) {
 	// STEP 1: Direct Address Resolution.
 	// Check if the name matches the pattern for an IEC direct address (e.g., %IX0.0, %MW100).
-	if directAddressRegex.MatchString(name) {
-		// If it's a direct address, look up its corresponding symbolic name in the map.
-		if symbolicName, found := db.directAddressMap.Load(name); found {
-			name = symbolicName.(string) // Replace the address with the symbolic name for further processing.
-		} else {
-			return nil, fmt.Errorf("GetTagValue: direct address '%s' not found in database", name)
-		}
+	// If it's a direct address, replace it with its symbolic name for further processing.
+	name, err := db.resolveAddress(name)
+	if err != nil {
+		return nil, fmt.Errorf("GetTagValue: %w", err)
 	}
 
 	// STEP 2: Direct Tag Match.
@@ -1191,6 +1204,96 @@ func (db *TagDatabase) getTagValueRecursive(name string, depth int) (interface{}
 	return nil, fmt.Errorf("GetTagValue: tag '%s' not found in database", name)
 }
 
+// GetTagQuality returns the quality of a tag's value. For an array element or UDT
+// field it returns the quality of the whole tag. On error the quality is QualityBad,
+// so a caller that only forwards the quality (e.g. to OPC) reports the failure.
+func (db *TagDatabase) GetTagQuality(name string) (Quality, error) {
+	return db.getTagQualityRecursive(name, 0)
+}
+
+func (db *TagDatabase) getTagQualityRecursive(name string, depth int) (Quality, error) {
+	tag, err := db.qualityTag(name)
+	if err != nil {
+		return QualityBad, fmt.Errorf("GetTagQuality: %w", err)
+	}
+	if tag.RemoteAlias != nil {
+		remoteDB, err := db.remoteForAlias(tag, depth)
+		if err != nil {
+			return QualityBad, fmt.Errorf("GetTagQuality: %w", err)
+		}
+		return remoteDB.getTagQualityRecursive(tag.RemoteAlias.TagName, depth+1)
+	}
+	return tag.GetQuality(), nil
+}
+
+// SetTagQuality changes a tag's quality without touching its value, e.g. when a
+// driver loses its connection and the last value read becomes Uncertain or Bad.
+// For an array element or UDT field it sets the quality of the whole tag.
+// Subscribers are notified only when the quality actually changes.
+func (db *TagDatabase) SetTagQuality(name string, quality Quality) error {
+	if !quality.IsValid() {
+		return fmt.Errorf("SetTagQuality: invalid quality %d for tag '%s'", uint8(quality), name)
+	}
+	return db.setTagQualityRecursive(name, quality, 0)
+}
+
+func (db *TagDatabase) setTagQualityRecursive(name string, quality Quality, depth int) error {
+	tag, err := db.qualityTag(name)
+	if err != nil {
+		return fmt.Errorf("SetTagQuality: %w", err)
+	}
+	if tag.RemoteAlias != nil {
+		remoteDB, err := db.remoteForAlias(tag, depth)
+		if err != nil {
+			return fmt.Errorf("SetTagQuality: %w", err)
+		}
+		return remoteDB.setTagQualityRecursive(tag.RemoteAlias.TagName, quality, depth+1)
+	}
+
+	tag.valMu.Lock()
+	changed := tag.Quality != quality
+	tag.Quality = quality
+	tag.valMu.Unlock()
+	if changed {
+		db.notifySubscribers(tag)
+	}
+	return nil
+}
+
+// qualityTag resolves a tag name, direct address, array element or UDT field to
+// the top-level tag that holds its quality.
+func (db *TagDatabase) qualityTag(name string) (*Tag, error) {
+	name, err := db.resolveAddress(name)
+	if err != nil {
+		return nil, err
+	}
+	if val, found := db.tags.Load(name); found {
+		return val.(*Tag), nil
+	}
+	// Tag names may themselves contain dots (e.g. "I.B"), so try every prefix
+	// that ends before a '.' or '[' rather than splitting at the first one.
+	for i, r := range name {
+		if r == '.' || r == '[' {
+			if val, found := db.tags.Load(name[:i]); found {
+				return val.(*Tag), nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("tag '%s' not found in database", name)
+}
+
+// remoteForAlias returns the database a remote alias tag points to.
+func (db *TagDatabase) remoteForAlias(tag *Tag, depth int) (DatabaseAccessor, error) {
+	if depth > 10 { // Prevent infinite recursion in alias chains.
+		return nil, fmt.Errorf("max recursion depth exceeded for remote alias '%s'", tag.Name)
+	}
+	remoteDB, found := db.getDatabase(tag.RemoteAlias.DBID)
+	if !found {
+		return nil, fmt.Errorf("remote database with ID '%s' not found for alias '%s'", tag.RemoteAlias.DBID, tag.Name)
+	}
+	return remoteDB, nil
+}
+
 // SetTagDescription updates the Description for a given tag.
 func (db *TagDatabase) SetTagDescription(name string, description string) (Tag, error) {
 	val, found := db.tags.Load(name)
@@ -1207,6 +1310,7 @@ func (db *TagDatabase) SetTagDescription(name string, description string) (Tag, 
 	return Tag{
 		Name:        tagPtr.Name,
 		Value:       tagPtr.Value,
+		Quality:     tagPtr.Quality,
 		Alias:       tagPtr.Alias,
 		TypeInfo:    tagPtr.TypeInfo,
 		Description: tagPtr.Description,
@@ -1343,15 +1447,7 @@ func (db *TagDatabase) SetTagForceValue(name string, value interface{}) (Tag, er
 
 			// String length enforcement for force value.
 			if (tag.TypeInfo.DataType == TypeSTRING || tag.TypeInfo.DataType == TypeWSTRING) && tag.TypeInfo.MaxLength > 0 {
-				if strVal, ok := value.(plc.STRING); ok {
-					if len(strVal) > tag.TypeInfo.MaxLength {
-						value = strVal[:tag.TypeInfo.MaxLength]
-					}
-				} else if strVal, ok := value.(string); ok {
-					if len(strVal) > tag.TypeInfo.MaxLength {
-						value = strVal[:tag.TypeInfo.MaxLength]
-					}
-				}
+				value = truncateString(value, tag.TypeInfo.MaxLength)
 			}
 			if tag.Force == nil {
 				tag.Force = &ForceInfo{}
@@ -1388,6 +1484,7 @@ func (db *TagDatabase) notifySubscribers(tag *Tag) {
 	cleanTag := Tag{
 		Name:        tag.Name,
 		Value:       tag.Value,
+		Quality:     tag.Quality,
 		Alias:       tag.Alias,
 		TypeInfo:    tag.TypeInfo,
 		Description: tag.Description,
@@ -1526,75 +1623,102 @@ func checkSubrange(value, min, max interface{}) error {
 	return nil // Not a numeric type we can range check
 }
 
-// generateDirectAddress attempts to generate an IEC direct address for a given Tag.
-// It returns the direct address string and true if successful, otherwise an empty string and false.
+// truncateString shortens a STRING, WSTRING or string value to maxLength
+// characters. STRING holds single-byte characters, so it is cut by bytes;
+// WSTRING is cut by Unicode characters so a multi-byte character is never split.
+func truncateString(value any, maxLength int) any {
+	switch s := value.(type) {
+	case plc.STRING:
+		if len(s) > maxLength {
+			return s[:maxLength]
+		}
+	case plc.WSTRING:
+		if runes := []rune(s); len(runes) > maxLength {
+			return plc.WSTRING(runes[:maxLength])
+		}
+	case string:
+		if len(s) > maxLength {
+			return s[:maxLength]
+		}
+	}
+	return value
+}
+
+// imageSizePrefix maps the arrays of a royaljelly vars.Addresses table to their
+// IEC 61131-3 size prefix. As in royaljelly, each array is indexed by address and
+// the areas are independent: %IX3 is I.B[3], %QW4 is Q.W[4] and %MD2 is M.D[2].
+// The R, LR, S and WS arrays have no size prefix and get no direct addresses.
+var imageSizePrefix = map[string]string{"B": "X", "C": "B", "W": "W", "D": "D", "L": "L"}
+
+// imageArrayName matches a process-image array tag, e.g. "I.B" or "M.W".
+var imageArrayName = regexp.MustCompile(`^([IQM])\.([BCWDL])$`)
+
+// imageElementName matches an element of a process-image array, e.g. "I.B[3]".
+var imageElementName = regexp.MustCompile(`^([IQM])\.([BCWDL])\[(\d+)]$`)
+
+// imageAddress returns the direct address of element index of an area's array.
+func imageAddress(area, field string, index int) (string, bool) {
+	size, ok := imageSizePrefix[field]
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("%%%s%s%d", area, size, index), true
+}
+
+// imageArrayAddresses calls fn with the direct address of every element of a
+// process-image array tag. It does nothing for other tags.
+func imageArrayAddresses(name string, length int, fn func(index int, addr string)) {
+	m := imageArrayName.FindStringSubmatch(name)
+	if m == nil {
+		return
+	}
+	for i := 0; i < length; i++ {
+		if addr, ok := imageAddress(m[1], m[2], i); ok {
+			fn(i, addr)
+		}
+	}
+}
+
+// generateDirectAddress returns the direct address of a tag named after a
+// process-image element, e.g. "%IX3" for "I.B[3]".
 func generateDirectAddress(tag *Tag) (string, bool) {
-	// Only generate direct addresses for tags that look like PLC memory addresses
-	// (e.g., I.B[0], Q.R[100], M.W[254])
-	re := regexp.MustCompile(`^([IQM])\.([BWDLR])\[(\d+)]$`)
-	matches := re.FindStringSubmatch(tag.Name)
-	if len(matches) != 4 {
-		return "", false // Not a recognized symbolic array format for direct addressing
-	}
-
-	areaPrefix := matches[1]
-	typeChar := matches[2]
-	index, _ := strconv.Atoi(matches[3])
-
-	return generateDirectAddressForElement(areaPrefix, typeChar, tag.TypeInfo.ElementType, index)
-}
-
-// generateDirectAddressForElement generates an IEC direct address based on its components.
-func generateDirectAddressForElement(areaChar, typeChar string, elementType DataType, index int) (string, bool) {
-	size, addressable := getPlcTypeSize(elementType)
-	if !addressable {
-		return "", false // Cannot generate direct address for this element type
-	}
-
-	var prefix string
-	switch areaChar {
-	case "I":
-		prefix = "%I"
-	case "Q":
-		prefix = "%Q"
-	case "M":
-		prefix = "%M"
-	default:
+	m := imageElementName.FindStringSubmatch(tag.Name)
+	if m == nil {
 		return "", false
 	}
-
-	switch elementType {
-	case TypeBOOL:
-		byteOffset := index / 8
-		bitOffset := index % 8
-		return fmt.Sprintf("%sX%d.%d", prefix, byteOffset, bitOffset), true
-	case TypeBYTE, TypeSINT, TypeUSINT, TypeWORD, TypeINT, TypeUINT, TypeDWORD, TypeDINT, TypeUDINT, TypeREAL, TypeLWORD, TypeLINT, TypeULINT, TypeLREAL:
-		// For byte, word, dword, lword types, the address is the byte offset.
-		return fmt.Sprintf("%s%s%d", prefix, typeChar, index*size), true
-	default:
+	index, err := strconv.Atoi(m[3])
+	if err != nil {
 		return "", false
 	}
+	return imageAddress(m[1], m[2], index)
 }
 
-// getPlcTypeSize returns the size in bytes of a given DataType, and true if it's addressable.
-func getPlcTypeSize(dataType DataType) (int, bool) {
-	switch dataType {
-	case TypeBOOL:
-		return 1, true // A BOOL typically occupies 1 bit, but for byte addressing, it's part of a byte.
-	case TypeBYTE, TypeSINT, TypeUSINT:
-		return 1, true
-	case TypeWORD, TypeINT, TypeUINT:
-		return 2, true
-	case TypeDWORD, TypeDINT, TypeUDINT, TypeREAL:
-		return 4, true
-	case TypeLWORD, TypeLINT, TypeULINT, TypeLREAL:
-		return 8, true
-	case TypeSTRING, TypeWSTRING:
-		// Variable length types are not simply addressable by byte offset in IEC direct addressing.
-		return 0, false
-	default:
-		return 0, false
+// canonicalAddress normalizes a direct address so that equivalent spellings
+// share one directAddressMap key: a bit in byte.bit form (%IX1.2) becomes the
+// flat bit index royaljelly uses (%IX10). Other addresses are returned as is.
+func canonicalAddress(addr string) string {
+	m := directAddressRegex.FindStringSubmatch(addr)
+	if m == nil || m[2] != "X" || m[4] == "" {
+		return addr
 	}
+	byteOffset, err1 := strconv.Atoi(m[3])
+	bit, err2 := strconv.Atoi(m[4])
+	if err1 != nil || err2 != nil || bit > 7 {
+		return addr
+	}
+	return fmt.Sprintf("%%%sX%d", m[1], byteOffset*8+bit)
+}
+
+// resolveAddress returns the symbolic name an IEC direct address maps to, or
+// name itself if it is not a direct address.
+func (db *TagDatabase) resolveAddress(name string) (string, error) {
+	if !directAddressRegex.MatchString(name) {
+		return name, nil
+	}
+	if symbolicName, found := db.directAddressMap.Load(canonicalAddress(name)); found {
+		return symbolicName.(string), nil
+	}
+	return "", fmt.Errorf("direct address '%s' not found in database", name)
 }
 
 // persistentTag is an unexported struct used as a data transfer object
@@ -1603,6 +1727,8 @@ type persistentTag struct {
 	Name     string    `json:"Name"`
 	TypeInfo *TypeInfo `json:"TypeInfo"`
 	Value    any       `json:"Value"`
+	// Quality is nil in files written before quality existed.
+	Quality *Quality `json:"Quality,omitempty"`
 }
 
 // WriteTagsToFile iterates through the database and writes each tag's name
@@ -1634,10 +1760,12 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 			defer wg.Done()
 			for tag := range tagsChan {
 				tag.valMu.RLock()
+				quality := tag.Quality
 				pTag := persistentTag{
 					Name:     tag.Name,
 					TypeInfo: tag.TypeInfo,
 					Value:    tag.GetValue(),
+					Quality:  &quality,
 				}
 				tag.valMu.RUnlock()
 
@@ -1758,6 +1886,11 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 		pTag := result.pTag
 		tagName := pTag.Name
 		valueData := pTag.Value
+		// Restored values may be stale, so Good comes back as Uncertain.
+		quality := QualityUncertain
+		if pTag.Quality != nil {
+			quality = pTag.Quality.restored()
+		}
 
 		val, found := db.tags.Load(tagName)
 		if !found {
@@ -1773,6 +1906,8 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 			udtJSON, _ := json.Marshal(valueData)
 			if jsonErr := json.Unmarshal(udtJSON, tag.Value); jsonErr != nil {
 				parseErr = fmt.Errorf("failed to process UDT data for '%s': %w", tagName, jsonErr)
+			} else {
+				tag.Quality = quality
 			}
 			tag.valMu.Unlock()
 		} else if tag.TypeInfo.DataType == TypeARRAY {
@@ -1804,7 +1939,7 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 		// For UDTs, the value is updated by reference, so we don't call SetTagValue.
 		// For primitives and arrays, newValue will be non-nil.
 		if newValue != nil {
-			if err := db.SetTagValue(tagName, newValue); err != nil {
+			if err := db.SetTagValueQuality(tagName, newValue, quality); err != nil {
 				errorList = append(errorList, fmt.Sprintf("set value error for tag '%s': %v", tagName, err))
 			}
 		} // Continue to the next line even if an error occurred on this one.
@@ -1855,6 +1990,8 @@ func parseValueToType(valueStr string, dataType DataType) (interface{}, error) {
 		return plc.LREAL(f), err
 	case TypeSTRING:
 		return plc.STRING(valueStr), nil
+	case TypeWSTRING:
+		return plc.WSTRING(valueStr), nil
 	default:
 		return nil, fmt.Errorf("unsupported data type '%s' for parsing from file", dataType)
 	}
@@ -1962,71 +2099,60 @@ func getDataType(t reflect.Type) (DataType, bool) {
 // It's initialized once to avoid repeated reflect.TypeOf() calls in getDataType.
 var typeToDataTypeMap = make(map[reflect.Type]DataType)
 
-// PopulateDatabaseFromVariables uses reflection to inspect the global I, Q, and M
-// address spaces and populates the provided database with corresponding tags.
+// PopulateDatabaseFromImage adds an ARRAY tag for each array in the I, Q and M
+// areas of a royaljelly process image, named area.array ("I.B", "Q.W", "M.R",
+// ...) and holding a copy of the image's current values. Every element of the
+// B, C, W, D and L arrays is mapped to its IEC direct address as royaljelly
+// defines it: I.B[n] is %IXn (also reachable as %IXbyte.bit), Q.C[n] is %QBn,
+// M.W[n] is %MWn, and so on. The REAL, LREAL and string arrays get no addresses.
+func PopulateDatabaseFromImage(db *TagDatabase, pi *vars.ProcessImage) error {
+	var img vars.Image
+	pi.Snapshot(&img)
+	return populateFromImage(db, &img)
+}
+
+// PopulateDatabaseFromVariables is PopulateDatabaseFromImage for royaljelly's
+// package-level vars.I, vars.Q and vars.M tables.
+//
+// Deprecated: royaljelly deprecated those tables because they are unsynchronized.
+// Use PopulateDatabaseFromImage with a vars.ProcessImage.
 func PopulateDatabaseFromVariables(db *TagDatabase) error {
-	addressSpaces := map[string]interface{}{
-		"I": plc.I,
-		"Q": plc.Q,
-		"M": plc.M,
-	}
+	return populateFromImage(db, &vars.Image{I: vars.I, Q: vars.Q, M: vars.M})
+}
 
-	for prefix, space := range addressSpaces {
-		v := reflect.ValueOf(space)
-		t := v.Type()
-
+func populateFromImage(db *TagDatabase, img *vars.Image) error {
+	for _, area := range []struct {
+		prefix string
+		table  *vars.Addresses
+	}{{"I", &img.I}, {"Q", &img.Q}, {"M", &img.M}} {
+		v := reflect.ValueOf(area.table).Elem()
 		for i := 0; i < v.NumField(); i++ {
 			field := v.Field(i)
-			fieldType := t.Field(i)
-
-			if field.Kind() == reflect.Array {
-				// This logic now creates a single ARRAY tag instead of individual element tags.
-				elemType := field.Type().Elem()
-				var elementType DataType
-
-				// Special handling for M.W which can be ambiguous.
-				// We know from the plc library's structure that M.W should be WORD.
-				if prefix == "M" && fieldType.Name == "W" {
-					elementType = TypeWORD
-				} else {
-					// For all other fields, infer the type normally.
-					var ok bool
-					elementType, ok = getDataType(elemType)
-					if !ok {
-						continue // Skip types we don't have a mapping for
-					}
-				}
-
-				tagName := fmt.Sprintf("%s.%s", prefix, fieldType.Name)
-
-				// The Go reflection for an array (e.g., [255]bool) is not a slice.
-				// We need to convert it to a slice to store it in our ARRAY tag.
-				slice := reflect.MakeSlice(reflect.SliceOf(elemType), field.Len(), field.Len())
-				reflect.Copy(slice, field)
-
-				tag := &Tag{
-					Name:  tagName,
-					Value: slice.Interface(),
-					TypeInfo: &TypeInfo{
-						DataType:    TypeARRAY,
-						ElementType: elementType,
-					},
-				}
-
-				if err := db.AddTag(tag); err != nil {
-					return fmt.Errorf("PopulateDatabaseFromVariables: error adding tag '%s': %w", tagName, err)
-				}
-
-				// After adding the base array tag, iterate through its elements to
-				// generate and store direct address mappings for each one.
-				for j := 0; j < field.Len(); j++ {
-					elementSymbolicName := fmt.Sprintf("%s[%d]", tagName, j)
-					if directAddr, ok := generateDirectAddressForElement(prefix, fieldType.Name, elementType, j); ok {
-						// Store the mapping from the direct address to the symbolic element name.
-						db.directAddressMap.Store(directAddr, elementSymbolicName)
-					}
-				}
+			if field.Kind() != reflect.Array {
+				continue // e.g. the scan time T
 			}
+			elemType := field.Type().Elem()
+			elementType, ok := getDataType(elemType)
+			if !ok {
+				continue // Skip types we don't have a mapping for
+			}
+
+			// An ARRAY tag holds a slice, so copy the fixed-size array into one.
+			slice := reflect.MakeSlice(reflect.SliceOf(elemType), field.Len(), field.Len())
+			reflect.Copy(slice, field)
+
+			tagName := area.prefix + "." + v.Type().Field(i).Name
+			tag := &Tag{
+				Name:     tagName,
+				Value:    slice.Interface(),
+				TypeInfo: &TypeInfo{DataType: TypeARRAY, ElementType: elementType},
+			}
+			if err := db.AddTag(tag); err != nil {
+				return fmt.Errorf("PopulateDatabaseFromImage: error adding tag '%s': %w", tagName, err)
+			}
+			imageArrayAddresses(tagName, field.Len(), func(j int, addr string) {
+				db.directAddressMap.Store(addr, fmt.Sprintf("%s[%d]", tagName, j))
+			})
 		}
 	}
 	return nil
@@ -2082,7 +2208,7 @@ func (db *TagDatabase) getNestedField(fullName string) (Tag, error) { // Correct
 
 // setSimpleTagValue is the internal, non-recursive implementation for setting a top-level tag's value.
 // setSimpleTagValue is the internal, non-recursive implementation for setting a top-level tag's value. It is the base case for recursive set operations.
-func (db *TagDatabase) setSimpleTagValue(name string, value interface{}) error {
+func (db *TagDatabase) setSimpleTagValue(name string, value interface{}, quality Quality) error {
 	val, found := db.tags.Load(name)
 	if !found {
 		return fmt.Errorf("setTagValue: tag '%s' not found in database", name)
@@ -2090,8 +2216,8 @@ func (db *TagDatabase) setSimpleTagValue(name string, value interface{}) error {
 	}
 	tag := val.(*Tag)
 
-	// Use the tag's own SetValue method to perform type checking.
-	if err := tag.SetValue(value); err != nil {
+	// Use the tag's own SetValueQuality method to perform type checking.
+	if err := tag.SetValueQuality(value, quality); err != nil {
 		return err
 	}
 
@@ -2127,7 +2253,7 @@ func getFieldFromStruct(udtInstance interface{}, fieldPath string) (interface{},
 // setNestedField handles writing a value to a field within a UDT or an element of an array of UDTs.
 // The `basePath` can be a simple tag name ("MyUDT") or an array element access ("MyArray[1]").
 // The `fieldPath` is the dot-separated path to the field to set (e.g., "Config.Speed").
-func (db *TagDatabase) setNestedField(basePath string, value interface{}, fieldPath string) (err error) {
+func (db *TagDatabase) setNestedField(basePath string, value interface{}, fieldPath string, quality Quality) (err error) {
 	var baseTag *Tag
 	var targetStruct reflect.Value
 
@@ -2229,6 +2355,7 @@ func (db *TagDatabase) setNestedField(basePath string, value interface{}, fieldP
 		}
 	}
 
+	baseTag.Quality = quality
 	return nil
 }
 
@@ -2322,8 +2449,9 @@ func getArrayElementValue(baseTag *Tag, index int) (interface{}, error) {
 	return sliceVal.Index(index).Interface(), nil
 }
 
-// setArrayElementValue writes a value to an element of a tag's slice value.
-func setArrayElementValue(baseTag *Tag, index int, value interface{}) error {
+// setArrayElementValue writes a value to an element of a tag's slice value and
+// sets the quality of the whole array.
+func setArrayElementValue(baseTag *Tag, index int, value interface{}, quality Quality) error {
 	baseTag.valMu.Lock()
 	defer baseTag.valMu.Unlock()
 
@@ -2344,6 +2472,7 @@ func setArrayElementValue(baseTag *Tag, index int, value interface{}) error {
 
 	// Set the value at the specified index.
 	sliceVal.Index(index).Set(reflect.ValueOf(value))
+	baseTag.Quality = quality
 
 	return nil
 }
@@ -2464,7 +2593,8 @@ func (ts *tagServer) handleGetTagValue(w http.ResponseWriter, r *http.Request, t
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	response := map[string]interface{}{"value": value}
+	quality, _ := ts.db.GetTagQuality(tagName)
+	response := map[string]interface{}{"value": value, "quality": quality}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
@@ -2502,16 +2632,35 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// The request body is expected to be a JSON object like {"value": ...}.
+	// The request body is expected to be a JSON object like {"value": ..., "quality": 1}.
+	// "quality" is optional and defaults to Good; sending it alone changes only the quality.
 	var requestPayload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &requestPayload); err != nil {
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
 		return
 	}
 
+	quality := QualityGood
+	qualityJSON, hasQuality := requestPayload["quality"]
+	if hasQuality {
+		if err := json.Unmarshal(qualityJSON, &quality); err != nil || !quality.IsValid() {
+			http.Error(w, "Invalid 'quality' field", http.StatusBadRequest)
+			return
+		}
+	}
+
 	valueJSON, ok := requestPayload["value"]
 	if !ok {
-		http.Error(w, "Missing 'value' field", http.StatusBadRequest)
+		if !hasQuality {
+			http.Error(w, "Missing 'value' field", http.StatusBadRequest)
+			return
+		}
+		if err := ts.db.SetTagQuality(tagName, quality); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "Tag quality updated successfully.")
 		return
 	}
 
@@ -2539,7 +2688,7 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 			}
 		}
 
-		if err := ts.db.SetTagValue(tagName, value); err != nil {
+		if err := ts.db.SetTagValueQuality(tagName, value, quality); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -2560,7 +2709,7 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 			finalValue = newValuePtr
 		}
 
-		if err := ts.db.SetTagValue(tagName, finalValue); err != nil {
+		if err := ts.db.SetTagValueQuality(tagName, finalValue, quality); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}

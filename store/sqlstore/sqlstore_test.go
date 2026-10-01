@@ -8,7 +8,7 @@ import (
 
 	"github.com/apiarytech/honeycomb"
 	"github.com/apiarytech/honeycomb/store/sqlstore"
-	plc "github.com/apiarytech/royaljelly"
+	plc "github.com/apiarytech/royaljelly/iec"
 	_ "modernc.org/sqlite"
 )
 
@@ -151,7 +151,7 @@ func TestPersisterPowerCycle(t *testing.T) {
 	}
 	must(t, db.SetTagValue("Counter", plc.DINT(41)))
 	must(t, p.Flush(ctx))
-	must(t, db.SetTagValue("Counter", plc.DINT(42)))
+	must(t, db.SetTagValueQuality("Counter", plc.DINT(42), honeycomb.QualityBad))
 	must(t, db.SetTagValue("Setpoint", plc.LREAL(12.5)))
 	must(t, db.SetTagValue("Motors[1].Speed", plc.REAL(1500)))
 	must(t, db.SetTagValue("Scratch", plc.DINT(7)))
@@ -181,6 +181,16 @@ func TestPersisterPowerCycle(t *testing.T) {
 			t.Errorf("%s = %v (%v), want %v", name, got, err, want)
 		}
 	}
+	// Good values may be stale after a power cycle; Bad values stay Bad.
+	for name, want := range map[string]honeycomb.Quality{
+		"Counter":  honeycomb.QualityBad,
+		"Setpoint": honeycomb.QualityUncertain,
+		"Scratch":  honeycomb.QualityUnknown,
+	} {
+		if got, err := db.GetTagQuality(name); err != nil || got != want {
+			t.Errorf("%s quality = %v (%v), want %v", name, got, err, want)
+		}
+	}
 	if forced, _ := db.GetTagForced("Setpoint"); forced {
 		t.Error("force state restored although RestoreForces is false")
 	}
@@ -188,10 +198,11 @@ func TestPersisterPowerCycle(t *testing.T) {
 
 func TestBuiltInDialects(t *testing.T) {
 	cases := map[string]string{
-		"sqlite":    "ON CONFLICT (instance_id) DO UPDATE SET tag_name",
-		"postgres":  "VALUES ($1, $2, $3",
-		"mysql":     "ON DUPLICATE KEY UPDATE tag_name = VALUES(tag_name)",
-		"sqlserver": "WHEN NOT MATCHED THEN INSERT",
+		"sqlite":      "ON CONFLICT (instance_id) DO UPDATE SET tag_name",
+		"postgres":    "VALUES ($1, $2, $3",
+		"cockroachdb": "UPSERT INTO t (instance_id, tag_name, tag_value) VALUES ($1, $2, $3)",
+		"mysql":       "ON DUPLICATE KEY UPDATE tag_name = VALUES(tag_name)",
+		"sqlserver":   "WHEN NOT MATCHED THEN INSERT",
 	}
 	for name, fragment := range cases {
 		d := mustLookup(t, name)
@@ -204,7 +215,7 @@ func TestBuiltInDialects(t *testing.T) {
 			t.Errorf("%s migrations: %v (found %d)", name, err, len(migrations))
 		}
 	}
-	for _, alias := range []string{"sqlite3", "pgx", "mssql", "MySQL"} {
+	for _, alias := range []string{"sqlite3", "pgx", "mssql", "MySQL", "crdb"} {
 		mustLookup(t, alias)
 	}
 }

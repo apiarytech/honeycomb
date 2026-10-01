@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	plc "github.com/apiarytech/royaljelly"
+	plc "github.com/apiarytech/royaljelly/iec"
 )
 
 // fakeStore is an in-memory TagStore that counts writes and can be made to fail.

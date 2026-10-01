@@ -23,7 +23,7 @@ import (
 	tags "github.com/apiarytech/honeycomb"
 	"github.com/apiarytech/honeycomb/shared"
 	"github.com/apiarytech/honeycomb/store/sqlstore"
-	plc "github.com/apiarytech/royaljelly"
+	plc "github.com/apiarytech/royaljelly/iec"
 	_ "modernc.org/sqlite" // Pure-Go SQLite driver: no CGO needed.
 )
 

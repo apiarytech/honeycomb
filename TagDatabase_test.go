@@ -24,7 +24,8 @@ import (
 	"testing"
 	"time"
 
-	plc "github.com/apiarytech/royaljelly" // Assuming this is an external dependency
+	plc "github.com/apiarytech/royaljelly/iec"
+	"github.com/apiarytech/royaljelly/vars"
 )
 
 // MotorData is a test-local UDT struct. It is defined here to allow
@@ -293,51 +294,122 @@ func TestTagDatabaseConcurrency(t *testing.T) {
 	}
 }
 
-// TestPopulateDatabaseFromVariables verifies that the database is correctly populated from the global variables.
+// TestPopulateDatabaseFromImage verifies that a royaljelly process image becomes
+// ARRAY tags whose elements carry royaljelly's direct addresses.
+func TestPopulateDatabaseFromImage(t *testing.T) {
+	var pi vars.ProcessImage
+	pi.Write(func(img *vars.Image) {
+		img.I.B[9] = true
+		img.I.C[2] = 0x7F
+		img.Q.W[4] = 1234
+		img.M.D[2] = 0xDEADBEEF
+		img.M.L[1] = 42
+		img.Q.R[0] = 1.5
+		img.M.WS[3] = "wide"
+	})
+	db := NewTagDatabase()
+	if err := PopulateDatabaseFromImage(db, &pi); err != nil {
+		t.Fatalf("PopulateDatabaseFromImage() returned an unexpected error: %v", err)
+	}
+
+	// Each area is indexed by address, as in royaljelly: %QW4 is Q.W[4], not a byte offset.
+	for _, tc := range []struct {
+		addr string
+		want any
+	}{
+		{"%IX9", plc.BOOL(true)},
+		{"%IX1.1", plc.BOOL(true)}, // byte.bit spelling of the same bit
+		{"%IB2", plc.BYTE(0x7F)},
+		{"%QW4", plc.WORD(1234)},
+		{"%MD2", plc.DWORD(0xDEADBEEF)},
+		{"%ML1", plc.LWORD(42)},
+	} {
+		if got, err := db.GetTagValue(tc.addr); err != nil || got != tc.want {
+			t.Errorf("%s = %v (%v), want %v", tc.addr, got, err, tc.want)
+		}
+	}
+
+	// Element types follow royaljelly's layout; W is WORD and WS is WSTRING.
+	for name, want := range map[string]DataType{
+		"I.B": TypeBOOL, "I.C": TypeBYTE, "Q.W": TypeWORD, "M.D": TypeDWORD, "M.L": TypeLWORD,
+		"Q.R": TypeREAL, "Q.LR": TypeLREAL, "M.S": TypeSTRING, "M.WS": TypeWSTRING,
+	} {
+		tag, found := db.GetTag(name)
+		if !found || tag.TypeInfo.DataType != TypeARRAY || tag.TypeInfo.ElementType != want {
+			t.Errorf("tag %s: found %v, element type %v, want ARRAY of %s", name, found, tag.TypeInfo, want)
+		}
+	}
+	if v, _ := db.GetTagValue("Q.R[0]"); v != plc.REAL(1.5) {
+		t.Errorf("Q.R[0] = %v, want 1.5", v)
+	}
+	if v, _ := db.GetTagValue("M.WS[3]"); v != plc.WSTRING("wide") {
+		t.Errorf("M.WS[3] = %v, want \"wide\"", v)
+	}
+
+	// REAL, LREAL and string arrays have no IEC size prefix, so no direct addresses:
+	// %QD0 is the DWORD Q.D[0], not the REAL Q.R[0].
+	if v, err := db.GetTagValue("%QD0"); err != nil || v != plc.DWORD(0) {
+		t.Errorf("%%QD0 = %v (%v), want DWORD 0 from Q.D[0]", v, err)
+	}
+	// Non-array fields (the scan time T) are not tags.
+	if _, found := db.GetTag("I.T"); found {
+		t.Error("Tag 'I.T' should not have been created as it is not an array field")
+	}
+}
+
+// TestPopulateDatabaseFromVariables verifies the deprecated global-table variant still works.
 func TestPopulateDatabaseFromVariables(t *testing.T) {
 	db := NewTagDatabase()
-	err := PopulateDatabaseFromVariables(db)
-	if err != nil {
+	if err := PopulateDatabaseFromVariables(db); err != nil {
 		t.Fatalf("PopulateDatabaseFromVariables() returned an unexpected error: %v", err)
 	}
-
-	// Check for a few specific tags to ensure they were created correctly.
-	testCases := []struct {
-		tagName             string
-		elementIndex        int
-		expectedType        DataType
-		expectedElementType DataType
-		expectedDirectAddr  string
-	}{
-		{"I.B", 0, TypeARRAY, TypeBOOL, "%IX0.0"},
-		{"I.B", 9, TypeARRAY, TypeBOOL, "%IX1.1"},
-		{"Q.R", 0, TypeARRAY, TypeREAL, "%QD0"},
-		{"M.W", 0, TypeARRAY, TypeWORD, "%MW0"},
-		{"M.W", 5, TypeARRAY, TypeWORD, "%MW10"},
+	if _, err := db.GetTagValue("%MW5"); err != nil {
+		t.Errorf("%%MW5 did not resolve: %v", err)
 	}
+}
 
-	for _, tc := range testCases {
-		t.Run(tc.expectedDirectAddr, func(t *testing.T) {
-			tag, found := db.GetTag(tc.tagName)
-			if !found {
-				t.Fatalf("Tag '%s' was not found in the database", tc.tagName)
-			}
-			if tag.TypeInfo.DataType != tc.expectedType {
-				t.Errorf("Tag '%s' has wrong DataType. Got %s, want %s", tc.tagName, tag.TypeInfo.DataType, tc.expectedType)
-			}
-			if tag.TypeInfo.ElementType != tc.expectedElementType {
-				t.Errorf("Tag '%s' has wrong ElementType. Got %s, want %s", tc.tagName, tag.TypeInfo.ElementType, tc.expectedElementType)
-			}
-			if tag.DirectAddress != "" { // The base array tag itself might not have a direct address
-				t.Logf("Note: Direct address on base tag '%s' is '%s'", tc.tagName, tag.DirectAddress)
-			}
-		})
+func TestCanonicalAddress(t *testing.T) {
+	for in, want := range map[string]string{
+		"%IX0.0": "%IX0",
+		"%IX1.2": "%IX10",
+		"%QX3":   "%QX3",
+		"%MW10":  "%MW10",
+		"%IX0.9": "%IX0.9", // not a valid bit; left alone so it does not resolve
+		"MyTag":  "MyTag",
+	} {
+		if got := canonicalAddress(in); got != want {
+			t.Errorf("canonicalAddress(%q) = %q, want %q", in, got, want)
+		}
 	}
+}
 
-	// Ensure non-array fields were not added.
-	_, found := db.GetTag("I.T")
-	if found {
-		t.Error("Tag 'I.T' should not have been created as it is not an array field")
+func TestStringLengthEnforcement(t *testing.T) {
+	db := NewTagDatabase()
+	for _, tag := range []*Tag{
+		{Name: "S", TypeInfo: &TypeInfo{DataType: TypeSTRING, MaxLength: 3}, Value: plc.STRING("")},
+		{Name: "WS", TypeInfo: &TypeInfo{DataType: TypeWSTRING, MaxLength: 3}, Value: plc.WSTRING("")},
+	} {
+		if err := db.AddTag(tag); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, tc := range map[string]struct{ in, want any }{
+		"S":  {plc.STRING("abcdef"), plc.STRING("abc")},
+		"WS": {plc.WSTRING("äöüß"), plc.WSTRING("äöü")}, // cut by character, not byte
+	} {
+		if err := db.SetTagValue(name, tc.in); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got, _ := db.GetTagValue(name); got != tc.want {
+			t.Errorf("%s = %q, want %q", name, got, tc.want)
+		}
+	}
+	// A value shorter than the limit is kept as is.
+	if err := db.SetTagValue("WS", plc.WSTRING("ok")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := db.GetTagValue("WS"); got != plc.WSTRING("ok") {
+		t.Errorf("WS = %q, want \"ok\"", got)
 	}
 }
 
@@ -378,7 +450,7 @@ func TestRemoveTag_DirectAddressCleanup(t *testing.T) {
 		}
 
 		arrayTagName := "I.W"
-		elementDirectAddr := "%IW2" // Corresponds to I.W[1]
+		elementDirectAddr := "%IW2" // Corresponds to I.W[2]
 
 		// 1. Remove the base array tag.
 		if err := db.RemoveTag(arrayTagName); err != nil {
@@ -2473,7 +2545,7 @@ func TestDirectAddressingForArrayElements(t *testing.T) {
 	})
 
 	// Note: More tests could be added here for other types like M.W and Q.R
-	// For example, setting M.W[2] and getting %MW4 (since WORD is 2 bytes).
+	// For example, setting M.W[2] and getting %MW2 (each area is indexed by address).
 	// This single test case is sufficient to prove the mechanism works.
 }
 

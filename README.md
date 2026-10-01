@@ -10,6 +10,9 @@ The `TagDatabase` project provides a robust, thread-safe, and feature-rich in-me
   - [TypeInfo](#typeinfo)
   - [Tag](#tag)
   - [UDT Interface](#udt-interface)
+- [Advanced Features](#advanced-features)
+  - [Cross-Database Aliasing](#cross-database-aliasing)
+  - [Tag Quality](#tag-quality)
 - [Installation](#installation)
 - [Usage](#usage)
   - [Initializing and Registering Types](#initializing-and-registering-types)
@@ -30,7 +33,7 @@ This database is designed to encapsulate the complexities of PLC tag management,
 *   **Array Management**: Supports single and multi-dimensional arrays (`ARRAY` type) with dynamic element type checking and direct element access (e.g., `MyArray[index]`, `MyMultiDimArray[row,col]`).
 *   **Enumerated Types (ENUMs)**: Provides mechanisms to define and validate enumerated data types, ensuring values are restricted to a predefined set of strings.
 *   **Subrange Types**: Allows the definition of `Min` and `Max` values for numeric tags, enforcing value constraints similar to IEC 61131-3 `SUBRANGE` types.
-*   **Direct Addressing**: Supports IEC 61131-3 direct addressing syntax (e.g., `%IX0.0`, `%QW10`, `%MD20`), enabling tags to be referenced by their memory addresses.
+*   **Direct Addressing**: Supports IEC 61131-3 direct addressing syntax (e.g., `%IX0.0`, `%QW10`, `%MD20`), enabling tags to be referenced by their memory addresses. `PopulateDatabaseFromImage` turns a [royaljelly](https://github.com/apiarytech/royaljelly) `vars.ProcessImage` into tags using royaljelly's address layout: each area is indexed by address (`%QW4` is `Q.W[4]`, `%MD2` is `M.D[2]`), and a bit can be written as `%IX10` or `%IX1.2`.
 *   **Tag Qualifiers**: Incorporates `Constant` and `Retain` qualifiers, mirroring common PLC tag properties for immutability and persistence across restarts.
 *   **Forcing Capabilities**: Tags can be "forced" with a `ForceValue`, overriding their actual `Value`, a critical feature for PLC diagnostics and commissioning.
 *   **Thread-Safety**: All database operations are protected by mutexes and `sync.Map`, ensuring safe concurrent access.
@@ -51,6 +54,7 @@ A struct that holds the defining characteristics of a tag's data type. This incl
 The central entity, representing a single variable or data point. It encapsulates:
 -   `Name`: Unique symbolic identifier.
 -   `Value`: Current data value.
+-   `Quality`: How trustworthy `Value` is: `QualityUnknown` (0), `QualityGood` (1), `QualityUncertain` (2) or `QualityBad` (3). See [Tag Quality](#tag-quality).
 -   `Alias`: Alternative name.
 -   `DirectAddress`: IEC 61131-3 memory address.
 -   `TypeInfo`: Pointer to the shared `TypeInfo` defining its characteristics.
@@ -89,6 +93,35 @@ db2.AddTag(&honeycomb.Tag{
 // Reading/writing "AliasToDB1" in db2 will now transparently access "SourceTag" in db1.
 val, _ := db2.GetTagValue("AliasToDB1") // val will be plc.DINT(100)
 ```
+
+### Tag Quality
+Every tag carries a `Quality` (`uint8`) that says whether its value can be trusted:
+
+| Quality            | Value | Set when                                                                    |
+|--------------------|-------|-----------------------------------------------------------------------------|
+| `QualityUnknown`   | 0     | The tag was created and nothing has written it yet.                         |
+| `QualityGood`      | 1     | `SetTagValue` succeeds (a plain write asserts the value is good). Constants start Good. |
+| `QualityUncertain` | 2     | A Good value is restored at power-up; it may be stale.                      |
+| `QualityBad`       | 3     | A driver reports a failure.                                                 |
+
+Quality is tracked per top-level tag: writing `Motor.Speed` or `Arr[1]` sets the quality of `Motor` or `Arr`.
+Drivers and protocol bridges should write value and quality together, and downgrade the quality alone when a read fails:
+
+```go
+db.SetTagValueQuality("Level", plc.DINT(42), honeycomb.QualityGood)
+db.SetTagQuality("Level", honeycomb.QualityBad) // keeps the last value; notifies only on change
+q, err := db.GetTagQuality("Level")             // QualityBad on error
+```
+
+Quality converts to and from the industrial protocols without depending on their libraries:
+
+| Protocol | To                     | From                                     | Notes |
+|----------|------------------------|------------------------------------------|-------|
+| OPC DA   | `q.OPCDA() uint16`     | `QualityFromOPCDA(uint16)`               | Good `0xC0`, Uncertain `0x40`, Bad `0x00`; Unknown is `0x20` (Bad, waiting for initial data). |
+| OPC UA   | `q.OPCUA() uint32`     | `QualityFromOPCUA(uint32)`               | By severity bits; Unknown is `BadWaitingForInitialData` (`0x80320000`). |
+| PLC4X    | —                      | `QualityFromPLC4X(code.GetName())`       | `OK` → Good; `REMOTE_BUSY`, `RESPONSE_PENDING`, `REQUEST_TIMEOUT` → Uncertain; everything else → Bad. |
+
+Over the network API, `GET /tags/{name}` returns `{"value": ..., "quality": 1}`, and `PUT` accepts an optional `"quality"` (default Good), or `"quality"` alone to change only the quality.
 
 ## Installation
 

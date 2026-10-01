@@ -11,8 +11,8 @@
 // Package sqlstore implements honeycomb.TagStore on top of database/sql.
 // It does not import any database driver: the application imports the driver
 // it needs (for example _ "modernc.org/sqlite") and sqlstore selects the
-// matching Dialect. SQLite, PostgreSQL, MySQL/MariaDB and SQL Server are
-// built in; other databases can be added with Register.
+// matching Dialect. SQLite, PostgreSQL, CockroachDB, MySQL/MariaDB and SQL
+// Server are built in; other databases can be added with Register.
 package sqlstore
 
 import (
@@ -35,7 +35,7 @@ const DefaultInstanceID = "default"
 
 // columns lists TagsTable's columns in bind-parameter order. The first two form the primary key.
 var columns = []string{
-	"instance_id", "tag_name", "data_type", "type_info", "tag_value", "alias",
+	"instance_id", "tag_name", "data_type", "type_info", "tag_value", "quality", "alias",
 	"description", "direct_address", "is_retain", "is_constant", "is_forced",
 	"force_value", "remote_db_id", "remote_tag_name", "updated_at",
 }
@@ -161,9 +161,10 @@ func (s *Store) LoadTags(ctx context.Context) ([]honeycomb.StoredTag, error) {
 			t                           honeycomb.StoredTag
 			dataType                    string
 			typeInfo, value, forceValue sql.NullString
+			quality                     int64
 			updatedAt                   any
 		)
-		err := rows.Scan(&t.Name, &dataType, &typeInfo, &value, &t.Alias, &t.Description,
+		err := rows.Scan(&t.Name, &dataType, &typeInfo, &value, &quality, &t.Alias, &t.Description,
 			&t.DirectAddress, &t.Retain, &t.Constant, &t.Forced, &forceValue,
 			&t.RemoteDBID, &t.RemoteTagName, &updatedAt)
 		if err != nil {
@@ -172,6 +173,7 @@ func (s *Store) LoadTags(ctx context.Context) ([]honeycomb.StoredTag, error) {
 		t.DataType = honeycomb.DataType(dataType)
 		t.TypeInfo = rawJSON(typeInfo)
 		t.Value = rawJSON(value)
+		t.Quality = honeycomb.Quality(quality)
 		t.ForceValue = rawJSON(forceValue)
 		if ts, ok := updatedAt.(time.Time); ok {
 			t.UpdatedAt = ts
@@ -201,7 +203,7 @@ func (s *Store) SaveTags(ctx context.Context, tags []honeycomb.StoredTag) error 
 				updatedAt = time.Now().UTC()
 			}
 			_, err := stmt.ExecContext(ctx, s.instance, t.Name, string(t.DataType),
-				nullJSON(t.TypeInfo), nullJSON(t.Value), t.Alias, t.Description,
+				nullJSON(t.TypeInfo), nullJSON(t.Value), int64(t.Quality), t.Alias, t.Description,
 				t.DirectAddress, t.Retain, t.Constant, t.Forced, nullJSON(t.ForceValue),
 				t.RemoteDBID, t.RemoteTagName, updatedAt)
 			if err != nil {

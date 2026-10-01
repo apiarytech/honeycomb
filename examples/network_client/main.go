@@ -13,7 +13,7 @@ import (
 
 	tags "github.com/apiarytech/honeycomb"
 	"github.com/apiarytech/honeycomb/shared"
-	plc "github.com/apiarytech/royaljelly"
+	plc "github.com/apiarytech/royaljelly/iec"
 )
 
 // --- Client Implementation ---

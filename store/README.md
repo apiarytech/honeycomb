@@ -22,6 +22,7 @@ keeps the two in sync.
    database/sql + Dialect
    ├─ sqlite     (modernc.org/sqlite, mattn/go-sqlite3)
    ├─ postgres   (pgx, lib/pq)
+   ├─ cockroachdb (pgx, lib/pq; set Options.Dialect)
    ├─ mysql      (go-sql-driver/mysql, parseTime=true)
    └─ sqlserver  (microsoft/go-mssqldb)
 ```
@@ -49,13 +50,14 @@ store/
   README.md                    this file
   sqlstore/
     sqlstore.go                Store: Open/New, Load/Save/DeleteTags, Purge, Close
-    dialect.go                 Dialect interface, registry, the four built-in dialects
+    dialect.go                 Dialect interface, registry, the five built-in dialects
     migrate.go                 Setup (migrate up) / Teardown (migrate down) runner
     migrations/
-      sqlite/    0001_create_tags.up.sql   0001_create_tags.down.sql
-      postgres/  0001_create_tags.up.sql   0001_create_tags.down.sql
-      mysql/     0001_create_tags.up.sql   0001_create_tags.down.sql
-      sqlserver/ 0001_create_tags.up.sql   0001_create_tags.down.sql
+      sqlite/      0001_create_tags.*.sql  0002_add_quality.*.sql
+      postgres/    0001_create_tags.*.sql  0002_add_quality.*.sql
+      cockroachdb/ 0001_create_tags.*.sql  0002_add_quality.*.sql
+      mysql/       0001_create_tags.*.sql  0002_add_quality.*.sql
+      sqlserver/   0001_create_tags.*.sql  0002_add_quality.*.sql
 ```
 
 The scripts are embedded in the binary with `go:embed`, so a deployed PLC
@@ -86,7 +88,33 @@ A non-SQL backend implements `honeycomb.TagStore` directly in its own package.
 
 One table, `honeycomb_tags`, keyed by `(instance_id, tag_name)` so several PLCs
 can share one server database. Values are stored as JSON (`JSONB` on
-PostgreSQL, `JSON` on MySQL, `NVARCHAR(MAX)` on SQL Server, `TEXT` on SQLite),
+PostgreSQL and CockroachDB, `JSON` on MySQL, `NVARCHAR(MAX)` on SQL Server, `TEXT` on SQLite),
 which handles primitives, arrays and UDTs uniformly. The stored value is always
 the tag's actual value; force values are stored separately and only restored
 when `PersistOptions.RestoreForces` is set.
+
+The `quality` column (0 Unknown, 1 Good, 2 Uncertain, 3 Bad) holds the value's
+quality when it was saved. `Restore` brings a Good value back as Uncertain,
+because the process may have changed while the runtime was down; Uncertain, Bad
+and Unknown are restored unchanged. Rows saved before migration `0002` default
+to Uncertain. The SQLite rollback uses `DROP COLUMN`, which needs SQLite 3.35+.
+
+## CockroachDB
+
+CockroachDB speaks the PostgreSQL wire protocol, so it uses the `pgx` or
+`lib/pq` driver. Those driver names resolve to the `postgres` dialect, so select
+the CockroachDB dialect explicitly:
+
+```go
+import _ "github.com/jackc/pgx/v5/stdlib"
+
+d, _ := sqlstore.Lookup("cockroachdb") // also "cockroach", "crdb"
+store, err := sqlstore.Open(ctx, "pgx",
+	"postgresql://root@localhost:26257/plc?sslmode=disable",
+	sqlstore.Options{Dialect: d, AutoSetup: true})
+```
+
+Saves use CockroachDB's native `UPSERT INTO`, which writes a row without
+reading it first. CockroachDB runs transactions at `SERIALIZABLE` and can abort
+one with a retryable error (SQLSTATE `40001`) under contention. A failed flush
+keeps its tags queued, so the persister retries on the next interval.

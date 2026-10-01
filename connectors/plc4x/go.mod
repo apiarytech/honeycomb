@@ -1,11 +1,11 @@
 module github.com/apiarytech/honeycomb/connectors/plc4x
 
-go 1.27
+go 1.27.1
 
 require (
 	github.com/apache/plc4x/plc4go v0.0.0-20260930074747-b878affa2d7b
 	github.com/apiarytech/honeycomb v0.0.0
-	github.com/apiarytech/royaljelly v0.0.2-alpha
+	github.com/apiarytech/royaljelly v0.1.0-beta1
 )
 
 require (
