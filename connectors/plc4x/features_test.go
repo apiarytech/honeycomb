@@ -185,7 +185,7 @@ func TestSubscriptionEventsSetValuesAndQuality(t *testing.T) {
 		addTag(t, db, name, honeycomb.TypeINT, plc.INT(0))
 	}
 	c, err := New(db, []Connection{{
-		Name: "sub", URL: "x://", Mode: ChangeOfState,
+		Name: "sub", URL: "modbus-tcp://127.0.0.1:1", Mode: ChangeOfState, // never connected
 		Bindings: []Binding{{Tag: "A", Address: "a"}, {Tag: "B", Address: "b"}, {Tag: "C", Address: "c"},
 			{Tag: "Out", Address: "o", Direction: Output}},
 	}}, WithDriverManager(nil))

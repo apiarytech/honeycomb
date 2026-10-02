@@ -27,8 +27,6 @@ import (
 	"time"
 
 	plc4go "github.com/apache/plc4x/plc4go/pkg/api"
-	"github.com/apache/plc4x/plc4go/pkg/api/config"
-	"github.com/apache/plc4x/plc4go/pkg/api/drivers"
 	apiModel "github.com/apache/plc4x/plc4go/pkg/api/model"
 	apiValues "github.com/apache/plc4x/plc4go/pkg/api/values"
 	"github.com/apiarytech/honeycomb"
@@ -195,27 +193,18 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 		c.connections = append(c.connections, cs)
 	}
 	if c.manager == nil {
-		c.manager = NewDriverManager()
+		// Only the drivers the connections use: a device reaches no other
+		// protocol's code.
+		m, err := NewDriverManagerFor(Protocols(connections)...)
+		if err != nil {
+			return nil, err
+		}
+		c.manager = m
 	}
 	if err := c.createDiagnostics(); err != nil {
 		return nil, err
 	}
 	return c, nil
-}
-
-// NewDriverManager returns a PLC4X driver manager with every PLC4X driver registered.
-func NewDriverManager() plc4go.PlcDriverManager {
-	m := plc4go.NewPlcDriverManager()
-	for _, register := range []func(plc4go.PlcDriverManager, ...config.WithOption) plc4go.PlcDriver{
-		drivers.RegisterAbEthDriver, drivers.RegisterAdsDriver, drivers.RegisterBacnetDriver,
-		drivers.RegisterCBusDriver, drivers.RegisterEipDriver, drivers.RegisterLogixDriver,
-		drivers.RegisterFirmataDriver, drivers.RegisterIec608705104Driver, drivers.RegisterKnxDriver,
-		drivers.RegisterModbusTcpDriver, drivers.RegisterModbusRtuDriver, drivers.RegisterModbusAsciiDriver,
-		drivers.RegisterOpcuaDriver, drivers.RegisterS7Driver, drivers.RegisterSlmpDriver, drivers.RegisterUmasDriver,
-	} {
-		register(m)
-	}
-	return m
 }
 
 // Status returns the current status of the named connection.

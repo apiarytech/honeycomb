@@ -184,10 +184,14 @@ func TestChangesKeepTheirOwnValues(t *testing.T) {
 	if first[0] != 1 || second[0] != 2 {
 		t.Errorf("history = %v then %v, want [1 0] then [2 0]", first, second)
 	}
-	// Editing a returned value does not reach the tag either.
+	// Editing a returned value reaches neither the tag nor what other readers see.
 	second[1] = 99
 	if v, _ := db.GetTagValue("Arr[1]"); v != plc.DINT(0) {
 		t.Errorf("Arr[1] = %v after editing a recorded change, want 0", v)
+	}
+	again, _ := db.Changes(context.Background(), ChangesRequest{Since: pos.Next, Epoch: pos.Epoch})
+	if v := again.Changes[1].Value.([]plc.DINT); v[1] != 0 {
+		t.Errorf("another reader sees %v, want [2 0]: a reader's edit altered the history", v)
 	}
 }
 

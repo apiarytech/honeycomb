@@ -155,6 +155,9 @@ func (f *changeFeed) collect(since uint64, names map[string]bool, limit int) (Ch
 		c := f.buf[(f.start+int(seq-oldest))%len(f.buf)]
 		batch.Next = seq
 		if len(names) == 0 || names[c.Name] {
+			// Each reader gets its own copy, so one reader changing an array or
+			// UDT value cannot alter the history other readers see.
+			c.Value = cloneValue(c.Value)
 			batch.Changes = append(batch.Changes, c)
 			if len(batch.Changes) == limit {
 				break

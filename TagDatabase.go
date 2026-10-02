@@ -11,7 +11,10 @@
 package honeycomb
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -2605,6 +2608,11 @@ func Dereference(ptr interface{}) interface{} {
 type tagServer struct {
 	db          *TagDatabase
 	validTokens []string
+	// authorize, when set, replaces validTokens (see ServerOptions.Authorize).
+	authorize func(r *http.Request, access Access) (string, error)
+	readOnly  bool
+	onWrite   func(r *http.Request, subject, tag string)
+	maxBody   int64
 }
 
 // tagHandler is the main router for the `/tags/` endpoint.
@@ -2621,15 +2629,39 @@ func (ts *tagServer) tagHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		ts.handleGetTagValue(w, r, tagName)
 	case http.MethodPut:
+		if ts.readOnly {
+			http.Error(w, "This server is read-only", http.StatusForbidden)
+			return
+		}
 		ts.handleSetTagValue(w, r, tagName)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// authMiddleware protects server endpoints with Bearer Token authentication.
+// authMiddleware protects server endpoints: with ServerOptions.Authorize when
+// set, else with Bearer tokens compared in constant time. A PUT to /tags/ is a
+// write; everything else is a read.
 func (ts *tagServer) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		access := AccessRead
+		if r.Method == http.MethodPut {
+			access = AccessWrite
+		}
+		if ts.authorize != nil {
+			subject, err := ts.authorize(r, access)
+			if err != nil {
+				if errors.Is(err, ErrForbidden) {
+					http.Error(w, "Forbidden", http.StatusForbidden)
+				} else {
+					http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				}
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), subjectKey{}, subject)))
+			return
+		}
+
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
 			http.Error(w, "Authorization header is required", http.StatusUnauthorized)
@@ -2640,20 +2672,22 @@ func (ts *tagServer) authMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "Authorization header format must be Bearer {token}", http.StatusUnauthorized)
 			return
 		}
-		token := parts[1]
-		isValid := false
-		for _, validToken := range ts.validTokens {
-			if token == validToken {
-				isValid = true
-				break
-			}
-		}
-		if !isValid {
+		if !tokenValid(parts[1], ts.validTokens) {
 			http.Error(w, "Invalid authentication token", http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// tokenValid compares token with every valid token in constant time, so the
+// time taken does not reveal how much of a token matched.
+func tokenValid(token string, valid []string) bool {
+	ok := 0
+	for _, v := range valid {
+		ok |= subtle.ConstantTimeCompare([]byte(token), []byte(v))
+	}
+	return ok == 1
 }
 
 // handleGetTagValue handles GET requests to read a tag's value.
@@ -2716,9 +2750,13 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	maxBody := ts.maxBody
+	if maxBody <= 0 {
+		maxBody = DefaultMaxBodyBytes
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+		http.Error(w, "Request body unreadable or too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -2757,6 +2795,7 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		ts.wrote(r, tagName)
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "Tag quality updated successfully.")
 		return
@@ -2766,7 +2805,7 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 	// of the correct type. We can get this from the tag's current value.
 	// For a nested write, we unmarshal into a generic interface{}.
 	// For a whole-tag write, we unmarshal into a new instance of the tag's type.
-	if strings.Contains(tagName, ".") || strings.Contains(tagName, "[") {
+	if tag.Name != tagName {
 		// Handle nested writes. We unmarshal into a generic interface{} first.
 		var value interface{}
 		if err := json.Unmarshal(valueJSON, &value); err != nil {
@@ -2813,8 +2852,17 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 		}
 	}
 
+	ts.wrote(r, tagName)
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "Tag value updated successfully.")
+}
+
+// wrote reports a successful write to ServerOptions.OnWrite.
+func (ts *tagServer) wrote(r *http.Request, tag string) {
+	if ts.onWrite != nil {
+		subject, _ := r.Context().Value(subjectKey{}).(string)
+		ts.onWrite(r, subject, tag)
+	}
 }
 
 // getNestedFieldType is a helper to determine the DataType of a nested field.
@@ -2834,6 +2882,11 @@ func (db *TagDatabase) getNestedFieldType(fullName string) (DataType, error) {
 // even if the name represents a nested field or array element (e.g., "MyUDT.Field" or "MyArray[0]").
 // It returns a pointer to the actual tag in the database, not a copy.
 func (db *TagDatabase) getBaseTag(name string) (*Tag, bool) {
+	// A top-level tag whose name contains a dot (e.g. "Guard1.Temp") is the tag
+	// itself, not a field of a tag named "Guard1".
+	if val, found := db.tags.Load(name); found {
+		return val.(*Tag), true
+	}
 	// The base tag name is the part before the first dot or bracket.
 	var baseTagName string
 	dotIndex := strings.Index(name, ".")
