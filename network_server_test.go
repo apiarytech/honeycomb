@@ -139,9 +139,13 @@ func TestHandleGetAllTags(t *testing.T) {
 	})
 
 	t.Run("UnsupportedMethod", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodPost, "/tags", nil)
+		// POST is a batch read (batchread.go); DELETE is not supported.
+		req, _ := http.NewRequest(http.MethodDelete, "/tags", nil)
 		rr := httptest.NewRecorder()
 		ts.handleGetAllTags(rr, req)
+		if rr.Code != http.StatusMethodNotAllowed {
+			t.Errorf("DELETE /tags returned %d, want %d", rr.Code, http.StatusMethodNotAllowed)
+		}
 	})
 }
 

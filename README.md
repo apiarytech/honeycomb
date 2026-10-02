@@ -15,6 +15,8 @@ The `TagDatabase` project provides a robust, thread-safe, and feature-rich in-me
   - [Tag Quality](#tag-quality)
   - [Timestamps](#timestamps)
   - [Subscriptions](#subscriptions)
+  - [Change Feed](#change-feed)
+  - [Batch Read](#batch-read)
 - [Installation](#installation)
 - [Usage](#usage)
   - [Initializing and Registering Types](#initializing-and-registering-types)
@@ -154,6 +156,49 @@ for update := range ch {
     last = update.Sequence
 }
 ```
+
+Subscriptions keep only the latest state. To process **every** change, for example to record a sequence of events, use the change feed.
+
+### Change Feed
+Each database keeps an in-memory ring buffer of tag changes (`DefaultChangeFeedCapacity`, 10,000; see `SetChangeFeedCapacity`). A change is recorded when the write happens, before subscriptions replace older updates. Each one has a sequence number, the tag's value and quality, and the device timestamp. A reader asks for the changes after the last sequence it saw, and can wait (long-poll) until there are some:
+
+```go
+pos, _ := db.Changes(ctx, honeycomb.ChangesRequest{}) // a new reader starts from "now"
+// ... read current values (ReadTags) to start from ...
+for {
+    batch, err := db.Changes(ctx, honeycomb.ChangesRequest{
+        Since: pos.Next, Epoch: pos.Epoch, Wait: 30 * time.Second,
+    })
+    if err != nil {
+        break
+    }
+    if batch.Gap {
+        // Changes were lost (the reader fell behind the buffer, or the
+        // database restarted): re-read current values before going on.
+    }
+    for _, c := range batch.Changes {
+        // c.Seq, c.Name, c.Value, c.Quality, c.Timestamp: in order, none skipped.
+    }
+    pos = batch
+}
+```
+
+- **Nothing is skipped while the buffer holds.** A 50 ms pulse between two polls still produces both its activation and its return to normal, each with its own device timestamp.
+- **Gaps are reported.** If a reader falls further behind than the buffer holds, or the database restarted (a new `Epoch`), the batch has `Gap` set, and the reader re-reads current values.
+- **Writes that change nothing are not recorded.** A driver that rewrites an unchanged value every poll does not fill the buffer; a change of quality alone is recorded.
+- **Each change keeps its own copy** of array and UDT values, so later element writes do not alter the history.
+- **Changes are per top-level tag.** A write to `Arr[1]` or `Motor.Speed` records the whole `Arr` or `Motor`.
+
+Over HTTP, `POST /changes` takes `{"since": 41, "epoch": "…", "names": [...], "wait_ms": 30000, "max": 1000}` and returns `{"epoch": "…", "next": 42, "gap": false, "changes": [...]}`. The server answers at once if there are newer changes, or holds the request open (at most `MaxChangesWait`, one minute) until one arrives. `NetworkDatabaseClient.Changes` wraps this, and returns `ErrChangesUnsupported` for a server without a feed.
+
+### Batch Read
+`ReadTags` reads many tags (value, quality and timestamp) in one call, so a client that samples tags pays one round trip per poll instead of one per tag:
+
+```go
+readings, err := db.ReadTags(ctx, []string{"Temp", "Lid", "Motors[1]"}) // err joins any per-tag errors
+```
+
+Over HTTP, `GET /tags?names=Temp,Lid` (or repeated `name=` parameters) and `POST /tags` with `{"names": [...]}` (for lists too long for a URL; up to `MaxReadTags`) both return `{"tags": {"Temp": {"value": 42.5, "quality": 1, "timestamp": "…"}, ...}}`. A tag that cannot be read has quality 3 (Bad) and an `"error"`. `GET /tags` without names still lists all tags. `NetworkDatabaseClient.ReadTags` wraps the POST form, and returns `ErrReadTagsUnsupported` for an older server. Both implement `TagReader`, as both implement `ChangeSource`, so a client reads the same way in process and over the network.
 
 ## Installation
 

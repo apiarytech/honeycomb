@@ -598,6 +598,9 @@ type TagDatabase struct {
 	PersistenceWorkers int
 	// persister is the attached TagStore's Persister, or nil. See AttachStore.
 	persister atomic.Pointer[Persister]
+	// feed is the change feed (changefeed.go), created on first use.
+	feedOnce sync.Once
+	feed     atomic.Pointer[changeFeed]
 }
 
 // DatabaseAccessor defines the interface for any object that can be registered
@@ -607,6 +610,7 @@ type DatabaseAccessor interface {
 	setTagValueRecursive(name string, value any, quality Quality, timestamp time.Time, depth int) error
 	getTagQualityRecursive(name string, depth int) (Quality, error)
 	setTagQualityRecursive(name string, quality Quality, depth int) error
+	readTagRecursive(name string, depth int) (Reading, error)
 }
 
 // NetworkDatabaseClient is an implementation of DatabaseAccessor that communicates
@@ -946,6 +950,7 @@ func (db *TagDatabase) RemoveTag(name string) error {
 		return fmt.Errorf("tag '%s' not found in database", name)
 	}
 	db.markRemoved(name)
+	db.changeFeed().forget(name)
 
 	// Also remove any active subscriptions for this tag.
 	db.subMu.Lock()
@@ -1252,6 +1257,42 @@ func (db *TagDatabase) getTagQualityRecursive(name string, depth int) (Quality, 
 	return tag.GetQuality(), nil
 }
 
+// Reading is a tag's value, quality and timestamp, read together.
+type Reading struct {
+	Value     any
+	Quality   Quality
+	Timestamp time.Time // zero if the value was never written or the source does not report it
+}
+
+// ReadTag returns a tag's value, quality and timestamp in one call. It accepts
+// the same names as GetTagValue. For a remote alias it makes a single request to
+// the remote database, so a client polling remote tags pays one round trip per
+// tag. On error the quality is QualityBad.
+func (db *TagDatabase) ReadTag(name string) (Reading, error) {
+	return db.readTagRecursive(name, 0)
+}
+
+func (db *TagDatabase) readTagRecursive(name string, depth int) (Reading, error) {
+	tag, err := db.qualityTag(name)
+	if err != nil {
+		return Reading{Quality: QualityBad}, fmt.Errorf("ReadTag: %w", err)
+	}
+	if tag.RemoteAlias != nil {
+		remoteDB, err := db.remoteForAlias(tag, depth)
+		if err != nil {
+			return Reading{Quality: QualityBad}, fmt.Errorf("ReadTag: %w", err)
+		}
+		// Keep an element or field suffix, e.g. "Alias.Speed" reads "Remote.Speed".
+		suffix := strings.TrimPrefix(name, tag.Name)
+		return remoteDB.readTagRecursive(tag.RemoteAlias.TagName+suffix, depth+1)
+	}
+	value, err := db.getTagValueRecursive(name, depth)
+	if err != nil {
+		return Reading{Quality: QualityBad}, fmt.Errorf("ReadTag: %w", err)
+	}
+	return Reading{Value: value, Quality: tag.GetQuality(), Timestamp: tag.GetTimestamp()}, nil
+}
+
 // SetTagQuality changes a tag's quality without touching its value, e.g. when a
 // driver loses its connection and the last value read becomes Uncertain or Bad.
 // For an array element or UDT field it sets the quality of the whole tag.
@@ -1513,14 +1554,16 @@ func (db *TagDatabase) notifySubscribers(tag *Tag) {
 	tag.notifyMu.Lock()
 	defer tag.notifyMu.Unlock()
 
+	// Every value write funnels through here, so this is where changes are
+	// recorded in the change feed (under the read lock, so array and UDT
+	// values are copied consistently) and queued for the attached TagStore.
 	tag.valMu.RLock()
 	update := tag.snapshot()
+	db.recordChange(tag)
 	tag.valMu.RUnlock()
 	tag.seq++
 	update.Sequence = tag.seq
 
-	// Every value write funnels through here, so this is where changes are
-	// queued for the attached TagStore, if any.
 	db.markChanged(update.Name)
 
 	// Holding subMu keeps Unsubscribe and RemoveTag from closing a channel mid-send.
@@ -2631,13 +2674,29 @@ func (ts *tagServer) handleGetTagValue(w http.ResponseWriter, r *http.Request, t
 	json.NewEncoder(w).Encode(response)
 }
 
-// handleGetAllTags handles GET requests to list all available tags.
+// handleGetAllTags handles GET requests to list all available tags, and batch
+// reads (GET /tags?names=… or POST /tags; see batchread.go).
 func (ts *tagServer) handleGetAllTags(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[Server] GET /tags")
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
+		if names := requestedNames(r); len(names) > 0 {
+			ts.handleReadTags(w, r, names)
+			return
+		}
+	case http.MethodPost:
+		names, err := decodeReadTagsBody(w, r)
+		if err != nil {
+			http.Error(w, "invalid batch read: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		ts.handleReadTags(w, r, names)
+		return
+	default:
+		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	log.Printf("[Server] GET /tags")
 
 	allTags := ts.db.GetAllTags() // This method returns a safe copy.
 

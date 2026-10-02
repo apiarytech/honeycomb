@@ -36,6 +36,23 @@ type tagResponse struct {
 	Value interface{} `json:"value"`
 	// Quality is nil when the server predates tag quality.
 	Quality *Quality `json:"quality"`
+	// Timestamp is zero when the tag was never written or the server predates timestamps.
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// readTagRecursive implements the DatabaseAccessor interface. It reads the
+// remote tag's value, quality and timestamp with one request. On error the
+// quality is QualityBad, so an unreachable server reads as Bad.
+func (ndc *NetworkDatabaseClient) readTagRecursive(name string, depth int) (Reading, error) {
+	payload, err := ndc.getTag(name)
+	if err != nil {
+		return Reading{Quality: QualityBad}, err
+	}
+	quality := QualityUnknown
+	if payload.Quality != nil {
+		quality = *payload.Quality
+	}
+	return Reading{Value: payload.Value, Quality: quality, Timestamp: payload.Timestamp}, nil
 }
 
 // getTagValueRecursive implements the DatabaseAccessor interface. It is called by a

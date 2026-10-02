@@ -41,6 +41,9 @@ func StartServer(db *TagDatabase, validTokens []string, port, certFile, keyFile 
 	//    This also goes through the authentication middleware.
 	mux.Handle("/tags", server.authMiddleware(http.HandlerFunc(server.handleGetAllTags)))
 
+	// 4b. The change feed (changefeed_network.go): POST /changes, long-polled.
+	mux.Handle("/changes", server.authMiddleware(http.HandlerFunc(server.handleChanges)))
+
 	// 4. Configure the HTTP server.
 	httpServer := &http.Server{
 		Addr:    ":" + port,
