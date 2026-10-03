@@ -1203,13 +1203,8 @@ func (db *TagDatabase) getTagValueRecursive(name string, depth int) (interface{}
 			arrayPart := name[:lastBracket+1] // e.g., "MyArray[0]"
 			fieldPart := name[lastBracket+2:] // e.g., "MyField" (+2 to skip the ']').
 
-			// First, recursively resolve the array element part to get the UDT instance.
-			element, err := db.getTagValueRecursive(arrayPart, depth) // Pass depth
-			if err != nil {
-				return nil, err
-			}
-			// Then, get the specific field from that UDT instance.
-			return getFieldFromStruct(element, fieldPart)
+			// Read the field of the array element under the array's lock.
+			return db.fieldOf(arrayPart, fieldPart, depth)
 		}
 	}
 
@@ -2243,17 +2238,10 @@ func (db *TagDatabase) getNestedField(fullName string) (Tag, error) { // Correct
 	basePath := fullName[:dotIndex]
 	fieldPath := fullName[dotIndex+1:]
 
-	// STEP 1: Get the base UDT instance.
-	// This could be a top-level UDT or an element from an array of UDTs.
-	// We use getTagValueRecursive because it can resolve both simple names and array access.
-	udtInstance, err := db.getTagValueRecursive(basePath, 0)
-	if err != nil {
-		return Tag{}, fmt.Errorf("getNestedField: could not resolve base path '%s': %w", basePath, err)
-	}
-
-	// STEP 2: Traverse the field path on the UDT instance.
-	// The getFieldFromStruct helper function will walk the dot-separated path (e.g., "Config.Speed").
-	fieldValue, err := getFieldFromStruct(udtInstance, fieldPath)
+	// STEP 1 and 2: Get the base UDT instance (a top-level UDT or an element
+	// of an array of UDTs) and walk the dot-separated field path on it
+	// (e.g., "Config.Speed"), under the lock of the tag that owns it.
+	fieldValue, err := db.fieldOf(basePath, fieldPath, 0)
 	if err != nil {
 		return Tag{}, fmt.Errorf("getNestedField: could not get field '%s' from base '%s': %w", fieldPath, basePath, err)
 	}
@@ -2298,6 +2286,56 @@ func (db *TagDatabase) setSimpleTagValue(name string, value interface{}, quality
 	db.notifySubscribers(tag)
 
 	return nil
+}
+
+// fieldOf reads fieldPath of the UDT at basePath, a tag or an element of an
+// array tag, under the read lock of the tag that owns it. setNestedField
+// writes a UDT's fields in place under that tag's write lock, so a field read
+// after the lock is released (through the UDT pointer GetValue returns) would
+// race with it.
+func (db *TagDatabase) fieldOf(basePath, fieldPath string, depth int) (interface{}, error) {
+	var owner *Tag
+	index := -1
+	if strings.HasSuffix(basePath, "]") {
+		tag, i, err := db.parseArrayAccess(basePath)
+		if err != nil {
+			return nil, err
+		}
+		owner, index = tag, i
+	} else if val, found := db.tags.Load(basePath); found {
+		owner = val.(*Tag)
+	}
+	switch {
+	case owner == nil, owner.RemoteAlias != nil && index >= 0:
+		// A direct address, or an element of a remote array: resolved by
+		// getTagValueRecursive.
+		udtInstance, err := db.getTagValueRecursive(basePath, depth)
+		if err != nil {
+			return nil, err
+		}
+		return getFieldFromStruct(udtInstance, fieldPath)
+	case owner.RemoteAlias != nil && index < 0:
+		// The remote database reads the field under its own lock.
+		if depth > 10 {
+			return nil, fmt.Errorf("max recursion depth exceeded for remote alias '%s'", basePath)
+		}
+		remoteDB, found := db.getDatabase(owner.RemoteAlias.DBID)
+		if !found {
+			return nil, fmt.Errorf("remote database with ID '%s' not found for alias '%s'", owner.RemoteAlias.DBID, basePath)
+		}
+		return remoteDB.getTagValueRecursive(owner.RemoteAlias.TagName+"."+fieldPath, depth+1)
+	}
+	owner.valMu.RLock()
+	defer owner.valMu.RUnlock()
+	udtInstance := owner.presentedValue()
+	if index >= 0 {
+		element, err := arrayElement(owner, index)
+		if err != nil {
+			return nil, err
+		}
+		udtInstance = element
+	}
+	return getFieldFromStruct(udtInstance, fieldPath)
 }
 
 func getFieldFromStruct(udtInstance interface{}, fieldPath string) (interface{}, error) {
@@ -2505,7 +2543,11 @@ func calculateFlatIndex(dimensions []int, indices []int) (int, error) {
 func getArrayElementValue(baseTag *Tag, index int) (interface{}, error) {
 	baseTag.valMu.RLock()
 	defer baseTag.valMu.RUnlock()
+	return arrayElement(baseTag, index)
+}
 
+// arrayElement is getArrayElementValue for a caller that holds baseTag.valMu.
+func arrayElement(baseTag *Tag, index int) (interface{}, error) {
 	if baseTag.TypeInfo.DataType != TypeARRAY { // Corrected from TypeARRAY to honeycomb.TypeARRAY
 		return nil, fmt.Errorf("getArrayElementValue: tag '%s' is not an array", baseTag.Name)
 	}
