@@ -1797,7 +1797,7 @@ type persistentTag struct {
 }
 
 // WriteTagsToFile iterates through the database and writes each tag's name
-// and current value to a file.
+// and current value to a file, readable and writable by its owner only.
 // This function is optimized to reduce memory allocations by pre-calculating
 // the required buffer size and writing directly to a strings.Builder.
 // It uses a worker pool to parallelize JSON marshaling for performance.
@@ -1875,7 +1875,10 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 	builder.Grow(estimatedSize) // Pre-allocate memory.
 	builder.WriteString(strings.Join(lines, "\n"))
 
-	return os.WriteFile(filePath, []byte(builder.String()), 0666)
+	// Owner only: the file holds retained values (setpoints, counters) that
+	// ReadTagsFromFile restores at start, so nobody else may read or change it.
+	// A file that already exists keeps its permissions.
+	return os.WriteFile(filePath, []byte(builder.String()), 0o600)
 }
 
 // ReadTagsFromFile reads a file of tag values, parses each line,
