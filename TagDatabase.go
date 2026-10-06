@@ -756,7 +756,7 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 	}
 
 	if tag.DirectAddress != "" {
-		db.directAddressMap.Store(canonicalAddress(tag.DirectAddress), tag.Name)
+		db.directAddressMap.Store(CanonicalAddress(tag.DirectAddress), tag.Name)
 	}
 	db.markChanged(tag.Name)
 	return nil
@@ -971,7 +971,7 @@ func (db *TagDatabase) RemoveTag(name string) error {
 	if tag, ok := val.(*Tag); ok {
 		// If the tag itself has a direct address, remove it.
 		if tag.DirectAddress != "" {
-			db.directAddressMap.Delete(canonicalAddress(tag.DirectAddress))
+			db.directAddressMap.Delete(CanonicalAddress(tag.DirectAddress))
 		}
 
 		// If the tag is a process-image array (see PopulateDatabaseFromImage), we
@@ -1035,7 +1035,7 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 	// Update the directAddressMap for the new name.
 	if tagPtr.DirectAddress != "" {
 		// For a simple tag, just update the single mapping.
-		db.directAddressMap.Store(canonicalAddress(tagPtr.DirectAddress), newName)
+		db.directAddressMap.Store(CanonicalAddress(tagPtr.DirectAddress), newName)
 	} else if tagPtr.TypeInfo != nil && tagPtr.TypeInfo.DataType == TypeARRAY {
 		// For a process-image array, remap each element's address. The addresses
 		// come from the old name, since the tag's internal name was just changed.
@@ -1775,10 +1775,10 @@ func canonicalAddress(addr string) string {
 // resolveAddress returns the symbolic name an IEC direct address maps to, or
 // name itself if it is not a direct address.
 func (db *TagDatabase) resolveAddress(name string) (string, error) {
-	if !directAddressRegex.MatchString(name) {
+	if !IsDirectAddress(name) {
 		return name, nil
 	}
-	if symbolicName, found := db.directAddressMap.Load(canonicalAddress(name)); found {
+	if symbolicName, found := db.directAddressMap.Load(CanonicalAddress(name)); found {
 		return symbolicName.(string), nil
 	}
 	return "", fmt.Errorf("direct address '%s' not found in database", name)
