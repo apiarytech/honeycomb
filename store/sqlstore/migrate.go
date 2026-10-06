@@ -82,19 +82,26 @@ func LoadMigrations(fsys fs.FS) ([]Migration, error) {
 // Setup creates or upgrades the schema by applying every pending migration,
 // each in its own transaction. It is idempotent: run it at every power-up.
 func Setup(ctx context.Context, db *sql.DB, d Dialect) error {
+	return SetupTable(ctx, db, d, MigrationsTable)
+}
+
+// SetupTable is Setup recording the applied versions in table: a schema of
+// its own (another program's tables in the same database) keeps its own
+// versions, so its migrations never collide with honeycomb's.
+func SetupTable(ctx context.Context, db *sql.DB, d Dialect, table string) error {
 	migrations, err := LoadMigrations(d.Migrations())
 	if err != nil {
 		return err
 	}
-	if _, err := db.ExecContext(ctx, d.CreateMigrationsTable(MigrationsTable)); err != nil {
-		return fmt.Errorf("sqlstore: create %s: %w", MigrationsTable, err)
+	if _, err := db.ExecContext(ctx, d.CreateMigrationsTable(table)); err != nil {
+		return fmt.Errorf("sqlstore: create %s: %w", table, err)
 	}
-	applied, err := appliedVersions(ctx, db)
+	applied, err := appliedVersions(ctx, db, table)
 	if err != nil {
 		return err
 	}
 
-	record := fmt.Sprintf("INSERT INTO %s (version, name, applied_at) VALUES (%s)", MigrationsTable, placeholders(d, 3))
+	record := fmt.Sprintf("INSERT INTO %s (version, name, applied_at) VALUES (%s)", table, placeholders(d, 3))
 	for _, mig := range migrations {
 		if applied[mig.Version] {
 			continue
@@ -117,19 +124,24 @@ func Setup(ctx context.Context, db *sql.DB, d Dialect) error {
 // migrations table, removing all honeycomb tables and data. It is meant for
 // decommissioning and tests; it is not part of a normal shutdown.
 func Teardown(ctx context.Context, db *sql.DB, d Dialect) error {
+	return TeardownTable(ctx, db, d, MigrationsTable)
+}
+
+// TeardownTable is Teardown for the versions recorded in table (SetupTable).
+func TeardownTable(ctx context.Context, db *sql.DB, d Dialect, table string) error {
 	migrations, err := LoadMigrations(d.Migrations())
 	if err != nil {
 		return err
 	}
-	if _, err := db.ExecContext(ctx, d.CreateMigrationsTable(MigrationsTable)); err != nil {
-		return fmt.Errorf("sqlstore: create %s: %w", MigrationsTable, err)
+	if _, err := db.ExecContext(ctx, d.CreateMigrationsTable(table)); err != nil {
+		return fmt.Errorf("sqlstore: create %s: %w", table, err)
 	}
-	applied, err := appliedVersions(ctx, db)
+	applied, err := appliedVersions(ctx, db, table)
 	if err != nil {
 		return err
 	}
 
-	forget := fmt.Sprintf("DELETE FROM %s WHERE version = %s", MigrationsTable, d.Placeholder(1))
+	forget := fmt.Sprintf("DELETE FROM %s WHERE version = %s", table, d.Placeholder(1))
 	for i := len(migrations) - 1; i >= 0; i-- {
 		mig := migrations[i]
 		if !applied[mig.Version] {
@@ -147,16 +159,16 @@ func Teardown(ctx context.Context, db *sql.DB, d Dialect) error {
 		}
 	}
 
-	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS "+MigrationsTable); err != nil {
-		return fmt.Errorf("sqlstore: drop %s: %w", MigrationsTable, err)
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS "+table); err != nil {
+		return fmt.Errorf("sqlstore: drop %s: %w", table, err)
 	}
 	return nil
 }
 
-func appliedVersions(ctx context.Context, db *sql.DB) (map[int]bool, error) {
-	rows, err := db.QueryContext(ctx, "SELECT version FROM "+MigrationsTable)
+func appliedVersions(ctx context.Context, db *sql.DB, table string) (map[int]bool, error) {
+	rows, err := db.QueryContext(ctx, "SELECT version FROM "+table)
 	if err != nil {
-		return nil, fmt.Errorf("sqlstore: read %s: %w", MigrationsTable, err)
+		return nil, fmt.Errorf("sqlstore: read %s: %w", table, err)
 	}
 	defer rows.Close()
 
