@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <title>honeycomb architecture</title>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+    <style>
+      .t  { font-size: 12.5px; font-weight: 600; fill: #1f1f1f; text-anchor: middle; }
+      .s  { font-size: 11px; fill: #444; text-anchor: middle; }
+      .h  { font-size: 14px; font-weight: 700; fill: #1f1f1f; }
+      .hs { font-size: 12px; font-weight: 400; fill: #555; }
+      .l  { font-size: 10.5px; fill: #333; }
+      .bh { fill: #eaf1fb; stroke: #3d6fb3; stroke-width: 1.5; }
+      .bi { fill: #ffffff; stroke: #3d6fb3; stroke-width: 1.2; }
+      .bm { fill: #ffffff; stroke: #3d6fb3; stroke-width: 1.2; stroke-dasharray: 5 3; }
+      .dh { fill: #fff3e0; stroke: #c47a14; stroke-width: 1.5; }
+      .ex { fill: #ffffff; stroke: #555; stroke-width: 1.3; }
+      .ln { stroke: #333; stroke-width: 1.4; fill: none; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="720" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="20" y="32" style="font-size:20px;font-weight:700;fill:#1f1f1f">honeycomb · architecture</text>
+  <text x="20" y="52" style="font-size:12.5px;fill:#555">The IEC 61131-3 tag database for PLC, HMI and SCADA: typed tags with quality and time, subscriptions, an ordered change feed, persistence and an HTTPS API.</text>
+
+  <!-- Module -->
+  <rect x="250" y="64" width="680" height="568" rx="10" fill="#fbfbfb" stroke="#333" stroke-width="1.6"/>
+  <text x="266" y="84" class="h">github.com/apiarytech/honeycomb <tspan class="hs">(standard library + royaljelly)</tspan></text>
+
+  <rect x="270" y="100" width="200" height="70" rx="5" class="bm"/>
+  <text x="370" y="122" class="t">connectors/plc4x</text>
+  <text x="370" y="140" class="s">its own Go module</text>
+  <text x="370" y="156" class="s">Apache PLC4X drivers ↔ tags</text>
+
+  <rect x="500" y="100" width="250" height="200" rx="6" class="bh"/>
+  <text x="625" y="124" class="t">TagDatabase</text>
+  <text x="625" y="146" class="s">tags by name · a lock per tag</text>
+  <text x="625" y="166" class="s">each write checked against TypeInfo</text>
+  <text x="625" y="186" class="s">(royaljelly iec types, arrays, UDTs)</text>
+  <text x="625" y="206" class="s">quality · device timestamp</text>
+  <text x="625" y="226" class="s">Retain · Constant · forcing</text>
+  <text x="625" y="246" class="s">alias · %MW address · remote alias</text>
+  <text x="625" y="266" class="s">type, UDT and enumeration registries</text>
+  <text x="625" y="286" class="s">writes never wait for readers or store</text>
+
+  <rect x="770" y="100" width="140" height="46" rx="5" class="bi"/>
+  <text x="840" y="119" class="t">Subscriptions</text>
+  <text x="840" y="136" class="s">latest state per tag</text>
+
+  <rect x="770" y="156" width="140" height="46" rx="5" class="bi"/>
+  <text x="840" y="175" class="t">Change feed</text>
+  <text x="840" y="192" class="s">every change, in order</text>
+
+  <rect x="770" y="212" width="140" height="46" rx="5" class="bi"/>
+  <text x="840" y="231" class="t">Batch read</text>
+  <text x="840" y="248" class="s">ReadTags</text>
+
+  <rect x="770" y="280" width="140" height="70" rx="5" class="bi"/>
+  <text x="840" y="300" class="t">HTTPS server</text>
+  <text x="840" y="318" class="s">tags · feed · batch</text>
+  <text x="840" y="334" class="s">bearer token</text>
+
+  <rect x="770" y="370" width="140" height="70" rx="5" class="bi"/>
+  <text x="840" y="390" class="t">HTTPS client</text>
+  <text x="840" y="408" class="s">NetworkDatabaseClient</text>
+  <text x="840" y="424" class="s">for remote aliases</text>
+
+  <rect x="270" y="330" width="200" height="70" rx="5" class="bi"/>
+  <text x="370" y="350" class="t">Persister</text>
+  <text x="370" y="368" class="s">write-behind of changed tags</text>
+  <text x="370" y="384" class="s">Restore at power-up</text>
+
+  <rect x="270" y="430" width="200" height="56" rx="5" class="bi"/>
+  <text x="370" y="451" class="t">TagStore interface</text>
+  <text x="370" y="469" class="s">Load · Save · Delete</text>
+
+  <rect x="270" y="516" width="640" height="90" rx="6" class="bh"/>
+  <text x="590" y="540" class="t">store/sqlstore: a TagStore on database/sql</text>
+  <text x="590" y="560" class="s">dialects: SQLite · PostgreSQL · CockroachDB · MySQL/MariaDB · SQL Server (Register adds more)</text>
+  <text x="590" y="578" class="s">embedded migrations per dialect · upsert per dialect</text>
+  <text x="590" y="596" class="s">SetupTable keeps another program's schema versions apart in a shared database</text>
+
+  <!-- arrows inside -->
+  <path d="M470,135 H498" class="ln" marker-end="url(#a)"/>
+  <path d="M750,123 H768" class="ln" marker-end="url(#a)"/>
+  <path d="M750,179 H768" class="ln" marker-end="url(#a)"/>
+  <path d="M750,235 H768" class="ln" marker-end="url(#a)"/>
+  <path d="M750,290 H758 V315 H768" class="ln" marker-end="url(#a)"/>
+  <path d="M770,405 H730 V302" class="ln" marker-start="url(#a)" marker-end="url(#a)"/>
+  <text x="724" y="384" class="l" text-anchor="end">remote aliases</text>
+  <path d="M560,300 V315 H370 V328" class="ln" marker-start="url(#a)" marker-end="url(#a)"/>
+  <text x="378" y="312" class="l">changed tags · restore</text>
+  <path d="M370,400 V428" class="ln" marker-end="url(#a)"/>
+  <path d="M370,486 V514" class="ln" marker-end="url(#a)"/>
+
+  <!-- External, left -->
+  <rect x="20" y="105" width="200" height="60" rx="6" class="ex"/>
+  <text x="120" y="129" class="t">Field devices</text>
+  <text x="120" y="147" class="s">Modbus, S7, OPC UA, ...</text>
+  <path d="M222,135 H268" class="ln" marker-start="url(#a)" marker-end="url(#a)"/>
+
+  <rect x="20" y="240" width="200" height="60" rx="6" class="ex"/>
+  <text x="120" y="264" class="t">Programs and drivers</text>
+  <text x="120" y="282" class="s">SetTagValueQualityAt · GetTagValue</text>
+  <path d="M222,270 H498" class="ln" marker-start="url(#a)" marker-end="url(#a)"/>
+
+  <!-- External, right -->
+  <rect x="960" y="100" width="220" height="46" rx="6" class="ex"/>
+  <text x="1070" y="119" class="t">HMIs and SCADA</text>
+  <text x="1070" y="136" class="s">the newest value of each tag</text>
+  <path d="M910,123 H958" class="ln" marker-end="url(#a)"/>
+
+  <rect x="960" y="156" width="220" height="46" rx="6" class="dh"/>
+  <text x="1070" y="175" class="t">Alarm engines, historians</text>
+  <text x="1070" y="192" class="s">beeguard, beehive: every change</text>
+  <path d="M910,179 H958" class="ln" marker-end="url(#a)"/>
+
+  <rect x="960" y="212" width="220" height="46" rx="6" class="ex"/>
+  <text x="1070" y="231" class="t">Services</text>
+  <text x="1070" y="248" class="s">many tags in one request</text>
+  <path d="M910,235 H958" class="ln" marker-end="url(#a)"/>
+
+  <rect x="960" y="285" width="220" height="60" rx="6" class="ex"/>
+  <text x="1070" y="309" class="t">Other programs, over HTTPS</text>
+  <text x="1070" y="327" class="s">read, write, follow the feed</text>
+  <path d="M910,315 H958" class="ln" marker-start="url(#a)" marker-end="url(#a)"/>
+
+  <rect x="960" y="375" width="220" height="60" rx="6" class="ex"/>
+  <text x="1070" y="399" class="t">Other honeycomb servers</text>
+  <text x="1070" y="417" class="s">their tags as remote aliases</text>
+  <path d="M910,405 H958" class="ln" marker-start="url(#a)" marker-end="url(#a)"/>
+
+  <rect x="960" y="531" width="220" height="60" rx="6" class="ex"/>
+  <text x="1070" y="555" class="t">SQL database</text>
+  <text x="1070" y="573" class="s">its driver chosen by the application</text>
+  <path d="M910,561 H958" class="ln" marker-start="url(#a)" marker-end="url(#a)"/>
+
+  <!-- Dependency -->
+  <rect x="20" y="531" width="200" height="60" rx="6" class="dh"/>
+  <text x="120" y="555" class="t">royaljelly · iec</text>
+  <text x="120" y="573" class="s">the IEC 61131-3 Go types</text>
+  <path d="M222,561 H268" class="ln" stroke-dasharray="5 4"/>
+
+  <!-- Legend -->
+  <g transform="translate(250,656)">
+    <rect x="0" y="0" width="16" height="12" class="bh"/>
+    <text x="22" y="11" style="font-size:11.5px;fill:#333">honeycomb</text>
+    <rect x="110" y="0" width="16" height="12" class="bm"/>
+    <text x="132" y="11" style="font-size:11.5px;fill:#333">its own Go module</text>
+    <rect x="260" y="0" width="16" height="12" class="dh"/>
+    <text x="282" y="11" style="font-size:11.5px;fill:#333">other apiarytech projects</text>
+    <rect x="440" y="0" width="16" height="12" class="ex"/>
+    <text x="462" y="11" style="font-size:11.5px;fill:#333">outside</text>
+    <path d="M530,6 H570" class="ln" marker-end="url(#a)"/>
+    <text x="578" y="11" style="font-size:11.5px;fill:#333">values and changes</text>
+    <path d="M700,6 H740" class="ln" stroke-dasharray="5 4"/>
+    <text x="748" y="11" style="font-size:11.5px;fill:#333">depends on</text>
+    <text x="0" y="36" style="font-size:11.5px;fill:#555">Details: tags.md, events.md, persistence.md, network.md, plc4x.md in this folder. Core dependencies: the standard library and royaljelly only.</text>
+  </g>
+</svg>
