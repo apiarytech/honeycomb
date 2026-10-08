@@ -168,7 +168,7 @@ func (c *Connector) flushWrites(ctx context.Context, plcConn plc4go.PlcConnectio
 		if !cs.link.changed(name, snap) {
 			continue // e.g. the change came from the device (echo) or only the quality changed
 		}
-		if err := c.write(ctx, plcConn, name, cs.byTag[name].Address, value); err != nil {
+		if err := c.write(ctx, plcConn, cs, name, cs.byTag[name].Address, value); err != nil {
 			errs = append(errs, fmt.Errorf("output '%s': %w", name, err))
 			continue
 		}
@@ -181,7 +181,7 @@ func (c *Connector) flushWrites(ctx context.Context, plcConn plc4go.PlcConnectio
 	return errors.Join(errs...)
 }
 
-func (c *Connector) write(ctx context.Context, plcConn plc4go.PlcConnection, name, address string, value any) error {
+func (c *Connector) write(ctx context.Context, plcConn plc4go.PlcConnection, cs *connState, name, address string, value any) error {
 	deviceValue, err := toDevice(value)
 	if err != nil {
 		return err
@@ -190,11 +190,9 @@ func (c *Connector) write(ctx context.Context, plcConn plc4go.PlcConnection, nam
 	if err != nil {
 		return fmt.Errorf("build write request: %w", err)
 	}
-	var result apiModel.PlcWriteRequestResult
-	select {
-	case result = <-request.Execute(ctx):
-	case <-ctx.Done():
-		return ctx.Err()
+	result, err := execute(ctx, cs, request.Execute)
+	if err != nil {
+		return err
 	}
 	if err := result.GetErr(); err != nil {
 		return fmt.Errorf("write: %w", err)

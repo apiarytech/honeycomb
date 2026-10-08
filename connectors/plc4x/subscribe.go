@@ -45,11 +45,9 @@ func (c *Connector) subscribe(ctx context.Context, plcConn plc4go.PlcConnection,
 		return fmt.Errorf("build subscription request: %w", err)
 	}
 
-	var result apiModel.PlcSubscriptionRequestResult
-	select {
-	case result = <-request.Execute(ctx):
-	case <-ctx.Done():
-		return ctx.Err()
+	result, err := execute(ctx, cs, request.Execute)
+	if err != nil {
+		return err
 	}
 	if err := result.GetErr(); err != nil {
 		return err

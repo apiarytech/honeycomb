@@ -61,6 +61,14 @@ copylocks check reports; every other vet check runs.
 
 ## Known issues
 
+- **PLC4X serial transport race.** PLC4X's serial transport reads its port
+  in `Write` without the lock `Close` takes to clear it
+  (`spi/transports/serial/TransportInstance.go`). The connector closes a
+  connection only after its requests have finished (`execute`,
+  `closeAfterRequests`), so the two never overlap. The race detector still
+  reports them, because that order runs through the serial line. CI
+  therefore skips `TestConnectorModbusRTUOverSerial` under `-race`; it runs
+  in the normal test jobs. Remove the skip when PLC4X fixes its transport.
 - **UDT field reads and the race detector.** Until the fix that reads a
   UDT field under the owning tag's lock (`fieldOf`, tested by
   `udt_field_race_test.go`), `GetTagValue("Tag.Field")` and

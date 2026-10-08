@@ -124,6 +124,53 @@ type connState struct {
 	byTag     map[string]Binding
 	hasInputs bool
 	link      *link // output tracking; set by Run
+	// inflight counts requests a session stopped waiting for; the session
+	// closes its connection only once they are done (see execute).
+	inflight sync.WaitGroup
+}
+
+// requestTimeout bounds one request to a device.
+const requestTimeout = 10 * time.Second
+
+// execute runs a request and waits for its result or for ctx to end.
+//
+// The request runs on a context that the end of a session does not cancel.
+// PLC4X hands back the result of a cancelled request at once, even while its
+// worker is still writing the request, and its transports race when a
+// connection is closed during a write (the serial transport's Close and Write
+// share the port without a lock). So a session that ends stops waiting at
+// once, but the result is still collected in the background, and the session
+// closes its connection only after that (closeAfterRequests).
+func execute[T any](ctx context.Context, cs *connState, run func(context.Context) <-chan T) (T, error) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), requestTimeout)
+	results := run(rctx)
+	select {
+	case r := <-results:
+		cancel()
+		return r, nil
+	case <-ctx.Done():
+		cs.inflight.Add(1)
+		go func() {
+			defer cs.inflight.Done()
+			defer cancel()
+			<-results
+		}()
+		var zero T
+		return zero, ctx.Err()
+	}
+}
+
+// closeAfterRequests closes a session's connection once the requests it
+// stopped waiting for are done, or after requestTimeout and a margin if PLC4X
+// never answers one.
+func closeAfterRequests(cs *connState, plcConn plc4go.PlcConnection) {
+	done := make(chan struct{})
+	go func() { cs.inflight.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(requestTimeout + time.Second):
+	}
+	plcConn.Close()
 }
 
 // Option configures a Connector.
@@ -270,7 +317,7 @@ func (c *Connector) session(ctx context.Context, cs *connState) error {
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	defer plcConn.Close()
+	defer closeAfterRequests(cs, plcConn)
 
 	var read apiModel.PlcReadRequest
 	subscribed := false
@@ -351,11 +398,9 @@ func (c *Connector) session(ctx context.Context, cs *connState) error {
 // A response counts as a read even if some tags failed; those failures are
 // recorded with it. The returned error means the read itself failed.
 func (c *Connector) poll(ctx context.Context, cs *connState, request apiModel.PlcReadRequest) error {
-	var result apiModel.PlcReadRequestResult
-	select {
-	case result = <-request.Execute(ctx):
-	case <-ctx.Done():
-		return ctx.Err()
+	result, err := execute(ctx, cs, request.Execute)
+	if err != nil {
+		return err
 	}
 	if err := result.GetErr(); err != nil {
 		// The device did not answer; the values held may be stale.

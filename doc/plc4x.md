@@ -57,6 +57,7 @@ the conversion to and from the PLC4X value, including arrays and UDTs.
 | Quality | `OK` Good; busy, pending, timeout or no answer Uncertain (last value kept); anything else or a lost connection Bad (last value kept). Output tags' quality is never changed |
 | Timestamps | Inputs are stamped with the time the connector writes them; device timestamps are not used yet |
 | Reconnects | Exponential backoff from 0.5 s to 30 s, per connection |
+| Requests | Each read, write or subscription request waits at most 10 s; a connection is closed only after its requests have finished |
 | Forcing | A forced output writes its force value |
 | Diagnostics | With `WithDiagnostics(prefix)`, tags `prefix+name.Connected`, `.Subscribed`, `.Reads`, `.Writes`, `.Errors`, `.LastError`, `.LastRead`; also `Status(name)` |
 | Errors | `WithErrorHandler(fn)`; otherwise kept in `Status` |

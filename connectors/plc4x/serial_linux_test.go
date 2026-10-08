@@ -32,6 +32,15 @@ import (
 // serial port: a simulated device on a pseudo-terminal, through PLC4X's
 // serial transport, as an RS-485 adapter's port would be.
 func TestConnectorModbusRTUOverSerial(t *testing.T) {
+	if raceDetector {
+		// PLC4X's serial transport reads its port in Write without the lock
+		// Close takes to clear it (spi/transports/serial/TransportInstance.go),
+		// so closing the connection after a request trips the race detector.
+		// The connector closes only after its requests finish (execute), but
+		// that order runs through the serial line, which the detector cannot
+		// see. Skip under -race until PLC4X fixes its transport.
+		t.Skip("PLC4X serial transport: Write and Close race (upstream bug)")
+	}
 	master, slave := openPTY(t)
 	dev := &rtuDevice{unit: 7}
 	dev.regs[0] = 1234 // holding register 1
