@@ -40,7 +40,7 @@ copylocks check reports; every other vet check runs.
 |---|---|
 | `go.yml` | Build, vet and test on Linux, macOS and Windows with the minimum Go and stable; the PLC4X connector on the three systems; gofmt and the race detector (the connector one package at a time for memory); Raspberry Pi (ARMv6, ARMv7, arm64) under QEMU |
 | `security.yml` | govulncheck for both modules, gosec to the Security tab, `go mod verify` and `go mod tidy -diff`; weekly as well |
-| `release.yml` | On a `v*` tag: race tests, then a GitHub release; a tag with a suffix (`v0.2.0-beta1`) is a pre-release |
+| `release.yml` | On a `v*` tag: race tests, then a GitHub release unless one was already made on GitHub; a tag with a suffix (`v0.2.0-beta1`) is a pre-release |
 
 ## Releases
 
