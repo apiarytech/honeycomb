@@ -3,7 +3,7 @@ module github.com/apiarytech/honeycomb
 go 1.27.1
 
 require (
-	github.com/apiarytech/royaljelly v0.1.0-beta1
+	github.com/apiarytech/royaljelly v0.3.0
 	modernc.org/sqlite v1.60.1
 )
 

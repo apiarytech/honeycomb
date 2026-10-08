@@ -2,8 +2,8 @@ github.com/ajankovic/xdiff v0.0.1 h1:V1cj8t5xwYzm6ZGPqPOlAc9AIajXuTEn41D/1MJBWMM
 github.com/ajankovic/xdiff v0.0.1/go.mod h1:SUmEZ67uB97I0zkiuQ+lb+LOms9ipn8X+p+2RdJV710=
 github.com/apache/plc4x/plc4go v0.0.0-20260930074747-b878affa2d7b h1:1xfllOxxNEHZgjBZI6EFWb93d8yXEdy54h1/KxBfyAU=
 github.com/apache/plc4x/plc4go v0.0.0-20260930074747-b878affa2d7b/go.mod h1:Lpg5fCeGVFVPpepXfN8sqOpzkSog8mkM7aHsNIPsDCo=
-github.com/apiarytech/royaljelly v0.1.0-beta1 h1:Y4yNNinZkA5R3d44+fbYGgwcDIQF/GT9UHsOK0HWjXo=
-github.com/apiarytech/royaljelly v0.1.0-beta1/go.mod h1:EqTWZxMNvS8lOZiwNMwjdGe9M/+fbo3bYzRBe4XR6NE=
+github.com/apiarytech/royaljelly v0.3.0 h1:PHM6C8Z8B9E0E+yhw2Rcg5Ea3AGJltbyBnSmdFHsCyw=
+github.com/apiarytech/royaljelly v0.3.0/go.mod h1:EqTWZxMNvS8lOZiwNMwjdGe9M/+fbo3bYzRBe4XR6NE=
 github.com/fatih/color v1.19.0 h1:Zp3PiM21/9Ld6FzSKyL5c/BULoe/ONr9KlbYVOfG8+w=
 github.com/fatih/color v1.19.0/go.mod h1:zNk67I0ZUT1bEGsSGyCZYZNrHuTkJJB+r6Q9VuMi0LE=
 github.com/mattn/go-colorable v0.1.15 h1:+u9SLTRGnXv73cEsnsmoZBom+dMU88B2M0aDcWy0/jY=
