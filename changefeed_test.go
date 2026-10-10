@@ -252,3 +252,24 @@ func TestCloneValue(t *testing.T) {
 		t.Error("scalars and nil must clone to themselves")
 	}
 }
+
+// Forcing a tag and releasing it change the value read, so both are in the
+// change feed, without any other write.
+func TestChangesRecordForces(t *testing.T) {
+	db := newFeedDB(t)
+	_ = db.SetTagValue("Temp", plc.REAL(21))
+	pos := start(t, db)
+	if _, err := db.SetTagForceValue("Temp", plc.REAL(80)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SetTagForced("Temp", false); err != nil {
+		t.Fatal(err)
+	}
+	b, err := db.Changes(context.Background(), ChangesRequest{Since: pos.Next, Epoch: pos.Epoch, Names: []string{"Temp"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Changes) != 2 || b.Changes[0].Value != plc.REAL(80) || b.Changes[1].Value != plc.REAL(21) {
+		t.Fatalf("batch = %+v", b)
+	}
+}

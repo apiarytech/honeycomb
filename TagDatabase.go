@@ -1433,7 +1433,10 @@ func (db *TagDatabase) SetTagForced(name string, forced bool) (Tag, error) {
 	// and the caller's first locking call on it would deadlock.
 	copied := tag.snapshot()
 	tag.valMu.Unlock()
-	db.markChanged(name)
+	// A force or its release changes the value read: tell subscribers and
+	// the change feed, as any value write does (it also marks the tag for
+	// the store).
+	db.notifySubscribers(tag)
 	return copied, nil
 }
 
@@ -1472,11 +1475,21 @@ func (db *TagDatabase) SetTagForceValue(name string, value interface{}) (Tag, er
 		return Tag{}, fmt.Errorf("cannot set force value on Constant tag '%s'", tag.Name)
 	}
 
-	// Lock the tag to safely perform the type check and update.
+	// Lock the tag to safely perform the type check and update, then tell
+	// subscribers and the change feed, as any value write does.
 	tag.valMu.Lock()
-	defer tag.valMu.Unlock()
-	defer db.markChanged(name)
+	out, err := setForceValueLocked(tag, value)
+	tag.valMu.Unlock()
+	if err != nil {
+		return Tag{}, err
+	}
+	db.notifySubscribers(tag)
+	return out, nil
+}
 
+// setForceValueLocked type-checks and sets tag's force value; the caller
+// holds tag.valMu.
+func setForceValueLocked(tag *Tag, value interface{}) (Tag, error) {
 	// Allow nil to clear the force honeycomb.Value
 	if value == nil && tag.Force != nil {
 		tag.Force.Value = nil
