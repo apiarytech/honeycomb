@@ -31,7 +31,9 @@ A `TagDatabase` holds **tags** by unique name. A tag has:
 - **qualifiers**: `Constant` (never written after creation), `Retain`
   (persisted across restarts);
 - optional **force** (`Force *ForceInfo`): reads return the force value
-  instead of the value;
+  instead of the value. Setting, changing or releasing a force
+  (`SetTagForced`, `SetTagForceValue`) is a change like a write: subscribers
+  and the change feed see the value a reader now gets;
 - optional **alias** (another name), **direct address** (`%MW10`), and
   **remote alias** (the tag lives in another database).
 
@@ -58,7 +60,10 @@ Every successful write:
 3. replaces the pending update of each subscriber with the new state;
 4. marks the tag dirty for the `Persister`, if one is attached.
 
-Writes never wait for subscribers, feed readers or the store.
+Writes never wait for subscribers, feed readers or the store. A force set,
+changed or released goes through steps 2 and 3 too, so a mirror of the
+database (beehive's tags service, an HMI) shows forced values as they are
+read.
 
 ## Concurrency model
 
