@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Go 1.27.1 or later (the `go` directive in `go.mod`).
+- Go 1.27.2 or later (the `go` directive in `go.mod`).
 - No C compiler: everything, including the SQLite driver used in tests
   (modernc.org/sqlite), is pure Go. The race detector needs cgo.
 
@@ -61,14 +61,16 @@ copylocks check reports; every other vet check runs.
 
 ## Known issues
 
-- **PLC4X serial transport race.** PLC4X's serial transport reads its port
-  in `Write` without the lock `Close` takes to clear it
-  (`spi/transports/serial/TransportInstance.go`). The connector closes a
-  connection only after its requests have finished (`execute`,
-  `closeAfterRequests`), so the two never overlap. The race detector still
-  reports them, because that order runs through the serial line. CI
-  therefore skips `TestConnectorModbusRTUOverSerial` under `-race`; it runs
-  in the normal test jobs. Remove the skip when PLC4X fixes its transport.
+- **PLC4X serial transport race (fixed upstream).** PLC4X's serial
+  transport read its port in `Write` without the lock `Close` takes to
+  clear it (`spi/transports/serial/TransportInstance.go`), so the race
+  detector reported closing a connection after a request, although the
+  connector closes only after its requests have finished (`execute`,
+  `closeAfterRequests`). Reported as
+  [apache/plc4x#2802](https://github.com/apache/plc4x/issues/2802) and
+  fixed in plc4go `2b1095c` (2026-10-12), which the connector pins.
+  `TestConnectorModbusRTUOverSerial` runs under `-race` again; the skip
+  is gone.
 - **UDT field reads and the race detector.** Until the fix that reads a
   UDT field under the owning tag's lock (`fieldOf`, tested by
   `udt_field_race_test.go`), `GetTagValue("Tag.Field")` and
