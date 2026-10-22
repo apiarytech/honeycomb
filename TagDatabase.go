@@ -1037,6 +1037,11 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 	db.tags.Store(newName, tagPtr)
 	db.markRemoved(oldName)
 	db.markChanged(newName)
+	// The change feed remembers each name's last value to skip repeats.
+	// Forget both names, so a new tag that reuses the old name records its
+	// first write, and the renamed tag records its next one.
+	db.changeFeed().forget(oldName)
+	db.changeFeed().forget(newName)
 
 	// Also migrate any active subscriptions from the old name to the new name.
 	db.subMu.Lock()

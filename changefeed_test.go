@@ -273,3 +273,41 @@ func TestChangesRecordForces(t *testing.T) {
 		t.Fatalf("batch = %+v", b)
 	}
 }
+
+// TestRenameForgetsFeedNamesIssue10 covers issue #10: a new tag that reuses
+// a renamed tag's old name records its first write, even with the same value.
+func TestRenameForgetsFeedNamesIssue10(t *testing.T) {
+	db := NewTagDatabase()
+	if err := db.AddTag(&Tag{Name: "A", TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(0)}); err != nil {
+		t.Fatal(err)
+	}
+	start, err := db.Changes(t.Context(), ChangesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetTagValue("A", plc.INT(5)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RenameTag("A", "B"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddTag(&Tag{Name: "A", TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(0)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetTagValue("A", plc.INT(5)); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := db.Changes(t.Context(), ChangesRequest{Since: start.Next, Epoch: start.Epoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, c := range batch.Changes {
+		if c.Name == "A" && c.Value == plc.INT(5) {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Errorf("A = 5 recorded %d times, want 2 (old tag, then the new tag A): %+v", n, batch.Changes)
+	}
+}
