@@ -734,7 +734,11 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 		tag.TypeInfo = typeInfo // Assign the inferred or registered TypeInfo
 	}
 
-	// LoadOrStore is an atomic operation that checks for existence and stores if not present. // Corrected from TypeInfo to honeycomb.TypeInfo
+	// Work out the direct address before the tag is published: once it is in
+	// the map, other goroutines read it, so it must only change under valMu.
+	directAddr, hasDirectAddr := generateDirectAddress(tag)
+
+	// LoadOrStore is an atomic operation that checks for existence and stores if not present.
 	// It returns the existing value if the key was already there.
 	if _, loaded := db.tags.LoadOrStore(tag.Name, tag); loaded {
 		return fmt.Errorf("tag '%s' already exists in the database", tag.Name)
@@ -761,15 +765,15 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 		tagPtr.Quality = QualityGood
 		tagPtr.Timestamp = stamp(tagPtr.Timestamp)
 	}
+	// If the tag is a PLC memory address, record its direct address.
+	if hasDirectAddr {
+		tagPtr.DirectAddress = directAddr
+	}
+	directAddress := tagPtr.DirectAddress
 	tagPtr.valMu.Unlock()
 
-	// If the tag is a PLC memory address, generate and store its direct address mapping.
-	if directAddr, ok := generateDirectAddress(tag); ok {
-		tag.DirectAddress = directAddr
-	}
-
-	if tag.DirectAddress != "" {
-		db.directAddressMap.Store(CanonicalAddress(tag.DirectAddress), tag.Name)
+	if directAddress != "" {
+		db.directAddressMap.Store(CanonicalAddress(directAddress), tag.Name)
 	}
 	db.markChanged(tag.Name)
 	return nil
@@ -1424,6 +1428,8 @@ func (db *TagDatabase) GetTagAlias(name string) (string, error) {
 		return "", fmt.Errorf("GetTagAlias: tag '%s' not found in database", name)
 	}
 	tag := val.(*Tag)
+	tag.valMu.RLock()
+	defer tag.valMu.RUnlock()
 	return tag.Alias, nil
 }
 
@@ -1460,6 +1466,8 @@ func (db *TagDatabase) GetTagDescription(name string) (string, error) {
 		return "", fmt.Errorf("GetTagDescription: tag '%s' not found in database", name)
 	}
 	tag := val.(*Tag)
+	tag.valMu.RLock()
+	defer tag.valMu.RUnlock()
 	return tag.Description, nil
 }
 

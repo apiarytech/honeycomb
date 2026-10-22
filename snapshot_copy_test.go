@@ -48,3 +48,33 @@ func TestSnapshotsAreDeepCopiesIssue1(t *testing.T) {
 		t.Errorf("Arr[0] after write = %v", got)
 	}
 }
+
+// TestConcurrentAliasDescriptionAndAddIssue8 exercises the paths of issue #8
+// concurrently. The race detector (go test -race, run in CI) reports any
+// unlocked access; without it the test checks the results.
+func TestConcurrentAliasDescriptionAndAddIssue8(t *testing.T) {
+	db := NewTagDatabase()
+	if err := db.AddTag(&Tag{Name: "A", TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(0)}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			db.SetTagAlias("A", "alias")
+			db.SetTagDescription("A", "desc")
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		db.GetTagAlias("A")
+		db.GetTagDescription("A")
+		db.GetTag("I0_0")
+	}
+	<-done
+	if a, _ := db.GetTagAlias("A"); a != "alias" {
+		t.Errorf("alias = %q", a)
+	}
+	if d, _ := db.GetTagDescription("A"); d != "desc" {
+		t.Errorf("description = %q", d)
+	}
+}
