@@ -1,35 +1,34 @@
-name: Feature Request
-description: Suggest a new feature
+name: Feature request
+description: Suggest something honeycomb should do
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for suggesting an improvement to Honeycomb!
-  - type: textarea
-    id: description
-    attributes:
-      label: Description
-      description: Clear description of the feature
-      placeholder: "It would be helpful if..."
-    validations:
-      required: true
+        Thanks for the suggestion. Feature requests are public, and by posting one you agree to the terms of submission in [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md): the idea may be used freely in honeycomb and in related products. Do not post anything confidential.
   - type: textarea
     id: use_case
     attributes:
-      label: Use Case
-      description: Real-world scenario where this feature helps
+      label: Use case
+      description: The real situation where this would help, and what you do today instead
     validations:
       required: true
   - type: textarea
-    id: solution
+    id: proposal
     attributes:
-      label: Proposed Solution
-      description: Your idea for implementation
+      label: Proposal
+      description: What honeycomb should do, as concretely as you can
     validations:
       required: true
   - type: textarea
     id: alternatives
     attributes:
-      label: Alternatives Considered
-      description: Other approaches you've considered
+      label: Alternatives considered
+  - type: dropdown
+    id: willing
+    attributes:
+      label: Would you implement it?
+      options:
+        - "No"
+        - "Yes, with guidance"
+        - "Yes, I have a design or a draft"

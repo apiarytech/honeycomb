@@ -1,63 +1,51 @@
-# Contributing to Honeycomb
+# Contributing to honeycomb
 
-Thank you for considering contributing to the Honeycomb project! We welcome contributions from the community and appreciate your help in making our software better. Please follow the guidelines below to understand how to contribute effectively.
+honeycomb is an IEC 61131-3 tag database. Bug reports, feature requests, code, tests and
+documentation are all welcome.
 
-## Guidelines for Contributors
-- Ensure that your contributions are aligned with the project's goals and objectives.
-- Please check if the issue you want to work on is open or if a discussion is ongoing before starting work.
-- Use clear and descriptive commit messages.
+## Issues and feature requests
 
-## Development Setup
-1. **Clone the Repository**
-   ```bash
-   git clone https://github.com/apiarytech/honeycomb.git
-   cd honeycomb
+- Search the open issues before filing a new one.
+- Use the issue templates: a bug report wants the version, the platform
+  and the steps; a feature request wants the use case.
+- A security problem is not an issue. See [SECURITY.md](SECURITY.md) for
+  the private channel.
+- Do not post credentials, customer data, plant tag names or anything else
+  private. The issue history is public and permanent.
+
+**Terms of submission.** Everything posted to this repository's issues,
+pull requests and discussions is public. By posting, you give the Project
+Owner (the copyright holder named in [LICENSE.md](LICENSE.md)) the right
+to use what you post, including ideas and feature suggestions, in any
+way: in the open-source and the commercial editions of honeycomb and in
+other products, with no obligation or payment to you. Code you submit is
+covered by the contributor licence agreement below.
+
+## Code
+
+1. **Open an issue first** for anything beyond a small fix, so the change
+   can be discussed before you spend time on it.
+2. **Sign the CLA.** honeycomb is dual-licensed (open source or commercial,
+   see LICENSE.md), so every contributor signs the
+   [contributor licence agreement](CLA.md) once. The check on your first
+   pull request tells you how; it takes one comment. Pull requests are
+   not merged until the author has signed.
+3. **Fork, branch, change.** Run `gofmt`, `go vet ./...` and the tests:
+
+   ```sh
+   go test ./...
    ```
-2. **Install Dependencies**
-   Depending on the tools used in this project, run the appropriate package manager:
-   ```bash
-   npm install
-   # or, for Python projects
-   pip install -r requirements.txt
-   ```
-3. **Run the Application**
-   Follow the instructions in the README to start the application.
+   If the change touches the PLC4X connector, run its tests too:
+   `cd connectors/plc4x && go test ./...`.
 
-## Code Standards
-- Follow the coding style defined in the project's documentation. Consistency is key.
-- Write clean, maintainable code with comments where necessary.
-- Maintain an appropriate level of test coverage for your contributions.
+4. **Keep dependencies minimal.** Do not add a module to `go.mod` without
+   discussing it in the issue first.
+5. **Commit messages**: one imperative subject line, a body that says why.
+6. **Pull request**: link the issue, describe the change, and make sure
+   the GitHub Actions checks pass.
 
-## Testing Requirements
-- Ensure that your code passes all existing tests and add new tests for your contributions.
-- Run the test suite locally before submitting your pull request:
-   ```bash
-   npm test
-   # or, for Python projects
-   pytest
-   ```
+## Licence of your contribution
 
-## Pull Request Process
-1. **Fork the Repository**
-   - Click on the ‘Fork’ button on GitHub to create your copy of the repository.
-2. **Make Changes in Your Fork**
-   - Create a new branch for your changes:
-   ```bash
-   git checkout -b my-feature-branch
-   ```
-3. **Commit Your Changes**
-   - Commit your changes with a clear message:
-   ```bash
-   git commit -m "Add some feature"
-   ```
-4. **Push to Your Fork**
-   ```bash
-   git push origin my-feature-branch
-   ```
-5. **Create a Pull Request**
-   - Go to the original repository on GitHub and click on ‘Pull Requests’.
-   - Click on ‘New Pull Request’ and select your branch as the base.
-   - Provide a description of your changes and submit the pull request.
-
-## Thank You!
-Thank you for contributing to Honeycomb! We appreciate your efforts and look forward to your contributions.
+Your contribution is licensed under the same terms as the rest of honeycomb
+(the GNU General Public License version 3 (GPLv3) or the commercial licence) and, through the CLA, to the Project
+Owner so that both licences remain available.

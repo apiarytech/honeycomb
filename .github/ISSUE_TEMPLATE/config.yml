@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/apiarytech/honeycomb/security/advisories/new
+    about: Report a security problem privately. Do not open a public issue for it.

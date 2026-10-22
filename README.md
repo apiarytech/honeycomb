@@ -261,3 +261,8 @@ Contributions to `honeycomb` are welcome! Please feel free to:
 Please ensure that your contributions adhere to the existing code style and include appropriate tests.
 
 Thank you for your interest in `honeycomb`!
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to file issues and submit
+code (contributors sign the [CLA](CLA.md) once, because honeycomb is
+dual-licensed) and [SECURITY.md](SECURITY.md) for reporting a
+vulnerability privately.
