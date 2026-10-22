@@ -78,3 +78,37 @@ func TestTagAtSpellings(t *testing.T) {
 		t.Errorf("GetTagValue: %v %v", v, err)
 	}
 }
+
+// TestDirectAddressValidationIssue9 covers issue #9: offset overflow, a bit
+// above 7, a bit suffix on a non-X size, and leading zeros.
+func TestDirectAddressValidationIssue9(t *testing.T) {
+	db := NewTagDatabase()
+	db.AddTag(&Tag{Name: "Zero", TypeInfo: &TypeInfo{DataType: TypeBOOL}, Value: plc.BOOL(false), DirectAddress: "%IX0"})
+	db.AddTag(&Tag{Name: "Ten", TypeInfo: &TypeInfo{DataType: TypeBOOL}, Value: plc.BOOL(false), DirectAddress: "%IX010"})
+
+	if tag, ok := db.TagAt("%IX2305843009213693952.0"); ok {
+		t.Errorf("an overflowing offset resolved to %q", tag.Name)
+	}
+	for _, bad := range []string{"%IX0.8", "%IW0.1", "%QB3.0", "%MD1.7", "%IX2305843009213693952.0", "%IX99999999999999999999"} {
+		if IsDirectAddress(bad) {
+			t.Errorf("IsDirectAddress(%q) = true, want false", bad)
+		}
+	}
+	for _, good := range []string{"%IX0.7", "%IX1.0", "%IW0", "%QD12", "%I0.3", "%IX010"} {
+		if !IsDirectAddress(good) {
+			t.Errorf("IsDirectAddress(%q) = false, want true", good)
+		}
+	}
+	if got := CanonicalAddress("%IX010"); got != "%IX10" {
+		t.Errorf("CanonicalAddress(%%IX010) = %q, want %%IX10", got)
+	}
+	if got := CanonicalAddress("%IW007"); got != "%IW7" {
+		t.Errorf("CanonicalAddress(%%IW007) = %q, want %%IW7", got)
+	}
+	if tag, ok := db.TagAt("%IX10"); !ok || tag.Name != "Ten" {
+		t.Errorf("TagAt(%%IX10) = %q, %v; want the tag added as %%IX010", tag.Name, ok)
+	}
+	if tag, ok := db.TagAt("%IX1.2"); !ok || tag.Name != "Ten" {
+		t.Errorf("TagAt(%%IX1.2) = %q, %v; want Ten", tag.Name, ok)
+	}
+}

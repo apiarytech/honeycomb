@@ -32,8 +32,10 @@ func CanonicalAddress(addr string) string {
 
 // IsDirectAddress reports whether addr is an IEC 61131-3 direct address
 // such as %IX0.0, %QW10 or %MD20.
+// A bit above 7 (%IX0.8), a bit suffix on a B, W, D or L address (%IW0.1)
+// and an offset too large for an int are not valid.
 func IsDirectAddress(addr string) bool {
-	return directAddressRegex.MatchString(CanonicalAddress(addr))
+	return validDirectAddress(CanonicalAddress(addr))
 }
 
 // TagAt returns the tag whose direct address is addr, in any spelling

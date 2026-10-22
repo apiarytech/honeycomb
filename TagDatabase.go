@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -1798,18 +1799,40 @@ func generateDirectAddress(tag *Tag) (string, bool) {
 
 // canonicalAddress normalizes a direct address so that equivalent spellings
 // share one directAddressMap key: a bit in byte.bit form (%IX1.2) becomes the
-// flat bit index royaljelly uses (%IX10). Other addresses are returned as is.
+// flat bit index royaljelly uses (%IX10), and leading zeros are dropped
+// (%IX010 is %IX10). An address that is not valid (a bit above 7, a bit on a
+// B, W, D or L address, or an offset too large) is returned as is, which
+// validDirectAddress then rejects.
 func canonicalAddress(addr string) string {
 	m := directAddressRegex.FindStringSubmatch(addr)
-	if m == nil || m[2] != "X" || m[4] == "" {
+	if m == nil {
 		return addr
 	}
-	byteOffset, err1 := strconv.Atoi(m[3])
-	bit, err2 := strconv.Atoi(m[4])
-	if err1 != nil || err2 != nil || bit > 7 {
+	offset, err := strconv.Atoi(m[3])
+	if err != nil {
+		return addr // too large for an int
+	}
+	if m[4] == "" {
+		return fmt.Sprintf("%%%s%s%d", m[1], m[2], offset)
+	}
+	bit, err := strconv.Atoi(m[4])
+	if m[2] != "X" || err != nil || bit > 7 || offset > (math.MaxInt-7)/8 {
 		return addr
 	}
-	return fmt.Sprintf("%%%sX%d", m[1], byteOffset*8+bit)
+	return fmt.Sprintf("%%%sX%d", m[1], offset*8+bit)
+}
+
+// validDirectAddress reports whether a canonical address (see
+// canonicalAddress) is a valid direct address: a valid byte.bit address has
+// already been flattened, so any remaining bit suffix is invalid, and the
+// offset must fit an int.
+func validDirectAddress(canonical string) bool {
+	m := directAddressRegex.FindStringSubmatch(canonical)
+	if m == nil || m[4] != "" {
+		return false
+	}
+	_, err := strconv.Atoi(m[3])
+	return err == nil
 }
 
 // resolveAddress returns the symbolic name an IEC direct address maps to, or
