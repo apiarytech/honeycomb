@@ -143,10 +143,17 @@ type Tag struct {
 
 // snapshot returns a copy of the tag's state without its locks or internal
 // counters. The caller must hold valMu.
+// Value and Force are deep-copied: an array (slice) or UDT (pointer) value
+// would otherwise be shared with the live tag, which writers change under
+// valMu while the caller reads the copy without it.
 func (t *Tag) snapshot() Tag {
+	var force *ForceInfo
+	if t.Force != nil {
+		force = &ForceInfo{Value: cloneValue(t.Force.Value)}
+	}
 	return Tag{
 		Name:          t.Name,
-		Value:         t.Value,
+		Value:         cloneValue(t.Value),
 		Quality:       t.Quality,
 		Timestamp:     t.Timestamp,
 		Alias:         t.Alias,
@@ -155,7 +162,7 @@ func (t *Tag) snapshot() Tag {
 		Description:   t.Description,
 		Constant:      t.Constant,
 		Retain:        t.Retain,
-		Force:         t.Force,
+		Force:         force,
 		RemoteAlias:   t.RemoteAlias,
 	}
 }
@@ -289,11 +296,12 @@ func (t *Tag) GetName() string {
 	return t.Name
 }
 
-// GetValue returns the current value of the tag.
+// GetValue returns the current value of the tag. An array or UDT value is a
+// deep copy, so the caller can read it without holding the tag's lock.
 func (t *Tag) GetValue() interface{} {
 	t.valMu.RLock()
 	defer t.valMu.RUnlock()
-	return t.presentedValue()
+	return cloneValue(t.presentedValue())
 }
 
 // presentedValue is GetValue for a caller that already holds valMu. (Taking a
