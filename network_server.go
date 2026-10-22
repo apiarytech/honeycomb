@@ -8,7 +8,9 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -136,22 +138,75 @@ func StartServer(db *TagDatabase, validTokens []string, port, certFile, keyFile 
 
 // Serve runs httpServer with TLS in a background goroutine until ctx is
 // done, then shuts it down gracefully. serverReady, if not nil, is marked
-// done just before the server starts listening.
+// done once the server is listening.
+//
+// If the address can't be bound or the certificate can't be loaded, Serve
+// calls log.Fatalf, which exits the whole process. A program that hosts the
+// server beside other work should use ListenAndServeTLS, which returns the
+// error instead.
 func Serve(ctx context.Context, httpServer *http.Server, certFile, keyFile string, serverReady *sync.WaitGroup) {
+	log.Printf("[Server] Starting honeycomb network server on %s...", httpServer.Addr)
+	done, err := ListenAndServeTLS(ctx, httpServer, certFile, keyFile)
+	if err != nil {
+		log.Fatalf("[Server] Could not listen on %s: %v\n", httpServer.Addr, err)
+	}
+	if serverReady != nil {
+		serverReady.Done()
+	}
 	go func() {
-		log.Printf("[Server] Starting honeycomb network server on %s...", httpServer.Addr)
-		if serverReady != nil {
-			serverReady.Done()
-		}
-		// ListenAndServeTLS blocks until the server is stopped.
-		if err := httpServer.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[Server] Could not listen on %s: %v\n", httpServer.Addr, err)
+		if err := <-done; err != nil {
+			log.Fatalf("[Server] Server failed on %s: %v\n", httpServer.Addr, err)
 		}
 		log.Println("[Server] Server stopped.")
 	}()
+}
+
+// ListenAndServeTLS loads the certificate and binds httpServer.Addr before it
+// returns, so a busy port or a bad certificate comes back as an error and the
+// caller decides what to do. It then serves with TLS in the background until
+// ctx is done and shuts down gracefully. The returned channel receives nil
+// once the server has stopped after ctx ended, or the error that stopped it.
+//
+// certFile and keyFile may be empty when httpServer.TLSConfig already holds
+// the certificates (Certificates or GetCertificate).
+func ListenAndServeTLS(ctx context.Context, httpServer *http.Server, certFile, keyFile string) (<-chan error, error) {
+	if certFile != "" || keyFile != "" {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("honeycomb: load TLS certificate: %w", err)
+		}
+		cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		if httpServer.TLSConfig != nil {
+			cfg = httpServer.TLSConfig.Clone()
+		}
+		cfg.Certificates = append([]tls.Certificate{cert}, cfg.Certificates...)
+		httpServer.TLSConfig = cfg
+	}
+	addr := httpServer.Addr
+	if addr == "" {
+		addr = ":https"
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("honeycomb: listen on %s: %w", addr, err)
+	}
+	done := make(chan error, 1)
+	stopped := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		log.Println("[Server] Shutdown signal received, shutting down server gracefully...")
-		httpServer.Shutdown(context.Background())
+		err := httpServer.ServeTLS(ln, "", "")
+		close(stopped)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		done <- err
 	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			log.Println("[Server] Shutdown signal received, shutting down server gracefully...")
+			httpServer.Shutdown(context.Background())
+		case <-stopped:
+		}
+	}()
+	return done, nil
 }

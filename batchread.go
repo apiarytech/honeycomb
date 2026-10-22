@@ -170,7 +170,7 @@ func (ndc *NetworkDatabaseClient) ReadTags(ctx context.Context, names []string) 
 	}
 
 	var reply readTagsWire
-	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, MaxResponseBytes)).Decode(&reply); err != nil {
 		return nil, fmt.Errorf("failed to decode tag readings: %w", err)
 	}
 	readings := make(map[string]Reading, len(names))

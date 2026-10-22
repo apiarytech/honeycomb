@@ -100,7 +100,7 @@ func (ndc *NetworkDatabaseClient) Changes(ctx context.Context, req ChangesReques
 		return ChangeBatch{}, fmt.Errorf("remote server returned error for changes (%d): %s", resp.StatusCode, string(msg))
 	}
 	var batch ChangeBatch
-	if err := json.NewDecoder(resp.Body).Decode(&batch); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, MaxResponseBytes)).Decode(&batch); err != nil {
 		return ChangeBatch{}, fmt.Errorf("failed to decode changes: %w", err)
 	}
 	return batch, nil

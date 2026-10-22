@@ -15,6 +15,11 @@ import (
 	"time"
 )
 
+// MaxResponseBytes caps how much of a successful reply NetworkDatabaseClient
+// decodes, so a misbehaving server can't make the client read without limit.
+// Error replies are cut at 4 KiB.
+const MaxResponseBytes = 64 << 20
+
 // NetworkDatabaseClient is an implementation of DatabaseAccessor that communicates
 // with a remote TagDatabase server over a network. It allows a local TagDatabase
 // instance to treat a remote database as one of its own data sources.
@@ -133,13 +138,13 @@ func (ndc *NetworkDatabaseClient) getTag(name string) (tagResponse, error) {
 	// 5. Check if the server responded with a success status code.
 	// If not, read the error message from the response body for better diagnostics.
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return tagResponse{}, fmt.Errorf("remote server returned error for tag '%s' (%d): %s", name, resp.StatusCode, string(body))
 	}
 
 	// 6. The server is expected to respond with a JSON object like `{"value": ..., "quality": 1}`.
 	var payload tagResponse
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, MaxResponseBytes)).Decode(&payload); err != nil {
 		return tagResponse{}, fmt.Errorf("failed to decode JSON response from remote server for tag '%s': %w", name, err)
 	}
 	return payload, nil
@@ -181,7 +186,7 @@ func (ndc *NetworkDatabaseClient) putTag(name string, payload map[string]interfa
 
 	// 6. Check for a successful status code and return an error if the update failed.
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("remote server returned error for setting tag '%s' (%d): %s", name, resp.StatusCode, string(respBody))
 	}
 
