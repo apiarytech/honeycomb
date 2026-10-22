@@ -180,3 +180,34 @@ func TestNetworkClient_Authentication(t *testing.T) {
 		}
 	})
 }
+
+// TestNetworkClientEscapesNamesIssue7 covers issue #7: direct addresses and
+// names with ?, # or spaces reach the server intact.
+func TestNetworkClientEscapesNamesIssue7(t *testing.T) {
+	db := NewTagDatabase()
+	for _, tag := range []*Tag{
+		{Name: "DI1", TypeInfo: &TypeInfo{DataType: TypeBOOL}, Value: plc.BOOL(true), DirectAddress: "%IX0.1"},
+		{Name: "Tank 1?#x", TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(3)},
+	} {
+		if err := db.AddTag(tag); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ts := &tagServer{db: db, validTokens: []string{"k"}}
+	server := httptest.NewServer(ts.authMiddleware(http.HandlerFunc(ts.tagHandler)))
+	defer server.Close()
+	client := &NetworkDatabaseClient{RemoteAddress: server.URL + "/", Client: server.Client(), BearerToken: "k"}
+
+	if v, err := client.getTagValueRecursive("%IX0.1", 0); err != nil || v != true {
+		t.Errorf("read %%IX0.1 = %v, %v; want true", v, err)
+	}
+	if v, err := client.getTagValueRecursive("Tank 1?#x", 0); err != nil || v != float64(3) {
+		t.Errorf("read \"Tank 1?#x\" = %v, %v; want 3", v, err)
+	}
+	if err := client.setTagValueRecursive("Tank 1?#x", 9, QualityGood, time.Time{}, 0); err != nil {
+		t.Errorf("write \"Tank 1?#x\": %v", err)
+	}
+	if v, _ := db.GetTagValue("Tank 1?#x"); v != plc.INT(9) {
+		t.Errorf("after write = %v, want 9", v)
+	}
+}

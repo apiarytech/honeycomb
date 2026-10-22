@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"time"
 )
@@ -96,13 +97,20 @@ func (ndc *NetworkDatabaseClient) setTagQualityRecursive(name string, quality Qu
 }
 
 // getTag makes an HTTP GET request to the remote server for a tag.
+// tagURL returns the URL of tag name on the remote server. The name is
+// path-escaped, so direct addresses such as %IX0.1 and names holding ?, #
+// or spaces reach the server intact (it unescapes the path).
+func (ndc *NetworkDatabaseClient) tagURL(name string) string {
+	return strings.TrimSuffix(ndc.RemoteAddress, "/") + "/tags/" + neturl.PathEscape(name)
+}
+
 func (ndc *NetworkDatabaseClient) getTag(name string) (tagResponse, error) {
 	if ndc.Client == nil {
 		return tagResponse{}, fmt.Errorf("NetworkDatabaseClient has a nil http.Client")
 	}
 
 	// 1. Construct the full URL for the GET request (e.g., "https://localhost:8080/tags/MyRemoteTag").
-	url := fmt.Sprintf("%s/tags/%s", strings.TrimSuffix(ndc.RemoteAddress, "/"), name)
+	url := ndc.tagURL(name)
 
 	// 2. Create a new HTTP GET request object.
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -144,7 +152,7 @@ func (ndc *NetworkDatabaseClient) putTag(name string, payload map[string]interfa
 	}
 
 	// 1. Construct the full URL for the PUT request.
-	url := fmt.Sprintf("%s/tags/%s", strings.TrimSuffix(ndc.RemoteAddress, "/"), name)
+	url := ndc.tagURL(name)
 
 	// 2. Marshal the payload, e.g. `{"value": ..., "quality": 1}`, into a JSON byte slice.
 	body, err := json.Marshal(payload)
