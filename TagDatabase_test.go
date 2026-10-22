@@ -3189,3 +3189,27 @@ func TestDereference(t *testing.T) {
 		})
 	}
 }
+
+// TestForceWithoutValueIssue12 covers issue #12.
+func TestForceWithoutValueIssue12(t *testing.T) {
+	db := NewTagDatabase()
+	if err := db.AddTag(&Tag{Name: "F", TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(7)}); err != nil {
+		t.Fatal(err)
+	}
+	tag, _ := db.GetTag("F")
+	if v := tag.GetForceValue(); v != nil {
+		t.Errorf("GetForceValue on an unforced tag = %v, want nil", v)
+	}
+	if _, err := db.SetTagForced("F", true); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := db.GetTagValue("F"); err != nil || v != plc.INT(7) {
+		t.Errorf("forced without a value: GetTagValue = %v, %v; want the real value 7", v, err)
+	}
+	if _, err := db.SetTagForceValue("F", plc.INT(9)); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := db.GetTagValue("F"); v != plc.INT(9) {
+		t.Errorf("forced to 9: GetTagValue = %v", v)
+	}
+}

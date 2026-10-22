@@ -298,8 +298,9 @@ func (t *Tag) GetValue() interface{} {
 
 // presentedValue is GetValue for a caller that already holds valMu. (Taking a
 // read lock twice deadlocks if a writer queues in between.)
+// A tag that is forced but has no force value yet presents its real value.
 func (t *Tag) presentedValue() interface{} {
-	if t.Force != nil {
+	if t.Force != nil && t.Force.Value != nil {
 		// Remote aliases do not have their own force values.
 		// The forcing is handled on the remote tag itself.
 		if t.RemoteAlias != nil {
@@ -411,9 +412,13 @@ func (t *Tag) GetTimestamp() time.Time {
 }
 
 // GetForceValue returns the forced value of the tag.
+// It returns nil when the tag is not forced.
 func (t *Tag) GetForceValue() interface{} {
 	t.valMu.RLock()
 	defer t.valMu.RUnlock()
+	if t.Force == nil {
+		return nil
+	}
 	return t.Force.Value
 }
 
