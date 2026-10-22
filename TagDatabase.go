@@ -1919,9 +1919,20 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 		numWorkers = 1 // Ensure at least one worker is used.
 	}
 
+	// restoredTag is a line of the file with its value kept as raw JSON, so
+	// it can be decoded straight into the tag's Go type. (Decoding into an
+	// interface{} turns every number into a float64, which loses DINT values
+	// of 1e6 and more, LINT and ULINT precision, and the bit-string types.)
+	type restoredTag struct {
+		Name      string          `json:"Name"`
+		Value     json.RawMessage `json:"Value"`
+		Quality   *Quality        `json:"Quality,omitempty"`
+		Timestamp time.Time       `json:"Timestamp,omitzero"`
+	}
+
 	// Define a struct to pass results (and errors) from workers to the consumer.
 	type parseResult struct {
-		pTag persistentTag
+		pTag restoredTag
 		err  error
 	}
 
@@ -1939,7 +1950,7 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 				if line == "" {
 					continue
 				}
-				var pTag persistentTag
+				var pTag restoredTag
 				if err := json.Unmarshal([]byte(line), &pTag); err != nil {
 					resultsChan <- parseResult{err: fmt.Errorf("failed to unmarshal JSON: %w", err)}
 				} else {
@@ -1972,7 +1983,6 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 
 		pTag := result.pTag
 		tagName := pTag.Name
-		valueData := pTag.Value
 		// Restored values may be stale, so Good comes back as Uncertain.
 		quality := QualityUncertain
 		if pTag.Quality != nil {
@@ -1985,51 +1995,28 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 		}
 		tag := val.(*Tag)
 
-		var newValue interface{}
-		var parseErr error
-
-		if _, isUDT := newUDTInstance(tag.TypeInfo.DataType); isUDT {
-			tag.valMu.Lock()
-			udtJSON, _ := json.Marshal(valueData)
-			if jsonErr := json.Unmarshal(udtJSON, tag.Value); jsonErr != nil {
-				parseErr = fmt.Errorf("failed to process UDT data for '%s': %w", tagName, jsonErr)
-			} else {
-				tag.Quality = quality
-				tag.Timestamp = stamp(pTag.Timestamp)
-			}
-			tag.valMu.Unlock()
-		} else if tag.TypeInfo.DataType == TypeARRAY {
-			if genericSlice, ok := valueData.([]interface{}); ok {
-				if elemGoType, ok := getGoType(tag.TypeInfo.ElementType); ok {
-					newSlice := reflect.MakeSlice(reflect.SliceOf(elemGoType), len(genericSlice), len(genericSlice))
-					for i, v := range genericSlice {
-						if convertedVal, err := convertTo(v, elemGoType); err == nil {
-							newSlice.Index(i).Set(reflect.ValueOf(convertedVal))
-						} else {
-							parseErr = fmt.Errorf("error converting element %d for array tag '%s': %w", i, tagName, err)
-							break
-						}
-					}
-					if parseErr == nil {
-						newValue = newSlice.Interface()
-					}
-				}
-			}
-		} else {
-			// It's a primitive type.
-			newValue, parseErr = parseValueToType(fmt.Sprintf("%v", valueData), tag.TypeInfo.DataType)
+		// A remote alias has no value of its own (the remote tag holds it),
+		// and a Constant keeps its configured value: neither is restored.
+		tag.valMu.RLock()
+		skip := tag.RemoteAlias != nil || tag.Constant
+		typeInfo, current := tag.TypeInfo, tag.Value
+		tag.valMu.RUnlock()
+		if skip {
+			continue
 		}
 
+		newValue, parseErr := decodeStoredValue(typeInfo, current, pTag.Value)
 		if parseErr != nil {
 			errorList = append(errorList, fmt.Sprintf("line error for tag '%s': %v", tagName, parseErr))
+			continue
 		}
-
-		// For UDTs, the value is updated by reference, so we don't call SetTagValue.
-		// For primitives and arrays, newValue will be non-nil.
-		if newValue != nil {
-			if err := db.SetTagValueQualityAt(tagName, newValue, quality, pTag.Timestamp); err != nil {
-				errorList = append(errorList, fmt.Sprintf("set value error for tag '%s': %v", tagName, err))
-			}
+		if newValue == nil {
+			continue // null in the file: keep the configured value.
+		}
+		// SetTagValueQualityAt applies the value as any write does, so
+		// subscribers and the change feed see restored values too.
+		if err := db.SetTagValueQualityAt(tagName, newValue, quality, pTag.Timestamp); err != nil {
+			errorList = append(errorList, fmt.Sprintf("set value error for tag '%s': %v", tagName, err))
 		} // Continue to the next line even if an error occurred on this one.
 	}
 
