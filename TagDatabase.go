@@ -2868,8 +2868,38 @@ func (ts *tagServer) handleSetTagValue(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// To correctly unmarshal the value, especially for UDTs, we need a variable
-	// of the correct type. We can get this from the tag's current value.
+	// A null value would reset the tag to its zero value; refuse it.
+	if strings.TrimSpace(string(valueJSON)) == "null" {
+		http.Error(w, "'value' must not be null", http.StatusBadRequest)
+		return
+	}
+
+	// Decode the value into the Go type of what is being written: the tag,
+	// an array element, a UDT field, or the remote tag behind an alias.
+	// Reading the current value resolves all of these, so arrays, elements,
+	// BOOL fields and alias writes get the right type (issue #6).
+	if current, err := ts.db.GetTagValue(tagName); err == nil && current != nil {
+		value, err := decodeStoredValue(nil, current, valueJSON)
+		if err != nil {
+			http.Error(w, "JSON value is not compatible with the tag's type: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := ts.db.SetTagValueQualityAt(tagName, value, quality, timestamp); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ts.wrote(r, tagName)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "Tag value updated successfully.")
+		return
+	}
+	if tag.TypeInfo == nil {
+		// A remote alias whose remote tag can't be read: there is no type to decode into.
+		http.Error(w, fmt.Sprintf("Tag '%s' has no type information (is it a remote alias whose remote tag is unavailable?)", tagName), http.StatusConflict)
+		return
+	}
+
+	// No current value to take the type from: fall back to the declared type.
 	// For a nested write, we unmarshal into a generic interface{}.
 	// For a whole-tag write, we unmarshal into a new instance of the tag's type.
 	if tag.Name != tagName {
