@@ -2773,9 +2773,7 @@ func (ts *tagServer) handleGetTagValue(w http.ResponseWriter, r *http.Request, t
 	if timestamp := ts.db.tagTimestamp(tagName); !timestamp.IsZero() {
 		response["timestamp"] = timestamp
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 // handleGetAllTags handles GET requests to list all available tags, and batch
@@ -2804,9 +2802,7 @@ func (ts *tagServer) handleGetAllTags(w http.ResponseWriter, r *http.Request) {
 
 	allTags := ts.db.GetAllTags() // This method returns a safe copy.
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(allTags)
+	writeJSON(w, http.StatusOK, allTags)
 }
 
 // handleSetTagValue handles PUT requests to update a tag's value.

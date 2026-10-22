@@ -115,8 +115,7 @@ func (ts *tagServer) handleReadTags(w http.ResponseWriter, r *http.Request, name
 		}
 		response.Tags[name] = wire
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 // decodeReadTagsBody reads the names of a POST /tags batch read.

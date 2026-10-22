@@ -55,8 +55,7 @@ func (ts *tagServer) handleChanges(w http.ResponseWriter, r *http.Request) {
 	if batch.Changes == nil {
 		batch.Changes = []Change{}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(batch)
+	writeJSON(w, http.StatusOK, batch)
 }
 
 // Changes reads the remote server's change feed with one request, waiting up
