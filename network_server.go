@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -76,6 +77,13 @@ func NewServer(db *TagDatabase, opts ServerOptions) (*http.Server, error) {
 	}
 	if opts.Authorize == nil && len(opts.Tokens) == 0 {
 		return nil, errors.New("honeycomb: NewServer needs tokens or an Authorize function")
+	}
+	if opts.Authorize == nil {
+		for _, t := range opts.Tokens {
+			if strings.TrimSpace(t) == "" {
+				return nil, errors.New("honeycomb: NewServer was given an empty token (is an environment variable unset?)")
+			}
+		}
 	}
 	server := &tagServer{
 		db:          db,

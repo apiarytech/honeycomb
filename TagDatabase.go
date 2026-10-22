@@ -2740,7 +2740,11 @@ func (ts *tagServer) authMiddleware(next http.Handler) http.Handler {
 
 // tokenValid compares token with every valid token in constant time, so the
 // time taken does not reveal how much of a token matched.
+// An empty token is never valid, even if an empty string was configured.
 func tokenValid(token string, valid []string) bool {
+	if token == "" {
+		return false
+	}
 	ok := 0
 	for _, v := range valid {
 		ok |= subtle.ConstantTimeCompare([]byte(token), []byte(v))

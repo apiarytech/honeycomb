@@ -157,3 +157,26 @@ func TestWriteTopLevelTagWithDot(t *testing.T) {
 		t.Fatalf("value = %v, want 21.5", v)
 	}
 }
+
+// TestEmptyTokenRejected covers issue #11: an empty token, for example from
+// an unset environment variable, must not authenticate anyone.
+func TestEmptyTokenRejected(t *testing.T) {
+	for _, tokens := range [][]string{{""}, {"  "}, {"good", ""}} {
+		if _, err := NewServer(securityDB(t), ServerOptions{Addr: "127.0.0.1:0", Tokens: tokens}); err == nil {
+			t.Errorf("NewServer(Tokens: %q) accepted an empty token", tokens)
+		}
+	}
+	if tokenValid("", []string{""}) {
+		t.Error("tokenValid accepted an empty token")
+	}
+	// A server built directly with an empty token still refuses "Bearer ".
+	ts := &tagServer{db: securityDB(t), validTokens: []string{""}}
+	h := ts.authMiddleware(http.HandlerFunc(ts.tagHandler))
+	req := httptest.NewRequest(http.MethodGet, "/tags/Valve", nil)
+	req.Header.Set("Authorization", "Bearer ")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("GET with \"Bearer \" = %d, want 401", rec.Code)
+	}
+}
