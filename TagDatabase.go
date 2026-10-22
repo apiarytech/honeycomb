@@ -21,6 +21,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -1848,8 +1849,12 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 		numWorkers = 1 // Ensure at least one worker is used.
 	}
 
+	type marshalResult struct {
+		line []byte
+		err  error
+	}
 	tagsChan := make(chan *Tag, numWorkers)
-	resultsChan := make(chan []byte, numWorkers)
+	resultsChan := make(chan marshalResult, numWorkers)
 	var wg sync.WaitGroup
 
 	// Start worker goroutines.
@@ -1870,9 +1875,16 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 				tag.valMu.RUnlock()
 
 				jsonData, err := json.Marshal(pTag)
-				if err == nil {
-					resultsChan <- jsonData
+				var unsupported *json.UnsupportedValueError
+				if errors.As(err, &unsupported) {
+					// A NaN or Inf REAL: store it as null, which
+					// ReadTagsFromFile leaves as the configured value.
+					jsonData, err = json.Marshal(jsonSafe(reflect.ValueOf(pTag)))
 				}
+				if err != nil {
+					err = fmt.Errorf("tag '%s': %w", tag.Name, err)
+				}
+				resultsChan <- marshalResult{line: jsonData, err: err}
 			}
 		}()
 	}
@@ -1896,9 +1908,14 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 	}()
 
 	// Consumer: Collect results from workers.
+	var marshalErrs []error
 	for result := range resultsChan {
-		lines = append(lines, string(result))
-		estimatedSize += len(result) + 1 // +1 for newline
+		if result.err != nil {
+			marshalErrs = append(marshalErrs, result.err)
+			continue
+		}
+		lines = append(lines, string(result.line))
+		estimatedSize += len(result.line) + 1 // +1 for newline
 	}
 
 	// Sort lines for a consistent file output, which is good for debugging and version control.
@@ -1912,7 +1929,57 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 	// Owner only: the file holds retained values (setpoints, counters) that
 	// ReadTagsFromFile restores at start, so nobody else may read or change it.
 	// A file that already exists keeps its permissions.
-	return os.WriteFile(filePath, []byte(builder.String()), 0o600)
+	if err := writeFileAtomic(filePath, []byte(builder.String()), 0o600); err != nil {
+		return err
+	}
+	// The tags that could be encoded are saved; report the ones that weren't.
+	if len(marshalErrs) > 0 {
+		return fmt.Errorf("WriteTagsToFile: %d tag(s) not saved: %w", len(marshalErrs), errors.Join(marshalErrs...))
+	}
+	return nil
+}
+
+// writeFileAtomic replaces path with data so that a crash or power loss
+// leaves either the old file or the new one, never a truncated file: it
+// writes a temporary file in the same directory, syncs it, renames it over
+// path and syncs the directory. A file that already exists keeps its
+// permissions; a new one gets perm.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) (err error) {
+	if info, statErr := os.Stat(path); statErr == nil {
+		perm = info.Mode().Perm()
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+		}
+	}()
+	if err = tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	// Make the rename durable. Directories can't be synced on Windows.
+	if d, dirErr := os.Open(dir); dirErr == nil {
+		_ = d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 // ReadTagsFromFile reads a file of tag values, parses each line,

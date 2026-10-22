@@ -2,7 +2,9 @@ package honeycomb
 
 import (
 	"math"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,5 +85,64 @@ func TestRetainRoundTripIssues3And5(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Error("subscriber was not told about the restored value")
+	}
+}
+
+// TestWriteTagsToFileIssue4 covers issue #4: a NaN value is saved (as null)
+// instead of silently dropped, the file is replaced atomically, and no
+// temporary file is left behind.
+func TestWriteTagsToFileIssue4(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "retain.json")
+	db := NewTagDatabase()
+	for _, tag := range []*Tag{
+		{Name: "R", TypeInfo: &TypeInfo{DataType: TypeREAL}, Value: plc.REAL(1), Retain: true},
+		{Name: "N", TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(4), Retain: true},
+	} {
+		if err := db.AddTag(tag); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.WriteTagsToFile(file); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetTagValue("R", plc.REAL(math.NaN())); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetTagValue("N", plc.INT(5)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteTagsToFile(file); err != nil {
+		t.Fatalf("WriteTagsToFile with a NaN: %v", err)
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"Name":"R"`) {
+		t.Errorf("the NaN tag was dropped from the file:\n%s", data)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Errorf("directory holds %d entries, want only the retain file", len(entries))
+	}
+
+	fresh := NewTagDatabase()
+	for _, tag := range []*Tag{
+		{Name: "R", TypeInfo: &TypeInfo{DataType: TypeREAL}, Value: plc.REAL(2), Retain: true},
+		{Name: "N", TypeInfo: &TypeInfo{DataType: TypeINT}, Value: plc.INT(0), Retain: true},
+	} {
+		if err := fresh.AddTag(tag); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fresh.ReadTagsFromFile(file); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := fresh.GetTagValue("N"); v != plc.INT(5) {
+		t.Errorf("N = %v, want 5", v)
+	}
+	if v, _ := fresh.GetTagValue("R"); v != plc.REAL(2) {
+		t.Errorf("R = %v, want the configured 2 (NaN was saved as null)", v)
 	}
 }
