@@ -10,10 +10,6 @@ env:
   # Fail instead of silently downloading a newer toolchain, so each matrix
   # entry really tests the Go version it names.
   GOTOOLCHAIN: local
-  # Tag values copy the mutex inside Tag (GetTag and friends return Tag by
-  # value), which vet's copylocks check reports. Skip that check until the API
-  # stops copying it; every other vet check runs.
-  VET_FLAGS: -copylocks=false
 
 jobs:
   test:
@@ -41,7 +37,7 @@ jobs:
       run: go build -v ./...
 
     - name: Vet
-      run: go vet ${{ env.VET_FLAGS }} ./...
+      run: go vet ./...
 
     - name: Test
       run: go test -v ./...
@@ -155,7 +151,7 @@ jobs:
       run: go build -v ./...
 
     - name: Vet
-      run: go vet ${{ env.VET_FLAGS }} ./...
+      run: go vet ./...
 
     - name: Test
       run: go test -count=1 ./...

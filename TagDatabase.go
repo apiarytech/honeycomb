@@ -32,6 +32,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	plc "github.com/apiarytech/royaljelly/iec"
 	"github.com/apiarytech/royaljelly/vars"
@@ -124,7 +125,6 @@ type RemoteAliasInfo struct {
 // Tag represents a single variable (tag) in the system.
 // It encapsulates all properties and the current state of a PLC tag.
 type Tag struct {
-	valMu         sync.RWMutex     // valMu provides read/write mutex protection for the tag's internal state.
 	Name          string           // Name is the unique symbolic name of the tag.
 	Value         interface{}      // Value holds the current data value of the tag.
 	Quality       Quality          // Quality reports how trustworthy Value is. A new tag starts as QualityUnknown.
@@ -139,15 +139,35 @@ type Tag struct {
 	Force         *ForceInfo       // If not nil, the tag's value is forced with the value in this struct.
 	RemoteAlias   *RemoteAliasInfo // If not nil, this tag is an alias for a tag in another database.
 
-	notifyMu sync.Mutex // serializes notifications, so subscribers receive updates in order
-	seq      uint64     // Sequence of the last update sent to subscribers; guarded by notifyMu
+	// locks are the tag's mutexes, made on first use (see lk). They sit
+	// behind a pointer so that a Tag, which the database hands out by value,
+	// holds no lock to copy: go vet's copylocks check passes for honeycomb
+	// and the programs that use it (issue #13).
+	locks unsafe.Pointer // *tagLocks
+	seq   uint64         // Sequence of the last update sent to subscribers; guarded by lk().notify
+}
+
+// tagLocks are a tag's mutexes.
+type tagLocks struct {
+	val    sync.RWMutex // read/write protection for the tag's state
+	notify sync.Mutex   // serializes notifications, so subscribers receive updates in order
+}
+
+// lk returns the tag's mutexes, making them on first use. Several
+// goroutines may race to make them: one wins, and all use its.
+func (t *Tag) lk() *tagLocks {
+	if p := atomic.LoadPointer(&t.locks); p != nil {
+		return (*tagLocks)(p)
+	}
+	atomic.CompareAndSwapPointer(&t.locks, nil, unsafe.Pointer(&tagLocks{}))
+	return (*tagLocks)(atomic.LoadPointer(&t.locks))
 }
 
 // snapshot returns a copy of the tag's state without its locks or internal
-// counters. The caller must hold valMu.
+// counters. The caller must hold lk().val.
 // Value and Force are deep-copied: an array (slice) or UDT (pointer) value
 // would otherwise be shared with the live tag, which writers change under
-// valMu while the caller reads the copy without it.
+// lk().val while the caller reads the copy without it.
 func (t *Tag) snapshot() Tag {
 	var force *ForceInfo
 	if t.Force != nil {
@@ -290,8 +310,8 @@ func getUDTTypeName(t reflect.Type) (DataType, bool) {
 
 // GetName returns the alias of the tag if it is defined, otherwise it returns the base name.
 func (t *Tag) GetName() string {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	if t.Alias != "" {
 		return t.Alias
 	}
@@ -301,12 +321,12 @@ func (t *Tag) GetName() string {
 // GetValue returns the current value of the tag. An array or UDT value is a
 // deep copy, so the caller can read it without holding the tag's lock.
 func (t *Tag) GetValue() interface{} {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	return cloneValue(t.presentedValue())
 }
 
-// presentedValue is GetValue for a caller that already holds valMu. (Taking a
+// presentedValue is GetValue for a caller that already holds lk().val. (Taking a
 // read lock twice deadlocks if a writer queues in between.)
 // A tag that is forced but has no force value yet presents its real value.
 func (t *Tag) presentedValue() interface{} {
@@ -343,8 +363,8 @@ func (t *Tag) SetValueQualityAt(value interface{}, quality Quality, timestamp ti
 	if !quality.IsValid() {
 		return fmt.Errorf("invalid quality %d for tag '%s'", uint8(quality), t.Name)
 	}
-	t.valMu.Lock()
-	defer t.valMu.Unlock()
+	t.lk().val.Lock()
+	defer t.lk().val.Unlock()
 
 	// A Constant tag's value cannot be changed.
 	if t.Constant {
@@ -409,23 +429,23 @@ func (t *Tag) SetValueQualityAt(value interface{}, quality Quality, timestamp ti
 
 // GetQuality returns the quality of the tag's value.
 func (t *Tag) GetQuality() Quality {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	return t.Quality
 }
 
 // GetTimestamp returns when the tag's value or quality last changed.
 func (t *Tag) GetTimestamp() time.Time {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	return t.Timestamp
 }
 
 // GetForceValue returns the forced value of the tag.
 // It returns nil when the tag is not forced.
 func (t *Tag) GetForceValue() interface{} {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	if t.Force == nil {
 		return nil
 	}
@@ -435,8 +455,8 @@ func (t *Tag) GetForceValue() interface{} {
 // SetForceValue updates the forced value of the tag.
 // It performs a type check to ensure the new value is compatible with the tag's DataType.
 func (t *Tag) SetForceValue(value interface{}) error {
-	t.valMu.Lock()
-	defer t.valMu.Unlock()
+	t.lk().val.Lock()
+	defer t.lk().val.Unlock()
 
 	// A Constant tag cannot be forced.
 	if t.Constant {
@@ -504,57 +524,57 @@ func (t *Tag) SetForceValue(value interface{}) error {
 
 // GetAlias returns the alias of the tag.
 func (t *Tag) GetAlias() string {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	return t.Alias
 }
 
 // GetDataType returns the data type of the tag.
 func (t *Tag) GetDataType() DataType {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	return t.TypeInfo.DataType
 }
 
 // GetDescription returns the description of the tag.
 func (t *Tag) GetDescription() string {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	return t.Description
 }
 
 // IsForced checks if the tag is currently being forced by examining the ForceMask.
 func (t *Tag) IsForced() bool {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	return t.Force != nil
 }
 
 // IsConstant checks if the tag is immutable.
 func (t *Tag) IsConstant() bool {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	return t.Constant
 }
 
 // IsRetain checks if the tag's value should be persisted across restarts.
 func (t *Tag) IsRetain() bool {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	return t.Retain
 }
 
 // GetDirectAddress returns the IEC 61131-3 direct address of the tag.
 func (t *Tag) GetDirectAddress() string {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	return t.DirectAddress
 }
 
 // GetTypeInfo returns a pointer to the TypeInfo struct of the tag.
 func (t *Tag) GetTypeInfo() *TypeInfo {
-	t.valMu.RLock()
-	defer t.valMu.RUnlock()
+	t.lk().val.RLock()
+	defer t.lk().val.RUnlock()
 	return t.TypeInfo
 }
 
@@ -591,7 +611,7 @@ type TagDatabaseManager interface {
 	SetTagValueQualityAt(name string, value interface{}, quality Quality, timestamp time.Time) error
 	SetTagQuality(name string, quality Quality) error
 	GetTagQuality(name string) (Quality, error)
-	SetTagDescription(name string, description string) error
+	SetTagDescription(name string, description string) (Tag, error)
 	GetTagDescription(name string) (string, error)
 	SetTagAlias(name string, alias string) error
 	GetTagAlias(name string) (string, error)
@@ -602,6 +622,9 @@ type TagDatabaseManager interface {
 	WriteTagsToFile(filePath string) error
 	ReadTagsFromFile(filePath string) error
 }
+
+// TagDatabase implements TagDatabaseManager; the build checks it.
+var _ TagDatabaseManager = (*TagDatabase)(nil)
 
 // TagDatabase is a thread-safe implementation of the TagDatabaseManager.
 type TagDatabase struct {
@@ -737,7 +760,7 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 	}
 
 	// Work out the direct address before the tag is published: once it is in
-	// the map, other goroutines read it, so it must only change under valMu.
+	// the map, other goroutines read it, so it must only change under lk().val.
 	directAddr, hasDirectAddr := generateDirectAddress(tag)
 
 	// LoadOrStore is an atomic operation that checks for existence and stores if not present.
@@ -752,7 +775,7 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 	newTag, _ := db.tags.Load(tag.Name) // Corrected from TypeInfo to honeycomb.TypeInfo
 	tagPtr := newTag.(*Tag)
 
-	tagPtr.valMu.Lock()
+	tagPtr.lk().val.Lock()
 	// Only attempt to auto-instantiate UDTs for non-alias tags with valid TypeInfo.
 	if tagPtr.RemoteAlias == nil && tagPtr.TypeInfo != nil {
 		_, isUDT := newUDTInstance(tagPtr.TypeInfo.DataType)
@@ -772,7 +795,7 @@ func (db *TagDatabase) AddTag(tag *Tag) error {
 		tagPtr.DirectAddress = directAddr
 	}
 	directAddress := tagPtr.DirectAddress
-	tagPtr.valMu.Unlock()
+	tagPtr.lk().val.Unlock()
 
 	if directAddress != "" {
 		db.directAddressMap.Store(CanonicalAddress(directAddress), tag.Name)
@@ -859,8 +882,8 @@ func (db *TagDatabase) GetTag(name string) (Tag, bool) {
 	val, found := db.tags.Load(name)
 	if found {
 		tagPtr := val.(*Tag)
-		tagPtr.valMu.RLock()
-		defer tagPtr.valMu.RUnlock()
+		tagPtr.lk().val.RLock()
+		defer tagPtr.lk().val.RUnlock()
 		return tagPtr.snapshot(), true
 	}
 
@@ -914,9 +937,9 @@ func (db *TagDatabase) GetAllTags() []Tag {
 	tags := make([]Tag, 0) // Initialize as an empty slice, not a nil slice.
 	db.tags.Range(func(_, value interface{}) bool {
 		tagPtr := value.(*Tag)
-		tagPtr.valMu.RLock()
+		tagPtr.lk().val.RLock()
 		tags = append(tags, tagPtr.snapshot())
-		tagPtr.valMu.RUnlock()
+		tagPtr.lk().val.RUnlock()
 		return true
 	})
 	return tags
@@ -930,9 +953,9 @@ func (db *TagDatabase) GetTags(names []string) map[string]Tag {
 	for _, name := range names {
 		if val, found := db.tags.Load(name); found {
 			tagPtr := val.(*Tag)
-			tagPtr.valMu.RLock()
+			tagPtr.lk().val.RLock()
 			foundTags[name] = tagPtr.snapshot()
-			tagPtr.valMu.RUnlock()
+			tagPtr.lk().val.RUnlock()
 		}
 	}
 	return foundTags
@@ -943,12 +966,12 @@ func (db *TagDatabase) GetTagsByType(dataType DataType) []Tag {
 	matchingTags := make([]Tag, 0)
 	db.tags.Range(func(key, value interface{}) bool {
 		tag := value.(*Tag)
-		tag.valMu.RLock()
+		tag.lk().val.RLock()
 		// Remote aliases have no TypeInfo of their own.
 		if tag.TypeInfo != nil && tag.TypeInfo.DataType == dataType {
 			matchingTags = append(matchingTags, tag.snapshot())
 		}
-		tag.valMu.RUnlock()
+		tag.lk().val.RUnlock()
 		return true
 	})
 	return matchingTags
@@ -1031,8 +1054,8 @@ func (db *TagDatabase) RenameTag(oldName, newName string) (Tag, error) {
 	}
 
 	// 3. Now that the new name is secured, update the internal name field.
-	tagPtr.valMu.Lock()
-	defer tagPtr.valMu.Unlock()
+	tagPtr.lk().val.Lock()
+	defer tagPtr.lk().val.Unlock()
 
 	tagPtr.Name = newName
 	db.tags.Store(newName, tagPtr)
@@ -1339,13 +1362,13 @@ func (db *TagDatabase) setTagQualityRecursive(name string, quality Quality, dept
 		return remoteDB.setTagQualityRecursive(tag.RemoteAlias.TagName, quality, depth+1)
 	}
 
-	tag.valMu.Lock()
+	tag.lk().val.Lock()
 	changed := tag.Quality != quality
 	if changed {
 		tag.Quality = quality
 		tag.Timestamp = time.Now() // A quality change is an event in its own right.
 	}
-	tag.valMu.Unlock()
+	tag.lk().val.Unlock()
 	if changed {
 		db.notifySubscribers(tag)
 	}
@@ -1405,10 +1428,10 @@ func (db *TagDatabase) SetTagDescription(name string, description string) (Tag, 
 	}
 
 	tagPtr := val.(*Tag)
-	tagPtr.valMu.Lock()
+	tagPtr.lk().val.Lock()
 	tagPtr.Description = description
 	copied := tagPtr.snapshot()
-	tagPtr.valMu.Unlock()
+	tagPtr.lk().val.Unlock()
 	db.markChanged(name)
 	return copied, nil
 }
@@ -1421,9 +1444,9 @@ func (db *TagDatabase) SetTagAlias(name string, alias string) error {
 	}
 
 	tagPtr := val.(*Tag)
-	tagPtr.valMu.Lock() // Corrected from TypeARRAY to honeycomb.TypeARRAY
+	tagPtr.lk().val.Lock() // Corrected from TypeARRAY to honeycomb.TypeARRAY
 	tagPtr.Alias = alias
-	tagPtr.valMu.Unlock()
+	tagPtr.lk().val.Unlock()
 	db.markChanged(name)
 	return nil
 }
@@ -1435,8 +1458,8 @@ func (db *TagDatabase) GetTagAlias(name string) (string, error) {
 		return "", fmt.Errorf("GetTagAlias: tag '%s' not found in database", name)
 	}
 	tag := val.(*Tag)
-	tag.valMu.RLock()
-	defer tag.valMu.RUnlock()
+	tag.lk().val.RLock()
+	defer tag.lk().val.RUnlock()
 	return tag.Alias, nil
 }
 
@@ -1447,7 +1470,7 @@ func (db *TagDatabase) SetTagForced(name string, forced bool) (Tag, error) {
 		return Tag{}, fmt.Errorf("SetTagForced: tag '%s' not found in database", name)
 	}
 	tag := val.(*Tag)
-	tag.valMu.Lock() // Corrected from TypeARRAY to honeycomb.TypeARRAY
+	tag.lk().val.Lock() // Corrected from TypeARRAY to honeycomb.TypeARRAY
 	if forced {
 		if tag.Force == nil {
 			tag.Force = &ForceInfo{} // Initialize if it doesn't exist
@@ -1458,7 +1481,7 @@ func (db *TagDatabase) SetTagForced(name string, forced bool) (Tag, error) {
 	// Copy the state without the mutex: a copy of a held mutex stays locked,
 	// and the caller's first locking call on it would deadlock.
 	copied := tag.snapshot()
-	tag.valMu.Unlock()
+	tag.lk().val.Unlock()
 	// A force or its release changes the value read: tell subscribers and
 	// the change feed, as any value write does (it also marks the tag for
 	// the store).
@@ -1473,8 +1496,8 @@ func (db *TagDatabase) GetTagDescription(name string) (string, error) {
 		return "", fmt.Errorf("GetTagDescription: tag '%s' not found in database", name)
 	}
 	tag := val.(*Tag)
-	tag.valMu.RLock()
-	defer tag.valMu.RUnlock()
+	tag.lk().val.RLock()
+	defer tag.lk().val.RUnlock()
 	return tag.Description, nil
 }
 
@@ -1485,8 +1508,8 @@ func (db *TagDatabase) GetTagForced(name string) (bool, error) {
 		return false, fmt.Errorf("GetTagForced: tag '%s' not found in database", name)
 	}
 	tag := val.(*Tag)
-	tag.valMu.RLock()
-	defer tag.valMu.RUnlock()
+	tag.lk().val.RLock()
+	defer tag.lk().val.RUnlock()
 	return tag.Force != nil, nil
 }
 
@@ -1505,9 +1528,9 @@ func (db *TagDatabase) SetTagForceValue(name string, value interface{}) (Tag, er
 
 	// Lock the tag to safely perform the type check and update, then tell
 	// subscribers and the change feed, as any value write does.
-	tag.valMu.Lock()
+	tag.lk().val.Lock()
 	out, err := setForceValueLocked(tag, value)
-	tag.valMu.Unlock()
+	tag.lk().val.Unlock()
 	if err != nil {
 		return Tag{}, err
 	}
@@ -1516,7 +1539,7 @@ func (db *TagDatabase) SetTagForceValue(name string, value interface{}) (Tag, er
 }
 
 // setForceValueLocked type-checks and sets tag's force value; the caller
-// holds tag.valMu.
+// holds tag.lk().val.
 func setForceValueLocked(tag *Tag, value interface{}) (Tag, error) {
 	// Allow nil to clear the force honeycomb.Value
 	if value == nil && tag.Force != nil {
@@ -1576,8 +1599,8 @@ func (db *TagDatabase) GetTagForceValue(name string) (interface{}, error) {
 		return nil, fmt.Errorf("GetTagForceValue: tag '%s' not found in database", name)
 	}
 	tag := val.(*Tag)
-	tag.valMu.RLock()
-	defer tag.valMu.RUnlock()
+	tag.lk().val.RLock()
+	defer tag.lk().val.RUnlock()
 	if tag.Force != nil {
 		return tag.Force.Value, nil
 	}
@@ -1589,17 +1612,17 @@ func (db *TagDatabase) GetTagForceValue(name string) (interface{}, error) {
 // received yet is replaced, so the newest state always wins. Sends never block.
 func (db *TagDatabase) notifySubscribers(tag *Tag) {
 	// Serializing notifications per tag keeps updates in order: the copy is
-	// taken under notifyMu, so a later notification always carries newer state.
-	tag.notifyMu.Lock()
-	defer tag.notifyMu.Unlock()
+	// taken under lk().notify, so a later notification always carries newer state.
+	tag.lk().notify.Lock()
+	defer tag.lk().notify.Unlock()
 
 	// Every value write funnels through here, so this is where changes are
 	// recorded in the change feed (under the read lock, so array and UDT
 	// values are copied consistently) and queued for the attached TagStore.
-	tag.valMu.RLock()
+	tag.lk().val.RLock()
 	update := tag.snapshot()
 	db.recordChange(tag)
-	tag.valMu.RUnlock()
+	tag.lk().val.RUnlock()
 	tag.seq++
 	update.Sequence = tag.seq
 
@@ -1891,7 +1914,7 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 		go func() {
 			defer wg.Done()
 			for tag := range tagsChan {
-				tag.valMu.RLock()
+				tag.lk().val.RLock()
 				quality := tag.Quality
 				pTag := persistentTag{
 					Name:      tag.Name,
@@ -1900,7 +1923,7 @@ func (db *TagDatabase) WriteTagsToFile(filePath string) error {
 					Quality:   &quality,
 					Timestamp: tag.Timestamp,
 				}
-				tag.valMu.RUnlock()
+				tag.lk().val.RUnlock()
 
 				jsonData, err := json.Marshal(pTag)
 				var unsupported *json.UnsupportedValueError
@@ -2108,10 +2131,10 @@ func (db *TagDatabase) ReadTagsFromFile(filePath string) error {
 
 		// A remote alias has no value of its own (the remote tag holds it),
 		// and a Constant keeps its configured value: neither is restored.
-		tag.valMu.RLock()
+		tag.lk().val.RLock()
 		skip := tag.RemoteAlias != nil || tag.Constant
 		typeInfo, current := tag.TypeInfo, tag.Value
-		tag.valMu.RUnlock()
+		tag.lk().val.RUnlock()
 		if skip {
 			continue
 		}
@@ -2444,8 +2467,8 @@ func (db *TagDatabase) fieldOf(basePath, fieldPath string, depth int) (interface
 		}
 		return remoteDB.getTagValueRecursive(owner.RemoteAlias.TagName+"."+fieldPath, depth+1)
 	}
-	owner.valMu.RLock()
-	defer owner.valMu.RUnlock()
+	owner.lk().val.RLock()
+	defer owner.lk().val.RUnlock()
 	udtInstance := owner.presentedValue()
 	if index >= 0 {
 		element, err := arrayElement(owner, index)
@@ -2497,9 +2520,9 @@ func (db *TagDatabase) setNestedField(basePath string, value interface{}, fieldP
 		}
 
 		// Lock the parent array tag for the entire operation.
-		baseTag.valMu.Lock()
+		baseTag.lk().val.Lock()
 		defer func() {
-			baseTag.valMu.Unlock()
+			baseTag.lk().val.Unlock()
 			if err == nil {
 				db.notifySubscribers(baseTag)
 			}
@@ -2525,9 +2548,9 @@ func (db *TagDatabase) setNestedField(basePath string, value interface{}, fieldP
 		baseTag = val.(*Tag)
 
 		// Lock the UDT tag for the operation.
-		baseTag.valMu.Lock()
+		baseTag.lk().val.Lock()
 		defer func() {
-			baseTag.valMu.Unlock()
+			baseTag.lk().val.Unlock()
 			if err == nil {
 				db.notifySubscribers(baseTag)
 			}
@@ -2660,12 +2683,12 @@ func calculateFlatIndex(dimensions []int, indices []int) (int, error) {
 
 // getArrayElementValue retrieves an element from a tag's slice value after all checks.
 func getArrayElementValue(baseTag *Tag, index int) (interface{}, error) {
-	baseTag.valMu.RLock()
-	defer baseTag.valMu.RUnlock()
+	baseTag.lk().val.RLock()
+	defer baseTag.lk().val.RUnlock()
 	return arrayElement(baseTag, index)
 }
 
-// arrayElement is getArrayElementValue for a caller that holds baseTag.valMu.
+// arrayElement is getArrayElementValue for a caller that holds baseTag.lk().val.
 func arrayElement(baseTag *Tag, index int) (interface{}, error) {
 	if baseTag.TypeInfo.DataType != TypeARRAY { // Corrected from TypeARRAY to honeycomb.TypeARRAY
 		return nil, fmt.Errorf("getArrayElementValue: tag '%s' is not an array", baseTag.Name)
@@ -2686,8 +2709,8 @@ func arrayElement(baseTag *Tag, index int) (interface{}, error) {
 // setArrayElementValue writes a value to an element of a tag's slice value and
 // sets the quality of the whole array.
 func setArrayElementValue(baseTag *Tag, index int, value interface{}, quality Quality, timestamp time.Time) error {
-	baseTag.valMu.Lock()
-	defer baseTag.valMu.Unlock()
+	baseTag.lk().val.Lock()
+	defer baseTag.lk().val.Unlock()
 
 	if baseTag.TypeInfo.DataType != TypeARRAY { // Corrected from TypeARRAY to honeycomb.TypeARRAY
 		return fmt.Errorf("setArrayElementValue: tag '%s' is not an array", baseTag.Name)

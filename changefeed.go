@@ -188,7 +188,7 @@ func (db *TagDatabase) changeFeed() *changeFeed {
 }
 
 // recordChange adds a tag's current state to the change feed. The caller must
-// hold t.valMu, so the value is copied consistently.
+// hold t.lk().val, so the value is copied consistently.
 func (db *TagDatabase) recordChange(t *Tag) {
 	db.changeFeed().record(Change{
 		Name:      t.Name,

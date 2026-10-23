@@ -204,10 +204,10 @@ func (p *Persister) restoreTag(rec StoredTag) error {
 	}
 
 	tag := val.(*Tag)
-	tag.valMu.RLock()
+	tag.lk().val.RLock()
 	typeInfo, current := tag.TypeInfo, tag.Value
 	skip := tag.RemoteAlias != nil || tag.Constant
-	tag.valMu.RUnlock()
+	tag.lk().val.RUnlock()
 	if skip {
 		return nil
 	}
@@ -430,8 +430,8 @@ func (p *Persister) Close(ctx context.Context) error {
 
 // snapshot captures a tag's state. The bool result reports whether the tag is in scope.
 func (p *Persister) snapshot(tag *Tag) (StoredTag, bool, error) {
-	tag.valMu.RLock()
-	defer tag.valMu.RUnlock()
+	tag.lk().val.RLock()
+	defer tag.lk().val.RUnlock()
 
 	if p.opts.Scope == PersistRetainOnly && !tag.Retain {
 		return StoredTag{}, false, nil
