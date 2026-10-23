@@ -5,7 +5,7 @@ go 1.27.2
 require (
 	github.com/apache/plc4x/plc4go v0.0.0-20261012073005-2b1095c45dbc
 	github.com/apiarytech/honeycomb v0.2.1
-	github.com/apiarytech/royaljelly v0.3.0
+	github.com/apiarytech/royaljelly v0.3.3
 )
 
 require (
