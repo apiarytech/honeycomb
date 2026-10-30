@@ -1,4 +1,4 @@
-# Honeycomb TagDatabase - IEC 61131-3 Compliant PLC Tag Management in Go
+# <img src="doc/icon/png/honeycomb-512.png" alt="" width="48" align="center"> Honeycomb: PLC Tag Database Management in Go!
 
 The `TagDatabase` project provides a robust, thread-safe, and feature-rich in-memory database for managing PLC-like tags, adhering closely to the specifications outlined in IEC 61131-3. Developed in Go, it offers a flexible and performant solution for applications requiring structured data management with industrial control system paradigms.
 
