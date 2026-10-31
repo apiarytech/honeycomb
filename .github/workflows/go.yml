@@ -21,7 +21,7 @@ jobs:
           - macos-latest
           - windows-latest
         go:
-          - '1.27.2' # Minimum version. Keep in sync with the go directive in go.mod.
+          - '1.27.3' # Minimum version. Keep in sync with the go directive in go.mod.
           - 'stable'
     runs-on: ${{ matrix.os }}
 
