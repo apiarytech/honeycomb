@@ -1,6 +1,6 @@
 module github.com/apiarytech/honeycomb/connectors/plc4x
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/apache/plc4x/plc4go v0.0.0-20261012073005-2b1095c45dbc

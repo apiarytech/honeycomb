@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Go 1.27.2 or later (the `go` directive in `go.mod`).
+- Go 1.27.3 or later (the `go` directive in `go.mod`).
 - No C compiler: everything, including the SQLite driver used in tests
   (modernc.org/sqlite), is pure Go. The race detector needs cgo.
 
