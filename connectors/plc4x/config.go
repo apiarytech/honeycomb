@@ -131,7 +131,7 @@ func (d *Direction) UnmarshalText(text []byte) error {
 	return fmt.Errorf("invalid direction %q (want input, output or inout)", text)
 }
 
-var modeNames = []string{Poll: "poll", ChangeOfState: "change-of-state", Cyclic: "cyclic"}
+var modeNames = []string{Poll: "poll", ChangeOfState: "change-of-state", Cyclic: "cyclic", Server: "server"}
 
 func (m Mode) String() string {
 	if int(m) < len(modeNames) {

@@ -61,6 +61,9 @@ const (
 	ChangeOfState
 	// Cyclic subscribes to the inputs; the device reports them every Interval.
 	Cyclic
+	// Server answers Modbus masters, on a serial port or over TCP, serving
+	// the bound tags (server.go, drone D-66).
+	Server
 )
 
 // Binding maps a honeycomb tag to an address on a device.
@@ -109,7 +112,10 @@ type Connector struct {
 	manager     plc4go.PlcDriverManager
 	connections []*connState
 	onError     func(connection string, err error)
-	diagPrefix  string
+	// onServerWrite reports each tag a Modbus master wrote to a server
+	// connection (D-66): the connection, the tag, its new value, from where.
+	onServerWrite func(connection, tag string, value any, from string)
+	diagPrefix    string
 
 	mu     sync.RWMutex
 	status map[string]Status
@@ -123,7 +129,8 @@ type connState struct {
 	Connection
 	byTag     map[string]Binding
 	hasInputs bool
-	link      *link // output tracking; set by Run
+	link      *link   // output tracking; set by Run
+	server    *server // a Server connection's port and register map
 	// inflight counts requests a session stopped waiting for; the session
 	// closes its connection only once they are done (see execute).
 	inflight sync.WaitGroup
@@ -188,6 +195,12 @@ func WithErrorHandler(fn func(connection string, err error)) Option {
 	return func(c *Connector) { c.onError = fn }
 }
 
+// WithServerWrites reports each tag a Modbus master writes through a
+// server connection, for the record: who changed what.
+func WithServerWrites(fn func(connection, tag string, value any, from string)) Option {
+	return func(c *Connector) { c.onServerWrite = fn }
+}
+
 // WithDiagnostics publishes each connection's Status as tags named
 // prefix + connection name + "." + field, e.g. "PLC4X.press1.Connected" for the
 // prefix "PLC4X.". The fields are Connected and Subscribed (BOOL), Reads, Writes
@@ -199,10 +212,11 @@ func WithDiagnostics(prefix string) Option {
 // New creates a Connector for the given devices.
 func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*Connector, error) {
 	c := &Connector{
-		db:        db,
-		onError:   func(string, error) {},
-		status:    make(map[string]Status),
-		published: make(map[string]Status),
+		db:            db,
+		onError:       func(string, error) {},
+		onServerWrite: func(string, string, any, string) {},
+		status:        make(map[string]Status),
+		published:     make(map[string]Status),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -219,10 +233,17 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 		if conn.Interval <= 0 {
 			conn.Interval = time.Second
 		}
-		if conn.Mode > Cyclic {
+		if conn.Mode > Server {
 			return nil, fmt.Errorf("plc4x: connection %q: invalid mode %d", conn.Name, conn.Mode)
 		}
 		cs := &connState{Connection: conn, byTag: make(map[string]Binding)}
+		if conn.Mode == Server {
+			s, err := newServer(conn)
+			if err != nil {
+				return nil, err
+			}
+			cs.server = s
+		}
 		for _, b := range conn.Bindings {
 			if b.Tag == "" || b.Address == "" {
 				return nil, fmt.Errorf("plc4x: connection %q: every binding needs a Tag and an Address", conn.Name)
@@ -230,8 +251,9 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 			if b.Direction > InOut {
 				return nil, fmt.Errorf("plc4x: connection %q: tag %q: invalid direction %d", conn.Name, b.Tag, b.Direction)
 			}
-			// PLC4X keys requests and responses by tag name.
-			if _, dup := cs.byTag[b.Tag]; dup {
+			// PLC4X keys requests and responses by tag name. A server may
+			// serve one tag at two addresses: it makes no requests.
+			if _, dup := cs.byTag[b.Tag]; dup && conn.Mode != Server {
 				return nil, fmt.Errorf("plc4x: connection %q: tag %q is bound twice", conn.Name, b.Tag)
 			}
 			cs.byTag[b.Tag] = b
@@ -242,7 +264,13 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 	if c.manager == nil {
 		// Only the drivers the connections use: a device reaches no other
 		// protocol's code.
-		m, err := NewDriverManagerFor(Protocols(connections)...)
+		var clients []Connection // a server needs no driver: it answers, it does not connect
+		for _, conn := range connections {
+			if conn.Mode != Server {
+				clients = append(clients, conn)
+			}
+		}
+		m, err := NewDriverManagerFor(Protocols(clients)...)
 		if err != nil {
 			return nil, err
 		}
@@ -267,6 +295,9 @@ func (c *Connector) Status(name string) (Status, bool) {
 // the others continue. Run returns early only if an output tag cannot be watched.
 func (c *Connector) Run(ctx context.Context) error {
 	for _, cs := range c.connections {
+		if cs.server != nil {
+			continue // a server reads its tags at each request
+		}
 		l, err := c.watchOutputs(cs)
 		if err != nil {
 			c.stopWatching()
@@ -281,6 +312,10 @@ func (c *Connector) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			if cs.server != nil {
+				c.runServer(ctx, cs)
+				return
+			}
 			c.runConnection(ctx, cs)
 		}()
 	}
