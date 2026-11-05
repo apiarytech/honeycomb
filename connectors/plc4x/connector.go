@@ -137,7 +137,7 @@ type connState struct {
 }
 
 // requestTimeout bounds one request to a device.
-const requestTimeout = 10 * time.Second
+var requestTimeout = 10 * time.Second
 
 // execute runs a request and waits for its result or for ctx to end.
 //
@@ -328,6 +328,13 @@ const (
 	maxBackoff = 30 * time.Second
 )
 
+// lostAfter ends a session whose reads or writes have failed without a
+// break for this long, even while the driver still says it is connected:
+// PLC4X's Modbus TCP connection keeps saying so after the device closed the
+// socket (a restarted drone, 2026-11-04: "broken pipe" ten times a second
+// for hours), so only a new connection gets the device back.
+var lostAfter = 5 * time.Second
+
 func (c *Connector) runConnection(ctx context.Context, cs *connState) {
 	backoff := minBackoff
 	for ctx.Err() == nil {
@@ -384,23 +391,44 @@ func (c *Connector) session(ctx context.Context, cs *connState) error {
 	c.record(cs.Name, func(s *Status) { s.Connected, s.Subscribed = true, subscribed }, nil)
 	cs.link.startSession()
 
+	// failing is when reads or writes started failing without a break; zero
+	// while they succeed.
+	var failing time.Time
+	// failed records err and keeps the session, unless the connection is
+	// lost or nothing has succeeded for lostAfter: then the session ends and
+	// runConnection connects again.
+	failed := func(err error) error {
+		if !plcConn.IsConnected() {
+			return err
+		}
+		c.record(cs.Name, nil, err) // The device did not answer; keep the session for now.
+		if failing.IsZero() {
+			failing = time.Now()
+		} else if time.Since(failing) >= lostAfter {
+			return fmt.Errorf("nothing answered for %s, connecting again: %w", lostAfter, err)
+		}
+		return nil
+	}
+
 	// cycle writes changed outputs and, when due, reads the inputs. It returns an
 	// error only when the connection is lost; other errors are recorded.
 	cycle := func(due bool) error {
 		if err := c.flushWrites(ctx, plcConn, cs); err != nil {
-			if !plcConn.IsConnected() {
+			if err := failed(err); err != nil {
 				return err
 			}
-			c.record(cs.Name, nil, err)
+		} else if read == nil {
+			failing = time.Time{}
 		}
 		switch {
 		case !due:
 		case read != nil:
 			if err := c.poll(ctx, cs, read); err != nil {
-				if !plcConn.IsConnected() {
+				if err := failed(err); err != nil {
 					return err
 				}
-				c.record(cs.Name, nil, err) // The device did not answer; keep the session.
+			} else {
+				failing = time.Time{}
 			}
 		case !plcConn.IsConnected():
 			return errors.New("connection lost")
