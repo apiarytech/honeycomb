@@ -301,7 +301,7 @@ func parseServerAddress(addr string) (serverPoint, error) {
 	}
 	p.dataType = dt
 	if !bits {
-		p.words = uint16((int(dt.DataTypeSize()) + 1) / 2)
+		p.words = (uint16(dt.DataTypeSize()) + 1) / 2
 		if p.words == 0 {
 			p.words = 1
 		}
@@ -328,8 +328,7 @@ func (s *server) answer(c *Connector, name string, frame []byte) []byte {
 		return nil
 	}
 	out := append([]byte{s.unit}, s.handle(c, name, frame[1:len(frame)-2], true, "serial")...)
-	crc := rtuCRC(out)
-	return append(out, byte(crc), byte(crc>>8))
+	return binary.LittleEndian.AppendUint16(out, rtuCRC(out))
 }
 
 // handle answers one request PDU with a response PDU: the reply, or an
@@ -856,8 +855,14 @@ func (c *Connector) serveTCPConn(ctx context.Context, cs *connState, conn net.Co
 		} else {
 			reply = s.handle(c, cs.Name, pdu, writes, from)
 		}
+		// MBAP length: the unit id and the PDU, which is at most 253 bytes
+		// (handle never makes more).
+		n := len(reply) + 1
+		if n < 2 || n > 254 {
+			return
+		}
 		out := append(head[:4:4], 0, 0, head[6])
-		binary.BigEndian.PutUint16(out[4:6], uint16(len(reply)+1))
+		binary.BigEndian.PutUint16(out[4:6], uint16(n))
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if _, err := conn.Write(append(out, reply...)); err != nil {
 			return
@@ -910,6 +915,5 @@ func rtuCRC(b []byte) uint16 {
 // crcOK checks a frame's last two bytes against the CRC of the rest.
 func crcOK(frame []byte) bool {
 	n := len(frame)
-	crc := rtuCRC(frame[:n-2])
-	return frame[n-2] == byte(crc) && frame[n-1] == byte(crc>>8)
+	return binary.LittleEndian.Uint16(frame[n-2:]) == rtuCRC(frame[:n-2])
 }

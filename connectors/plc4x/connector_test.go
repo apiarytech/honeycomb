@@ -85,7 +85,7 @@ func (s *modbusServer) serve(conn net.Conn) {
 	if muted { // a connection made while muted is dropped at once
 		return
 	}
-	dead := false // muted once: never answers again, like a socket to a gone process
+	dead := false             // muted once: never answers again, like a socket to a gone process
 	header := make([]byte, 7) // transaction id, protocol id, length, unit id
 	for {
 		if _, err := io.ReadFull(conn, header); err != nil {

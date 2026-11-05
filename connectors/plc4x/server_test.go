@@ -165,14 +165,14 @@ func TestServerConfig(t *testing.T) {
 	addTag(t, db, "A", honeycomb.TypeINT, plc.INT(0))
 	addTag(t, db, "B", honeycomb.TypeREAL, plc.REAL(0))
 	for want, conn := range map[string]Connection{
-		"or Modbus TCP":               {URL: "s7://10.0.0.5", Bindings: []Binding{out("A", "holding-register:1")}},
-		"unit-identifier":             {URL: strings.Replace(serverURL, "unit-identifier=7", "unit-identifier=0", 1)},
-		"owns its port":               {URL: serverURL + "&serial.reuse-port=true"},
-		"bindings are outputs":        {URL: serverURL, Bindings: []Binding{{Tag: "A", Address: "holding-register:1"}}},
-		"overlaps":                    {URL: serverURL, Bindings: []Binding{out("B", "holding-register:1:REAL"), out("A", "holding-register:2:INT")}},
-		"are BOOL":                    {URL: serverURL, Bindings: []Binding{out("A", "coil:1:INT")}},
-		"1 is the first":              {URL: serverURL, Bindings: []Binding{out("A", "holding-register:0")}},
-		"does not serve":              {URL: serverURL, Bindings: []Binding{out("A", "holding-register:1:STRING")}},
+		"or Modbus TCP":        {URL: "s7://10.0.0.5", Bindings: []Binding{out("A", "holding-register:1")}},
+		"unit-identifier":      {URL: strings.Replace(serverURL, "unit-identifier=7", "unit-identifier=0", 1)},
+		"owns its port":        {URL: serverURL + "&serial.reuse-port=true"},
+		"bindings are outputs": {URL: serverURL, Bindings: []Binding{{Tag: "A", Address: "holding-register:1"}}},
+		"overlaps":             {URL: serverURL, Bindings: []Binding{out("B", "holding-register:1:REAL"), out("A", "holding-register:2:INT")}},
+		"are BOOL":             {URL: serverURL, Bindings: []Binding{out("A", "coil:1:INT")}},
+		"1 is the first":       {URL: serverURL, Bindings: []Binding{out("A", "holding-register:0")}},
+		"does not serve":       {URL: serverURL, Bindings: []Binding{out("A", "holding-register:1:STRING")}},
 	} {
 		conn.Name, conn.Mode = "S", Server
 		if _, err := New(db, []Connection{conn}); err == nil || !strings.Contains(err.Error(), want) {
