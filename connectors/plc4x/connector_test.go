@@ -25,6 +25,10 @@ type modbusServer struct {
 	mu       sync.Mutex
 	regs     [16]uint16
 	writes   int
+	// mute: open connections stay open but never answer again, as a
+	// socket whose other end went away (a restarted drone); new ones are
+	// dropped while muted, answered after.
+	mute bool
 }
 
 func startModbusServer(t *testing.T) *modbusServer {
@@ -67,8 +71,21 @@ func (s *modbusServer) writeCount() int {
 	return s.writes
 }
 
+func (s *modbusServer) setMute(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mute = on
+}
+
 func (s *modbusServer) serve(conn net.Conn) {
 	defer conn.Close()
+	s.mu.Lock()
+	muted := s.mute
+	s.mu.Unlock()
+	if muted { // a connection made while muted is dropped at once
+		return
+	}
+	dead := false             // muted once: never answers again, like a socket to a gone process
 	header := make([]byte, 7) // transaction id, protocol id, length, unit id
 	for {
 		if _, err := io.ReadFull(conn, header); err != nil {
@@ -77,6 +94,12 @@ func (s *modbusServer) serve(conn net.Conn) {
 		pdu := make([]byte, binary.BigEndian.Uint16(header[4:6])-1)
 		if _, err := io.ReadFull(conn, pdu); err != nil {
 			return
+		}
+		s.mu.Lock()
+		dead = dead || s.mute
+		s.mu.Unlock()
+		if dead {
+			continue // read, never answered: the client's driver still says connected
 		}
 
 		out := append([]byte{}, header[:4]...)
@@ -184,6 +207,40 @@ func TestConnectorReadsModbusIntoTags(t *testing.T) {
 		if q, _ := db.GetTagQuality(name); q != honeycomb.QualityGood {
 			t.Errorf("%s quality = %v, want Good", name, q)
 		}
+	}
+}
+
+// A device that stops answering while the driver still says connected (a
+// restarted drone: PLC4X kept writing to the dead socket for hours): after
+// lostAfter the session ends and a new connection reads the device again.
+func TestConnectorReconnectsWhenNothingAnswers(t *testing.T) {
+	oldLost, oldReq := lostAfter, requestTimeout
+	lostAfter, requestTimeout = 300*time.Millisecond, 100*time.Millisecond
+	t.Cleanup(func() { lostAfter, requestTimeout = oldLost, oldReq })
+	server := startModbusServer(t)
+	server.set(0, 7)
+	db := honeycomb.NewTagDatabase()
+	addTag(t, db, "Level", honeycomb.TypeINT, plc.INT(0))
+	connector, err := New(db, []Connection{{
+		Name: "box", URL: "modbus-tcp://" + server.addr(), Interval: 50 * time.Millisecond,
+		Bindings: []Binding{{Tag: "Level", Address: "holding-register:1:INT"}},
+	}}, WithErrorHandler(func(name string, err error) { t.Logf("%s: %v", name, err) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { connector.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	waitFor(t, func() bool { v, _ := db.GetTagValue("Level"); return v == plc.INT(7) })
+
+	server.setMute(true)
+	time.Sleep(lostAfter + 500*time.Millisecond)
+	server.set(0, 8)
+	server.setMute(false) // the old connection stays dead: only a new one reads 8
+	waitFor(t, func() bool { v, _ := db.GetTagValue("Level"); return v == plc.INT(8) })
+	if s, _ := connector.Status("box"); s.Errors == 0 {
+		t.Errorf("no errors recorded while muted: %+v", s)
 	}
 }
 
