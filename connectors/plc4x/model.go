@@ -375,7 +375,9 @@ type Capabilities struct {
 	Browse bool
 	// Server: this connector can be the protocol's server (Server mode).
 	Server bool
-	Note   string
+	// Discover: the driver finds devices on a network (Discover).
+	Discover bool
+	Note     string
 }
 
 // capabilities are the PLC4X drivers' abilities, as their connection
@@ -405,6 +407,7 @@ var capabilities = map[string]Capabilities{
 func CapabilitiesOf(protocol string) Capabilities {
 	c := capabilities[protocol]
 	c.Protocol = protocol
+	c.Discover = discovers(protocol)
 	return c
 }
 

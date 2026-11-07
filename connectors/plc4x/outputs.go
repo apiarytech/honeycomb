@@ -15,9 +15,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/apiarytech/honeycomb"
 
 	plc4go "github.com/apache/plc4x/plc4go/pkg/api"
 	apiModel "github.com/apache/plc4x/plc4go/pkg/api/model"
@@ -70,6 +73,7 @@ func (c *Connector) stopWatching() {
 			cs.link.stop()
 			cs.link = nil
 		}
+		cs.running.Store(false)
 	}
 }
 
@@ -219,4 +223,87 @@ func (c *Connector) write(ctx context.Context, plcConn plc4go.PlcConnection, cs 
 		return fmt.Errorf("device returned %s", code)
 	}
 	return nil
+}
+
+// safeWrite is one output's safe value (R-25), in the tag's own type.
+type safeWrite struct {
+	tag, address string
+	value        any
+}
+
+// safeTimeout bounds writing every safe value of one connection when the
+// connector stops: a device that does not answer does not hold up the stop.
+var safeTimeout = 3 * time.Second
+
+// resolveSafe reads the connection's safe values into each tag's own type:
+// a value of that type is taken as it is, JSON is decoded into it.
+func (c *Connector) resolveSafe(cs *connState) ([]safeWrite, error) {
+	var out []safeWrite
+	for _, b := range cs.Bindings {
+		if b.SafeValue == nil {
+			continue
+		}
+		current, err := c.db.GetTagValue(b.Tag)
+		if err != nil {
+			return nil, fmt.Errorf("plc4x: connection %q: safe value of %q: %w", cs.Name, b.Tag, err)
+		}
+		v, err := safeValueAs(reflect.TypeOf(honeycomb.Dereference(current)), b.SafeValue)
+		if err != nil {
+			return nil, fmt.Errorf("plc4x: connection %q: safe value of %q: %w", cs.Name, b.Tag, err)
+		}
+		out = append(out, safeWrite{tag: b.Tag, address: b.Address, value: v})
+	}
+	return out, nil
+}
+
+// safeValueAs is v as a value of type t.
+func safeValueAs(t reflect.Type, v any) (any, error) {
+	if t == nil {
+		return nil, errors.New("the tag has no value to take its type from")
+	}
+	var raw []byte
+	switch x := v.(type) {
+	case json.RawMessage:
+		raw = x
+	case []byte:
+		raw = x
+	default:
+		rv := reflect.ValueOf(v)
+		if rv.Type() == t {
+			return v, nil
+		}
+		if rv.Type().ConvertibleTo(t) && rv.Kind() != reflect.String && t.Kind() != reflect.String {
+			return rv.Convert(t).Interface(), nil
+		}
+		return nil, fmt.Errorf("%v is a %s, the tag a %s", v, rv.Type(), t)
+	}
+	if t != timeType && t.Kind() == reflect.Struct && t.ConvertibleTo(timeType) { // DT, DATE, TOD: an RFC 3339 time
+		var tm time.Time
+		if err := json.Unmarshal(raw, &tm); err != nil {
+			return nil, fmt.Errorf("%s is not a %s: %w", raw, t, err)
+		}
+		return reflect.ValueOf(tm).Convert(t).Interface(), nil
+	}
+	p := reflect.New(t)
+	if err := json.Unmarshal(raw, p.Interface()); err != nil {
+		return nil, fmt.Errorf("%s is not a %s: %w", raw, t, err)
+	}
+	return p.Elem().Interface(), nil
+}
+
+// writeSafe writes the connection's safe values, each once, within
+// safeTimeout. A failure is recorded and the others are still written.
+func (c *Connector) writeSafe(plcConn plc4go.PlcConnection, cs *connState) {
+	if !plcConn.IsConnected() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), safeTimeout)
+	defer cancel()
+	for _, w := range cs.safe {
+		if err := c.write(ctx, plcConn, cs, w.tag, w.address, w.value); err != nil {
+			c.record(cs.Name, nil, fmt.Errorf("safe value of '%s': %w", w.tag, err))
+			continue
+		}
+		c.record(cs.Name, func(s *Status) { s.LastWrite = time.Now(); s.Writes++ }, nil)
+	}
 }

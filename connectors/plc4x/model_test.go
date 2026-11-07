@@ -2,7 +2,9 @@ package plc4x
 
 import (
 	"context"
+	"encoding/json"
 	"math"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -327,5 +329,135 @@ func TestCapabilitiesCoverEveryProtocol(t *testing.T) {
 	}
 	if !slices.Contains(modeNames, "event") {
 		t.Error("no name for Event")
+	}
+}
+
+func TestSafeValuesAreWrittenWhenStopping(t *testing.T) {
+	server := startModbusServer(t)
+	db := honeycomb.NewTagDatabase()
+	addTag(t, db, "Valve", honeycomb.TypeINT, plc.INT(5))
+	addTag(t, db, "Pump", honeycomb.TypeINT, plc.INT(1))
+	addTag(t, db, "Free", honeycomb.TypeINT, plc.INT(8))
+	c, err := New(db, []Connection{{
+		Name: "sim", URL: "modbus-tcp://" + server.addr(), Interval: 50 * time.Millisecond,
+		Bindings: []Binding{
+			{Tag: "Valve", Address: "holding-register:7:INT", Direction: Output, SafeValue: json.RawMessage("0")},
+			{Tag: "Pump", Address: "holding-register:8:INT", Direction: InOut, SafeValue: plc.INT(-1)},
+			{Tag: "Free", Address: "holding-register:9:INT", Direction: Output},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	waitFor(t, func() bool { return server.get(6) == 5 && server.get(8) == 8 })
+	cancel()
+	<-done
+	if server.get(6) != 0 || int16(server.get(7)) != -1 {
+		t.Errorf("after stopping the device holds %d and %d, want the safe values 0 and -1", server.get(6), int16(server.get(7)))
+	}
+	if server.get(8) != 8 {
+		t.Errorf("an output without a safe value changed to %d", server.get(8))
+	}
+	if v := tagValue(db, "Valve"); v != plc.INT(5) {
+		t.Errorf("the tag became %v; it keeps its value", v)
+	}
+}
+
+func TestSafeValueChecks(t *testing.T) {
+	db := honeycomb.NewTagDatabase()
+	addTag(t, db, "Level", honeycomb.TypeINT, plc.INT(0))
+	if _, err := New(db, []Connection{{Name: "a", URL: "modbus-tcp://127.0.0.1:1",
+		Bindings: []Binding{{Tag: "Level", Address: "holding-register:1:INT", SafeValue: plc.INT(0)}}}}); err == nil {
+		t.Error("an input took a safe value")
+	}
+	if _, err := safeValueAs(reflect.TypeOf(plc.INT(0)), json.RawMessage(`"x"`)); err == nil {
+		t.Error(`"x" became an INT`)
+	}
+	if v, err := safeValueAs(reflect.TypeOf(plc.REAL(0)), 2); err != nil || v != plc.REAL(2) {
+		t.Errorf("2 as REAL = %v, %v", v, err)
+	}
+	if v, err := safeValueAs(reflect.TypeOf(plc.BOOL(false)), json.RawMessage("true")); err != nil || v != plc.BOOL(true) {
+		t.Errorf("true as BOOL = %v, %v", v, err)
+	}
+}
+
+func TestEnableAndDisableWhileRunning(t *testing.T) {
+	server := startModbusServer(t)
+	server.set(0, 7)
+	db := honeycomb.NewTagDatabase()
+	addTag(t, db, "Level", honeycomb.TypeINT, plc.INT(0))
+	addTag(t, db, "Valve", honeycomb.TypeINT, plc.INT(4))
+	c, err := New(db, []Connection{{
+		Name: "dev", URL: "modbus-tcp://" + server.addr(), Interval: 20 * time.Millisecond, Disabled: true,
+		Bindings: []Binding{{Tag: "Level", Address: "holding-register:1:INT"},
+			{Tag: "Valve", Address: "holding-register:2:INT", Direction: Output, SafeValue: plc.INT(0)}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runConnector(t, c)
+	waitFor(t, func() bool { s, _ := c.Status("dev"); return s.Disabled })
+
+	// Enabled while running: it connects, reads, and writes its outputs.
+	if err := c.SetEnabled("dev", true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return tagValue(db, "Level") == plc.INT(7) && server.get(1) == 4 })
+	if s, _ := c.Status("dev"); s.Disabled || !s.Override {
+		t.Errorf("enabled while running: status %+v, want enabled and overridden", s)
+	}
+
+	// Disabled again: the safe value is written, inputs go Bad.
+	if err := c.SetEnabled("dev", false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { s, _ := c.Status("dev"); return s.Disabled && !s.Connected })
+	if server.get(1) != 0 {
+		t.Errorf("disabling left the device %d, want its safe value 0", server.get(1))
+	}
+	if q, _ := db.GetTagQuality("Level"); q != honeycomb.QualityBad {
+		t.Errorf("input quality %v after disabling, want Bad", q)
+	}
+	if s, _ := c.Status("dev"); s.Override {
+		t.Error("back to its configuration, but still marked overridden")
+	}
+	if err := c.PollNow("dev"); err == nil {
+		t.Error("a disabled connection was polled")
+	}
+	if err := c.SetEnabled("nope", true); err == nil {
+		t.Error("an unknown connection was enabled")
+	}
+}
+
+func TestPollNowAndResetCounters(t *testing.T) {
+	server := startModbusServer(t)
+	server.set(0, 1)
+	db := honeycomb.NewTagDatabase()
+	addTag(t, db, "Level", honeycomb.TypeINT, plc.INT(0))
+	c, err := New(db, []Connection{{
+		Name: "slow", URL: "modbus-tcp://" + server.addr(), Interval: time.Hour,
+		Bindings: []Binding{{Tag: "Level", Address: "holding-register:1:INT"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runConnector(t, c)
+	waitFor(t, func() bool { return tagValue(db, "Level") == plc.INT(1) })
+	server.set(0, 2)
+	if err := c.PollNow("slow"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return tagValue(db, "Level") == plc.INT(2) })
+	if s, _ := c.Status("slow"); s.Reads < 2 {
+		t.Fatalf("reads %d after a poll now", s.Reads)
+	}
+	if err := c.ResetCounters("slow"); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := c.Status("slow"); s.Reads != 0 || s.Errors != 0 {
+		t.Errorf("after a reset: %+v", s)
 	}
 }
