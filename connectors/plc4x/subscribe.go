@@ -33,9 +33,12 @@ func (c *Connector) subscribe(ctx context.Context, plcConn plc4go.PlcConnection,
 		if !b.Direction.reads() {
 			continue
 		}
-		if cs.Mode == Cyclic {
+		switch cs.Mode {
+		case Cyclic:
 			builder.AddCyclicTagAddress(b.Tag, b.Address, cs.Interval)
-		} else {
+		case Event:
+			builder.AddEventTagAddress(b.Tag, b.Address)
+		default:
 			builder.AddChangeOfStateTagAddress(b.Tag, b.Address)
 		}
 		builder.AddPreRegisteredConsumer(b.Tag, consumer)

@@ -33,6 +33,8 @@ var diagnosticFields = []diagnosticField{
 	{"Errors", honeycomb.TypeULINT, func(s Status) any { return plc.ULINT(s.Errors) }},
 	{"LastError", honeycomb.TypeSTRING, func(s Status) any { return plc.STRING(errorText(s.LastError)) }},
 	{"LastRead", honeycomb.TypeDT, func(s Status) any { return plc.DT(s.LastRead) }},
+	{"Demoted", honeycomb.TypeBOOL, func(s Status) any { return plc.BOOL(s.Demoted) }},
+	{"Failures", honeycomb.TypeUDINT, func(s Status) any { return plc.UDINT(s.Failures) }},
 }
 
 func errorText(err error) string {

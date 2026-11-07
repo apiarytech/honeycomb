@@ -132,8 +132,28 @@ connection's `Status` as tags, created if missing:
 | `<prefix><name>.Errors`     | ULINT  | Errors of any kind. |
 | `<prefix><name>.LastError`  | STRING | Most recent error; empty after a clean read. |
 | `<prefix><name>.LastRead`   | DT     | Time of the last answered poll or event. |
+| `<prefix><name>.Demoted`    | BOOL   | The connection is demoted (`Demotion`). |
+| `<prefix><name>.Failures`   | UDINT  | Failed exchanges in a row, counted toward `Demotion.After`; 0 after a success. |
 
 Only fields that changed are written, so subscribers see real changes.
+
+## Channels, timing and scaling
+
+All optional; the zero value is the behaviour above.
+
+| Field | Effect |
+|-------|--------|
+| `Connection.Channel` + `WithChannels` / `Config.Channels` | Connections naming one channel share a transport (an RS-485 port with `serial.reuse-port=true`) and take turns: one request at a time, `InterDeviceDelay` before a request to another device than the last. A server is on no channel. |
+| `Connection.Mode = Event` | Inputs are PLC4X event subscriptions: the device reports when it has something to say. A driver that cannot subscribe is polled. |
+| `Connection.PollGroups`, `Binding.PollGroup` | Named rates: each group is one read request on its own ticker; other inputs are read every `Interval`. |
+| `ConnectTimeout`, `RequestTimeout`, `Attempts`, `InterRequestDelay` | Bounds and pauses per connection; `RequestTimeout` defaults to 10 s. |
+| `Demotion{After, Period, DiscardWrites}` | Every failed exchange adds one to `Status.Failures` (diagnostic tag `Failures`), a success sets it to 0; when it reaches `After` the connection pauses for `Period` (10 s): inputs Bad, `Status.Demoted`, diagnostic tag `Demoted`. `DiscardWrites` drops in-out changes made meanwhile. |
+| `Disabled` | No connection; inputs Bad; `Status.Disabled`. |
+| `Binding.Scaling` | Linear or square-root scaling with clamps and negate: reads scaled into the tag (the tag's numeric type), writes unscaled (a whole-number address gets the raw value rounded half to even). |
+
+`CapabilitiesOf(protocol)` says whether a driver subscribes, sends events,
+browses and has a server here; `Browse(ctx, url, query)` lists a device's
+addresses for the drivers that browse.
 
 ## Why a separate module
 
