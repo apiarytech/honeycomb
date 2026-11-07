@@ -33,6 +33,14 @@ package plc4x
 // answers writes only on a connection whose local address is not on one of
 // read-only-interfaces: a master there reads and nothing more. Every other
 // function gets exception 01.
+//
+// Modbus ASCII is served too, on a serial port like RTU: the same requests,
+// framed as ':' and hex characters, an LRC and CR LF (server_ascii.go):
+//
+//	modbus-ascii:serial:///dev/ttyAMA2?serial.baud-rate=9600&serial.data-bits=7&serial.parity=even&default-unit-identifier=1
+//
+// IEC 60870-5-104 (server_iec104.go) and S7 (server_s7.go) servers share
+// this file's URL handling, Status and write path.
 
 import (
 	"context"
@@ -107,7 +115,9 @@ func (p serverPoint) span() int {
 // server is a server connection: where it answers, its unit address and its
 // register map.
 type server struct {
+	proto    string // the URL's protocol
 	tcp      bool
+	ascii    bool // Modbus ASCII framing on the serial port
 	port     string // serial port
 	config   serialport.Config
 	listen   string   // TCP address, "0.0.0.0:502"
@@ -115,14 +125,19 @@ type server struct {
 	unit     uint8
 	points   map[int][]serverPoint // by area, sorted by start
 	mu       sync.Mutex            // one request at a time
+	iec      *iecServer            // an IEC 60870-5-104 server's points
+	s7       *s7Server             // an S7 server's areas
 }
 
 // IsServerURL says whether url is one a server connection can take: Modbus
-// RTU on a serial port, or Modbus TCP.
+// RTU or ASCII on a serial port, Modbus TCP, IEC 60870-5-104 or S7 over TCP:
+// the protocols whose Capabilities say Server.
 func IsServerURL(u string) bool {
-	p := ProtocolOf(u)
-	return p == "modbus-rtu" || p == "modbus-tcp"
+	return CapabilitiesOf(ProtocolOf(u)).Server
 }
+
+// serverPorts are the TCP servers' default ports.
+var serverPorts = map[string]string{"modbus-tcp": "502", "iec-60870-5-104": "2404", "s7": "102"}
 
 // newServer reads a server connection: its URL and its bindings.
 func newServer(conn Connection) (*server, error) {
@@ -132,8 +147,19 @@ func newServer(conn Connection) (*server, error) {
 	}
 	for _, b := range conn.Bindings {
 		if b.Direction != Output && b.Direction != InOut {
-			return nil, fmt.Errorf("plc4x: server %q: tag %q: a server's bindings are outputs (read only) or in-outs (the master may write)", conn.Name, b.Tag)
+			return nil, fmt.Errorf("plc4x: server %q: tag %q: a server's bindings are outputs (read only) or in-outs (the client may write)", conn.Name, b.Tag)
 		}
+	}
+	var err error
+	switch s.proto {
+	case "iec-60870-5-104":
+		s.iec, err = newIECServer(conn)
+		return s, err
+	case "s7":
+		s.s7, err = newS7Server(conn)
+		return s, err
+	}
+	for _, b := range conn.Bindings {
 		p, err := parseServerAddress(b.Address)
 		if err != nil {
 			return nil, fmt.Errorf("plc4x: server %q: tag %q: %w", conn.Name, b.Tag, err)
@@ -165,10 +191,11 @@ func newServer(conn Connection) (*server, error) {
 // address. A serial port's settings are those of PLC4X's serial transport.
 func (s *server) parseURL(raw string) error {
 	if !IsServerURL(raw) {
-		return fmt.Errorf("a server is Modbus RTU on a serial port (modbus-rtu:serial://...) or Modbus TCP (modbus-tcp://0.0.0.0:502), not %q", ProtocolOf(raw))
+		return fmt.Errorf("a server is Modbus RTU or ASCII on a serial port (modbus-rtu:serial://...), or Modbus TCP (modbus-tcp://0.0.0.0:502), IEC 60870-5-104 (iec-60870-5-104://0.0.0.0:2404) or S7 (s7://0.0.0.0:102), not %q", ProtocolOf(raw))
 	}
+	s.proto = ProtocolOf(raw)
 	var q url.Values
-	if ProtocolOf(raw) == "modbus-tcp" {
+	if def, ok := serverPorts[s.proto]; ok {
 		u, err := url.Parse(raw)
 		if err != nil {
 			return err
@@ -176,17 +203,17 @@ func (s *server) parseURL(raw string) error {
 		s.tcp = true
 		host, port := u.Hostname(), u.Port()
 		if port == "" {
-			port = "502"
+			port = def
 		}
 		s.listen = net.JoinHostPort(host, port)
 		q = u.Query()
-		for _, name := range strings.Split(q.Get("read-only-interfaces"), ",") {
-			if name = strings.TrimSpace(name); name != "" {
-				s.readOnly = append(s.readOnly, name)
-			}
+		s.readOnly = readOnlyInterfaces(q)
+		if s.proto != "modbus-tcp" {
+			return nil // the unit address is Modbus's
 		}
 	} else {
-		rest := strings.TrimPrefix(raw, "modbus-rtu:")
+		s.ascii = s.proto == "modbus-ascii"
+		rest := strings.TrimPrefix(raw, s.proto+":")
 		rest = strings.TrimPrefix(rest, "//") // "modbus-rtu://..." names the default transport, serial
 		if !strings.Contains(rest, "://") {
 			rest = "serial://" + rest
@@ -196,7 +223,7 @@ func (s *server) parseURL(raw string) error {
 			return err
 		}
 		if u.Scheme != "serial" {
-			return fmt.Errorf("a Modbus RTU server needs the serial transport, not %q", u.Scheme)
+			return fmt.Errorf("a Modbus RTU or ASCII server needs the serial transport, not %q", u.Scheme)
 		}
 		s.port = u.Host + u.Path
 		if s.port == "" {
@@ -676,11 +703,19 @@ func (c *Connector) runServer(ctx context.Context, cs *connState) {
 	backoff := minBackoff
 	for ctx.Err() == nil {
 		var err error
-		if cs.server.tcp {
+		switch {
+		case cs.server.iec != nil:
+			err = c.serveIEC(ctx, cs)
+		case cs.server.s7 != nil:
+			err = c.serveS7(ctx, cs)
+		case cs.server.tcp:
 			err = c.serveTCP(ctx, cs)
-		} else {
+		case cs.server.ascii:
+			err = c.serveASCII(ctx, cs)
+		default:
 			err = c.serve(ctx, cs)
 		}
+
 		if ctx.Err() != nil {
 			return
 		}
@@ -874,11 +909,43 @@ func (c *Connector) serveTCPConn(ctx context.Context, cs *connState, conn net.Co
 // writesFrom says whether a client that reached the server at local may
 // write: not when local is an address of a read-only interface.
 func (s *server) writesFrom(local net.Addr) bool {
+	return writesFromReadOnly(s.readOnly, local)
+}
+
+// readOnlyInterfaces reads the read-only-interfaces query parameter: the
+// interface names whose clients may read but not write.
+func readOnlyInterfaces(q url.Values) []string {
+	var out []string
+	for _, name := range strings.Split(q.Get("read-only-interfaces"), ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// parseServerTCPURL reads a TCP server's URL: its host, its port (defaultPort
+// when none is given) and its query parameters.
+func parseServerTCPURL(raw, defaultPort string) (*url.URL, string, string, url.Values, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, "", "", nil, err
+	}
+	port := u.Port()
+	if port == "" {
+		port = defaultPort
+	}
+	return u, u.Hostname(), port, u.Query(), nil
+}
+
+// writesFromReadOnly says whether a client that reached a TCP server at local
+// may write: not when local is an address of one of the read-only interfaces.
+func writesFromReadOnly(readOnly []string, local net.Addr) bool {
 	a, ok := local.(*net.TCPAddr)
 	if !ok {
 		return false
 	}
-	for _, name := range s.readOnly {
+	for _, name := range readOnly {
 		iface, err := net.InterfaceByName(name)
 		if err != nil {
 			continue
@@ -895,6 +962,7 @@ func (s *server) writesFrom(local net.Addr) bool {
 	}
 	return true
 }
+
 
 // rtuCRC is the Modbus RTU CRC, sent low byte first.
 func rtuCRC(b []byte) uint16 {
