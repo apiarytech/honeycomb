@@ -165,7 +165,7 @@ func TestServerConfig(t *testing.T) {
 	addTag(t, db, "A", honeycomb.TypeINT, plc.INT(0))
 	addTag(t, db, "B", honeycomb.TypeREAL, plc.REAL(0))
 	for want, conn := range map[string]Connection{
-		"or Modbus TCP":        {URL: "opcua:tcp://10.0.0.5", Bindings: []Binding{out("A", "holding-register:1")}}, // not a server protocol
+		"or Modbus TCP": {URL: "opcua:tcp://10.0.0.5", Bindings: []Binding{out("A", "holding-register:1")}}, // not a server protocol
 
 		"unit-identifier":      {URL: strings.Replace(serverURL, "unit-identifier=7", "unit-identifier=0", 1)},
 		"owns its port":        {URL: serverURL + "&serial.reuse-port=true"},

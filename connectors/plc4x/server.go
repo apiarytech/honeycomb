@@ -117,7 +117,7 @@ func (p serverPoint) span() int {
 type server struct {
 	proto    string // the URL's protocol
 	tcp      bool
-	ascii    bool // Modbus ASCII framing on the serial port
+	ascii    bool   // Modbus ASCII framing on the serial port
 	port     string // serial port
 	config   serialport.Config
 	listen   string   // TCP address, "0.0.0.0:502"
@@ -962,7 +962,6 @@ func writesFromReadOnly(readOnly []string, local net.Addr) bool {
 	}
 	return true
 }
-
 
 // rtuCRC is the Modbus RTU CRC, sent low byte first.
 func rtuCRC(b []byte) uint16 {
