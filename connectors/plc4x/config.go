@@ -42,6 +42,8 @@ import (
 type Config struct {
 	Diagnostics string
 	Connections []Connection
+	// Channels describe the shared transports connections name (WithChannels).
+	Channels []Channel
 }
 
 // LoadConfig reads a Config from a JSON file.
@@ -105,6 +107,9 @@ func NewFromConfig(db *honeycomb.TagDatabase, cfg Config, opts ...Option) (*Conn
 	if cfg.Diagnostics != "" {
 		opts = append([]Option{WithDiagnostics(cfg.Diagnostics)}, opts...)
 	}
+	if len(cfg.Channels) > 0 {
+		opts = append([]Option{WithChannels(cfg.Channels...)}, opts...)
+	}
 	return New(db, cfg.Connections, opts...)
 }
 
@@ -131,7 +136,7 @@ func (d *Direction) UnmarshalText(text []byte) error {
 	return fmt.Errorf("invalid direction %q (want input, output or inout)", text)
 }
 
-var modeNames = []string{Poll: "poll", ChangeOfState: "change-of-state", Cyclic: "cyclic", Server: "server"}
+var modeNames = []string{Poll: "poll", ChangeOfState: "change-of-state", Cyclic: "cyclic", Server: "server", Event: "event"}
 
 func (m Mode) String() string {
 	if int(m) < len(modeNames) {

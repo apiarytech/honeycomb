@@ -175,6 +175,7 @@ func (c *Connector) flushWrites(ctx context.Context, plcConn plc4go.PlcConnectio
 		cs.link.written(name, snap)
 		c.record(cs.Name, func(s *Status) {
 			s.LastWrite = time.Now()
+			s.ErrorSince = time.Time{}
 			s.Writes++
 		}, nil)
 	}
@@ -182,17 +183,34 @@ func (c *Connector) flushWrites(ctx context.Context, plcConn plc4go.PlcConnectio
 }
 
 func (c *Connector) write(ctx context.Context, plcConn plc4go.PlcConnection, cs *connState, name, address string, value any) error {
-	deviceValue, err := toDevice(value)
-	if err != nil {
-		return err
+	var deviceValue any
+	if sc := cs.byTag[name].Scaling; sc.Kind != NoScaling {
+		v, err := engineeringNumber(value)
+		if err != nil {
+			return err
+		}
+		deviceValue = rawForDevice(plcConn, name, address, sc.Unscale(v))
+	} else {
+		dv, err := toDevice(value)
+		if err != nil {
+			return err
+		}
+		deviceValue = dv
 	}
 	request, err := plcConn.WriteRequestBuilder().AddTagAddress(name, address, deviceValue).Build()
 	if err != nil {
 		return fmt.Errorf("build write request: %w", err)
 	}
-	result, err := execute(ctx, cs, request.Execute)
-	if err != nil {
-		return err
+	var result apiModel.PlcWriteRequestResult
+	for attempt := 1; ; attempt++ {
+		r, err := execute(ctx, cs, request.Execute)
+		if err != nil {
+			return err
+		}
+		result = r
+		if result.GetErr() == nil || attempt >= cs.tries() {
+			break
+		}
 	}
 	if err := result.GetErr(); err != nil {
 		return fmt.Errorf("write: %w", err)
