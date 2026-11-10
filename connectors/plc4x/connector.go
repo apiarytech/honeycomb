@@ -94,6 +94,12 @@ type Binding struct {
 	// tag itself keeps its value: outputs are written again on return (D-3).
 	// nil writes nothing.
 	SafeValue any
+	// StaleAfter, on an Input or InOut binding, marks frozen data (beehive
+	// R-4): a read that brings the same value as before, unchanged for at
+	// least this long, is stored with Uncertain quality instead of Good, so
+	// a stuck sensor or a device that repeats its last value shows. The
+	// next changed value is Good again. Zero: never.
+	StaleAfter time.Duration
 }
 
 // Connection describes one field device and the tags exchanged with it.
@@ -199,7 +205,13 @@ type connState struct {
 
 	lastMu  sync.Mutex
 	lastEnd time.Time // when the last request ended, for InterRequestDelay
+
+	staleMu sync.Mutex
+	changed map[string]time.Time // when a StaleAfter binding's value last changed
 }
+
+// now is the connector's clock; tests replace it.
+var now = time.Now
 
 // requestTimeout bounds one request to a device.
 var requestTimeout = 10 * time.Second
