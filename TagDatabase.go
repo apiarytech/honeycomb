@@ -107,6 +107,13 @@ type TypeInfo struct {
 	Max         interface{} // Max defines the maximum allowed value for subrange types.
 	MaxLength   int         // MaxLength specifies the maximum length for STRING/WSTRING types. A value of 0 means no limit.
 	Dimensions  []int       // Dimensions holds the sizes of each dimension for multi-dimensional arrays (e.g., [2, 3] for a 2x3 array).
+
+	// Display hints for HMIs and reports: they never change how the value
+	// is stored or converted. They travel with the type information, so a
+	// store keeps them without a column of their own.
+	Label    string `json:",omitempty"` // Label is the short text an HMI shows for the tag, e.g. "Tank 1 level".
+	EngUnit  string `json:",omitempty"` // EngUnit is the engineering unit, e.g. "m", "°C", "L/min".
+	Decimals *int   `json:",omitempty"` // Decimals is how many decimals an HMI shows; nil leaves it to the HMI.
 }
 
 // ForceInfo encapsulates the state related to forcing a tag's value.
