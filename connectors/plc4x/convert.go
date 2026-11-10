@@ -89,8 +89,16 @@ func (c *Connector) store(cs *connState, tagName string, value apiValues.PlcValu
 	if current == nil {
 		return fmt.Errorf("tag has no value to infer its type from")
 	}
-	converted, err := convert(reflect.TypeOf(current), value)
-	if err != nil {
+	var converted any
+	if sc := cs.byTag[tagName].Scaling; sc.Kind != NoScaling {
+		raw, err := rawNumber(value)
+		if err != nil {
+			return err
+		}
+		if converted, err = engineering(reflect.TypeOf(current), sc.Scale(raw)); err != nil {
+			return err
+		}
+	} else if converted, err = convert(reflect.TypeOf(current), value); err != nil {
 		return err
 	}
 	if cs.byTag[tagName].Direction == InOut && !cs.link.accept(tagName, converted) {

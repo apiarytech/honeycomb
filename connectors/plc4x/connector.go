@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,6 +65,10 @@ const (
 	// Server answers Modbus masters, on a serial port or over TCP, serving
 	// the bound tags (server.go, drone D-66).
 	Server
+	// Event subscribes to the inputs as events: the device sends them
+	// unsolicited, when it has something to report. A driver that cannot
+	// subscribe is polled instead, as in the other subscribing modes.
+	Event
 )
 
 // Binding maps a honeycomb tag to an address on a device.
@@ -76,6 +81,19 @@ type Binding struct {
 	Address string
 	// Direction defaults to Input.
 	Direction Direction
+	// Scaling converts between the raw device value and the tag's
+	// engineering value; the zero Scaling stores the raw value.
+	Scaling Scaling
+	// PollGroup names one of the connection's PollGroups; empty reads the
+	// binding every Interval.
+	PollGroup string
+	// SafeValue, on an Output or InOut binding, is written to the device
+	// when the connector stops (comm going offline or shutting down, R-25),
+	// so the device is left in a known state. It is the tag's own Go type,
+	// or JSON (json.RawMessage) decoded into that type when Run starts. The
+	// tag itself keeps its value: outputs are written again on return (D-3).
+	// nil writes nothing.
+	SafeValue any
 }
 
 // Connection describes one field device and the tags exchanged with it.
@@ -92,6 +110,28 @@ type Connection struct {
 	Mode Mode
 	// Bindings lists the tags exchanged with the device.
 	Bindings []Binding
+
+	// Description is for people.
+	Description string
+	// Disabled keeps the connection configured but stops the exchange:
+	// no connection is made, its inputs are Bad, its outputs not written.
+	Disabled bool
+	// Channel names the shared transport this device is on (WithChannels);
+	// connections on one channel take turns. Empty: a transport of its own.
+	Channel string
+	// ConnectTimeout bounds a connection attempt; 0 waits for the driver.
+	ConnectTimeout time.Duration
+	// RequestTimeout bounds one request; 0 is ten seconds.
+	RequestTimeout time.Duration
+	// Attempts is how often a request the device does not answer is sent
+	// before it counts as failed; 0 or 1 sends it once.
+	Attempts int
+	// InterRequestDelay is the least time between two requests to the device.
+	InterRequestDelay time.Duration
+	// Demotion takes a failing device out of the cycle for a while.
+	Demotion Demotion
+	// PollGroups are rates of their own for some inputs.
+	PollGroups []PollGroup
 }
 
 // Status reports the health of a connection.
@@ -104,6 +144,14 @@ type Status struct {
 	Reads      uint64    // successful polls and subscription events
 	Writes     uint64    // successful output writes
 	Errors     uint64    // errors of any kind
+
+	Disabled     bool      // the connection is configured but disabled, or disabled while running
+	Override     bool      // enabled or disabled while running, against its configuration (SetEnabled)
+	Demoted      bool      // out of the cycle until DemotedUntil (Demotion)
+	DemotedUntil time.Time // zero unless demoted
+	Demotions    uint64    // times demoted
+	ErrorSince   time.Time // start of the current run of errors; zero after a success
+	Failures     uint32    // successive failed exchanges now, counted toward Demotion.After; 0 after a success
 }
 
 // Connector exchanges values between field devices and a TagDatabase.
@@ -116,6 +164,10 @@ type Connector struct {
 	// connection (D-66): the connection, the tag, its new value, from where.
 	onServerWrite func(connection, tag string, value any, from string)
 	diagPrefix    string
+	channels      []Channel
+
+	runMu   sync.Mutex // Run's start and end, against SetEnabled preparing a connection
+	started bool
 
 	mu     sync.RWMutex
 	status map[string]Status
@@ -134,6 +186,19 @@ type connState struct {
 	// inflight counts requests a session stopped waiting for; the session
 	// closes its connection only once they are done (see execute).
 	inflight sync.WaitGroup
+
+	safe []safeWrite // resolved SafeValues, in binding order; set by Run
+
+	// enabled is whether the connection runs now: !Disabled until SetEnabled.
+	enabled  atomic.Bool
+	ctl      chan struct{} // wakes the supervisor when enabled changes
+	pollNow  chan struct{} // asks the session to read every input now (PollNow)
+	running  atomic.Bool   // Run prepared it: its link and safe values are set
+	turn     *turn         // the channel's, if the connection is on one
+	failures int           // successive failed exchanges, for Demotion (runConnection's goroutine)
+
+	lastMu  sync.Mutex
+	lastEnd time.Time // when the last request ended, for InterRequestDelay
 }
 
 // requestTimeout bounds one request to a device.
@@ -148,21 +213,38 @@ var requestTimeout = 10 * time.Second
 // share the port without a lock). So a session that ends stops waiting at
 // once, but the result is still collected in the background, and the session
 // closes its connection only after that (closeAfterRequests).
+//
+// A connection on a channel waits for its turn first, and holds it until
+// the result is in (or the request timeout and a margin have passed).
 func execute[T any](ctx context.Context, cs *connState, run func(context.Context) <-chan T) (T, error) {
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), requestTimeout)
+	var zero T
+	release, err := cs.acquire(ctx)
+	if err != nil {
+		return zero, err
+	}
+	timeout := cs.timeout()
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	results := run(rctx)
 	select {
 	case r := <-results:
 		cancel()
+		release()
 		return r, nil
 	case <-ctx.Done():
 		cs.inflight.Add(1)
 		go func() {
 			defer cs.inflight.Done()
 			defer cancel()
-			<-results
+			defer release()
+			select {
+			case <-results:
+			case <-time.After(timeout + time.Second):
+				// PLC4X never answered: give the channel back; the
+				// result is still collected for the connection's close.
+				release()
+				<-results
+			}
 		}()
-		var zero T
 		return zero, ctx.Err()
 	}
 }
@@ -175,7 +257,7 @@ func closeAfterRequests(cs *connState, plcConn plc4go.PlcConnection) {
 	go func() { cs.inflight.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(requestTimeout + time.Second):
+	case <-time.After(cs.timeout() + time.Second):
 	}
 	plcConn.Close()
 }
@@ -209,6 +291,13 @@ func WithDiagnostics(prefix string) Option {
 	return func(c *Connector) { c.diagPrefix = prefix }
 }
 
+// WithChannels describes the shared transports connections name in
+// Connection.Channel. A channel no option describes has no delay between
+// devices.
+func WithChannels(channels ...Channel) Option {
+	return func(c *Connector) { c.channels = append(c.channels, channels...) }
+}
+
 // New creates a Connector for the given devices.
 func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*Connector, error) {
 	c := &Connector{
@@ -220,6 +309,16 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 	}
 	for _, opt := range opts {
 		opt(c)
+	}
+	turns := make(map[string]*turn)
+	for _, ch := range c.channels {
+		if ch.Name == "" {
+			return nil, errors.New("plc4x: a channel needs a Name")
+		}
+		if _, dup := turns[ch.Name]; dup {
+			return nil, fmt.Errorf("plc4x: duplicate channel name %q", ch.Name)
+		}
+		turns[ch.Name] = newTurn(max(ch.InterDeviceDelay, 0))
 	}
 	seen := make(map[string]bool)
 	for i, conn := range connections {
@@ -233,10 +332,36 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 		if conn.Interval <= 0 {
 			conn.Interval = time.Second
 		}
-		if conn.Mode > Server {
+		if conn.Mode > Event {
 			return nil, fmt.Errorf("plc4x: connection %q: invalid mode %d", conn.Name, conn.Mode)
 		}
-		cs := &connState{Connection: conn, byTag: make(map[string]Binding)}
+		if conn.ConnectTimeout < 0 || conn.RequestTimeout < 0 || conn.InterRequestDelay < 0 || conn.Attempts < 0 ||
+			conn.Demotion.After < 0 || conn.Demotion.Period < 0 {
+			return nil, fmt.Errorf("plc4x: connection %q: timeouts, delays, attempts and demotion cannot be negative", conn.Name)
+		}
+		cs := &connState{Connection: conn, byTag: make(map[string]Binding), ctl: make(chan struct{}, 1), pollNow: make(chan struct{}, 1)}
+		cs.enabled.Store(!conn.Disabled)
+		if conn.Channel != "" {
+			if conn.Mode == Server {
+				return nil, fmt.Errorf("plc4x: connection %q: a server owns its transport and shares no channel", conn.Name)
+			}
+			t, ok := turns[conn.Channel]
+			if !ok {
+				t = newTurn(0)
+				turns[conn.Channel] = t
+			}
+			cs.turn = t
+		}
+		groups := make(map[string]bool)
+		for _, g := range conn.PollGroups {
+			if g.Name == "" || groups[g.Name] {
+				return nil, fmt.Errorf("plc4x: connection %q: poll group %q: empty or repeated name", conn.Name, g.Name)
+			}
+			if g.Interval <= 0 {
+				return nil, fmt.Errorf("plc4x: connection %q: poll group %q needs an interval", conn.Name, g.Name)
+			}
+			groups[g.Name] = true
+		}
 		if conn.Mode == Server {
 			s, err := newServer(conn)
 			if err != nil {
@@ -251,6 +376,18 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 			if b.Direction > InOut {
 				return nil, fmt.Errorf("plc4x: connection %q: tag %q: invalid direction %d", conn.Name, b.Tag, b.Direction)
 			}
+			if err := b.Scaling.check(); err != nil {
+				return nil, fmt.Errorf("plc4x: connection %q: tag %q: %w", conn.Name, b.Tag, err)
+			}
+			if conn.Mode == Server && (b.Scaling.Kind != NoScaling || b.PollGroup != "") {
+				return nil, fmt.Errorf("plc4x: connection %q: tag %q: a server's points have no scaling and no poll group", conn.Name, b.Tag)
+			}
+			if b.SafeValue != nil && (!b.Direction.writes() || conn.Mode == Server) {
+				return nil, fmt.Errorf("plc4x: connection %q: tag %q: only a client's Output and InOut points have a safe value", conn.Name, b.Tag)
+			}
+			if b.PollGroup != "" && !groups[b.PollGroup] {
+				return nil, fmt.Errorf("plc4x: connection %q: tag %q: no poll group %q", conn.Name, b.Tag, b.PollGroup)
+			}
 			// PLC4X keys requests and responses by tag name. A server may
 			// serve one tag at two addresses: it makes no requests.
 			if _, dup := cs.byTag[b.Tag]; dup && conn.Mode != Server {
@@ -264,11 +401,19 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 	if c.manager == nil {
 		// Only the drivers the connections use: a device reaches no other
 		// protocol's code.
+		// A disabled connection's driver too, so it can be enabled while
+		// running (SetEnabled), when PLC4X knows its protocol.
 		var clients []Connection // a server needs no driver: it answers, it does not connect
 		for _, conn := range connections {
-			if conn.Mode != Server {
-				clients = append(clients, conn)
+			if conn.Mode == Server {
+				continue
 			}
+			if conn.Disabled {
+				if _, known := protocols()[strings.ToLower(ProtocolOf(conn.URL))]; !known {
+					continue
+				}
+			}
+			clients = append(clients, conn)
 		}
 		m, err := NewDriverManagerFor(Protocols(clients)...)
 		if err != nil {
@@ -295,32 +440,173 @@ func (c *Connector) Status(name string) (Status, bool) {
 // the others continue. Run returns early only if an output tag cannot be watched.
 func (c *Connector) Run(ctx context.Context) error {
 	for _, cs := range c.connections {
-		if cs.server != nil {
-			continue // a server reads its tags at each request
+		if !cs.enabled.Load() {
+			continue // prepared when it is enabled (SetEnabled)
 		}
-		l, err := c.watchOutputs(cs)
-		if err != nil {
+		if err := c.prepare(cs); err != nil {
 			c.stopWatching()
 			return err
 		}
-		cs.link = l
 	}
-	defer c.stopWatching()
+	c.runMu.Lock()
+	c.started = true
+	c.runMu.Unlock()
+	defer func() {
+		c.runMu.Lock()
+		c.started = false
+		c.stopWatching()
+		c.runMu.Unlock()
+	}()
 
 	var wg sync.WaitGroup
 	for _, cs := range c.connections {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if cs.server != nil {
-				c.runServer(ctx, cs)
-				return
-			}
-			c.runConnection(ctx, cs)
+			c.supervise(ctx, cs)
 		}()
 	}
 	wg.Wait()
 	return ctx.Err()
+}
+
+// prepare watches a client connection's outputs and reads its safe values.
+// A server reads its tags at each request.
+func (c *Connector) prepare(cs *connState) error {
+	if cs.server == nil && cs.link == nil {
+		safe, err := c.resolveSafe(cs)
+		if err != nil {
+			return err
+		}
+		l, err := c.watchOutputs(cs)
+		if err != nil {
+			return err
+		}
+		cs.safe, cs.link = safe, l
+	}
+	cs.running.Store(true)
+	return nil
+}
+
+// supervise runs a connection while it is enabled and holds it while it is
+// disabled, until ctx ends. Disabling ends its session as stopping does: its
+// safe values are written (R-25).
+func (c *Connector) supervise(ctx context.Context, cs *connState) {
+	for ctx.Err() == nil {
+		if !cs.enabled.Load() {
+			c.setInputQuality(cs, honeycomb.QualityBad)
+			c.record(cs.Name, func(s *Status) {
+				s.Disabled, s.Connected, s.Subscribed, s.Demoted, s.DemotedUntil = true, false, false, false, time.Time{}
+			}, nil)
+			select {
+			case <-ctx.Done():
+				return
+			case <-cs.ctl:
+				continue
+			}
+		}
+		c.record(cs.Name, func(s *Status) { s.Disabled = false }, nil)
+		run, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if cs.server != nil {
+				c.runServer(run, cs)
+			} else {
+				c.runConnection(run, cs)
+			}
+		}()
+	held:
+		for {
+			select {
+			case <-ctx.Done():
+				cancel()
+				<-done
+				return
+			case <-done:
+				cancel()
+				break held // runConnection returns after a demotion's period too: it runs again
+			case <-cs.ctl:
+				if !cs.enabled.Load() {
+					cancel()
+					<-done
+					break held
+				}
+			}
+		}
+	}
+}
+
+// connection is the named connection's state.
+func (c *Connector) connection(name string) (*connState, error) {
+	for _, cs := range c.connections {
+		if cs.Name == name {
+			return cs, nil
+		}
+	}
+	return nil, fmt.Errorf("plc4x: no connection %q", name)
+}
+
+// SetEnabled enables or disables a connection while the connector runs
+// (beehive R-135), without changing its configuration: a new Connector
+// starts from Connection.Disabled again. Disabling ends its session, writing
+// its safe values, and makes its inputs Bad; enabling connects it, and its
+// outputs are written as after every reconnect.
+func (c *Connector) SetEnabled(name string, enabled bool) error {
+	cs, err := c.connection(name)
+	if err != nil {
+		return err
+	}
+	if enabled && cs.server == nil {
+		if _, known := protocols()[strings.ToLower(ProtocolOf(cs.URL))]; !known {
+			return fmt.Errorf("plc4x: connection %q: unknown protocol %q", name, ProtocolOf(cs.URL))
+		}
+	}
+	c.runMu.Lock()
+	if enabled && c.started && !cs.running.Load() {
+		if err := c.prepare(cs); err != nil {
+			c.runMu.Unlock()
+			return fmt.Errorf("plc4x: connection %q: %w", name, err)
+		}
+	}
+	cs.enabled.Store(enabled)
+	c.runMu.Unlock()
+	c.record(name, func(s *Status) { s.Override, s.Disabled = enabled == cs.Disabled, !enabled }, nil) // writes are refused from now
+	select {
+	case cs.ctl <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// PollNow reads every input of a polled connection now, besides its
+// intervals. It returns at once; the values arrive as with any poll.
+func (c *Connector) PollNow(name string) error {
+	cs, err := c.connection(name)
+	if err != nil {
+		return err
+	}
+	switch {
+	case cs.server != nil:
+		return fmt.Errorf("plc4x: connection %q is a server: it answers, it does not poll", name)
+	case !cs.enabled.Load():
+		return fmt.Errorf("plc4x: connection %q is disabled", name)
+	}
+	select {
+	case cs.pollNow <- struct{}{}:
+	default: // already asked
+	}
+	return nil
+}
+
+// ResetCounters sets a connection's reads, writes, errors and demotions
+// back to 0.
+func (c *Connector) ResetCounters(name string) error {
+	if _, err := c.connection(name); err != nil {
+		return err
+	}
+	c.record(name, func(s *Status) { s.Reads, s.Writes, s.Errors, s.Demotions = 0, 0, 0, 0 }, nil)
+	return nil
 }
 
 const (
@@ -344,6 +630,11 @@ func (c *Connector) runConnection(ctx context.Context, cs *connState) {
 		}
 		c.setInputQuality(cs, honeycomb.QualityBad)
 		c.record(cs.Name, func(s *Status) { s.Connected, s.Subscribed = false, false }, err)
+		if cs.demoteDue() {
+			c.demote(ctx, cs)
+			backoff = minBackoff
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -353,15 +644,50 @@ func (c *Connector) runConnection(ctx context.Context, cs *connState) {
 	}
 }
 
+// demote keeps a failing connection out of the cycle for its demotion
+// period. With DiscardWrites, in-out changes made meanwhile are dropped.
+func (c *Connector) demote(ctx context.Context, cs *connState) {
+	until := time.Now().Add(cs.demotionPeriod())
+	c.record(cs.Name, func(s *Status) {
+		s.Demoted, s.DemotedUntil = true, until
+		s.Demotions++
+	}, nil)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Until(until)):
+	}
+	if cs.Demotion.DiscardWrites && cs.link != nil {
+		cs.link.takePending()
+	}
+	cs.failures = 0
+	c.record(cs.Name, func(s *Status) { s.Demoted, s.DemotedUntil, s.Failures = false, time.Time{}, 0 }, nil)
+}
+
+// readGroup is the inputs read at one rate: the connection's interval, or a
+// poll group's.
+type readGroup struct {
+	name     string // "" for the connection's interval
+	interval time.Duration
+	request  apiModel.PlcReadRequest
+}
+
 // session connects once and exchanges values until the connection fails or ctx ends.
 func (c *Connector) session(ctx context.Context, cs *connState) error {
-	plcConn, err := c.manager.GetConnection(ctx, cs.URL)
+	plcConn, err := c.connect(ctx, cs)
 	if err != nil {
+		c.countFailure(cs)
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer closeAfterRequests(cs, plcConn)
+	// Stopping leaves the device its safe values (R-25), before the
+	// connection closes (defers run last in, first out).
+	defer func() {
+		if ctx.Err() != nil && len(cs.safe) > 0 {
+			c.writeSafe(plcConn, cs)
+		}
+	}()
 
-	var read apiModel.PlcReadRequest
+	var reads []*readGroup
 	subscribed := false
 	if cs.hasInputs {
 		// Asking a driver that cannot subscribe for a subscription builder panics.
@@ -377,14 +703,8 @@ func (c *Connector) session(ctx context.Context, cs *connState) error {
 			if cs.Mode != Poll {
 				c.record(cs.Name, nil, fmt.Errorf("driver cannot subscribe; polling every %s instead", cs.Interval))
 			}
-			builder := plcConn.ReadRequestBuilder()
-			for _, b := range cs.Bindings {
-				if b.Direction.reads() {
-					builder.AddTagAddress(b.Tag, b.Address)
-				}
-			}
-			if read, err = builder.Build(); err != nil {
-				return fmt.Errorf("build read request: %w", err)
+			if reads, err = buildReads(plcConn, cs); err != nil {
+				return err
 			}
 		}
 	}
@@ -394,12 +714,20 @@ func (c *Connector) session(ctx context.Context, cs *connState) error {
 	// failing is when reads or writes started failing without a break; zero
 	// while they succeed.
 	var failing time.Time
+	succeeded := func() {
+		failing = time.Time{}
+		c.clearFailures(cs)
+	}
 	// failed records err and keeps the session, unless the connection is
-	// lost or nothing has succeeded for lostAfter: then the session ends and
-	// runConnection connects again.
+	// lost, nothing has succeeded for lostAfter, or the connection is to be
+	// demoted: then the session ends and runConnection connects again.
 	failed := func(err error) error {
+		c.countFailure(cs)
 		if !plcConn.IsConnected() {
 			return err
+		}
+		if cs.demoteDue() {
+			return fmt.Errorf("%w: %w", errDemoted, err)
 		}
 		c.record(cs.Name, nil, err) // The device did not answer; keep the session for now.
 		if failing.IsZero() {
@@ -410,35 +738,66 @@ func (c *Connector) session(ctx context.Context, cs *connState) error {
 		return nil
 	}
 
-	// cycle writes changed outputs and, when due, reads the inputs. It returns an
-	// error only when the connection is lost; other errors are recorded.
-	cycle := func(due bool) error {
+	// cycle writes changed outputs and reads the inputs that are due. It
+	// returns an error only when the session is to end; other errors are
+	// recorded.
+	cycle := func(due []*readGroup) error {
 		if err := c.flushWrites(ctx, plcConn, cs); err != nil {
 			if err := failed(err); err != nil {
 				return err
 			}
-		} else if read == nil {
-			failing = time.Time{}
+		} else if len(reads) == 0 {
+			succeeded()
 		}
-		switch {
-		case !due:
-		case read != nil:
-			if err := c.poll(ctx, cs, read); err != nil {
+		for _, g := range due {
+			if err := c.poll(ctx, cs, g.request); err != nil {
 				if err := failed(err); err != nil {
 					return err
 				}
 			} else {
-				failing = time.Time{}
+				succeeded()
 			}
-		case !plcConn.IsConnected():
+		}
+		if len(reads) == 0 && due != nil && !plcConn.IsConnected() {
 			return errors.New("connection lost")
 		}
 		return nil
 	}
 
-	ticker := time.NewTicker(cs.Interval)
-	defer ticker.Stop()
-	if err := cycle(true); err != nil {
+	// One ticker per rate; the connection's own also checks a subscribed or
+	// output-only connection.
+	main := &readGroup{interval: cs.Interval}
+	tickers := []*readGroup{main}
+	for _, g := range reads {
+		if g.name == "" {
+			main.request = g.request
+		} else {
+			tickers = append(tickers, g)
+		}
+	}
+	dueCh := make(chan *readGroup, len(tickers))
+	for _, g := range tickers {
+		t := time.NewTicker(g.interval)
+		defer t.Stop()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					select {
+					case dueCh <- g:
+					default: // still due from the last tick
+					}
+				}
+			}
+		}()
+	}
+	all := reads
+	if all == nil {
+		all = []*readGroup{}
+	}
+	if err := cycle(all); err != nil {
 		return err
 	}
 	for {
@@ -447,9 +806,15 @@ func (c *Connector) session(ctx context.Context, cs *connState) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-cs.link.wake:
-			err = cycle(false)
-		case <-ticker.C:
-			err = cycle(true)
+			err = cycle(nil)
+		case <-cs.pollNow:
+			err = cycle(all)
+		case g := <-dueCh:
+			if g.request != nil {
+				err = cycle([]*readGroup{g})
+			} else {
+				err = cycle([]*readGroup{})
+			}
 		}
 		if err != nil {
 			return err
@@ -457,17 +822,58 @@ func (c *Connector) session(ctx context.Context, cs *connState) error {
 	}
 }
 
+// buildReads builds one read request per rate: the inputs without a poll
+// group, and each poll group's.
+func buildReads(plcConn plc4go.PlcConnection, cs *connState) ([]*readGroup, error) {
+	builders := map[string]apiModel.PlcReadRequestBuilder{}
+	order := []string{}
+	for _, b := range cs.Bindings {
+		if !b.Direction.reads() {
+			continue
+		}
+		bld, ok := builders[b.PollGroup]
+		if !ok {
+			bld = plcConn.ReadRequestBuilder()
+			builders[b.PollGroup] = bld
+			order = append(order, b.PollGroup)
+		}
+		bld.AddTagAddress(b.Tag, b.Address)
+	}
+	interval := map[string]time.Duration{"": cs.Interval}
+	for _, g := range cs.PollGroups {
+		interval[g.Name] = g.Interval
+	}
+	var out []*readGroup
+	for _, name := range order {
+		req, err := builders[name].Build()
+		if err != nil {
+			return nil, fmt.Errorf("build read request: %w", err)
+		}
+		out = append(out, &readGroup{name: name, interval: interval[name], request: req})
+	}
+	return out, nil
+}
+
 // poll executes one read and writes every successfully read value to its tag.
 // A response counts as a read even if some tags failed; those failures are
 // recorded with it. The returned error means the read itself failed.
 func (c *Connector) poll(ctx context.Context, cs *connState, request apiModel.PlcReadRequest) error {
-	result, err := execute(ctx, cs, request.Execute)
-	if err != nil {
-		return err
+	var result apiModel.PlcReadRequestResult
+	for attempt := 1; ; attempt++ {
+		r, err := execute(ctx, cs, request.Execute)
+		if err != nil {
+			return err
+		}
+		result = r
+		if result.GetErr() == nil || attempt >= cs.tries() {
+			break
+		}
 	}
 	if err := result.GetErr(); err != nil {
 		// The device did not answer; the values held may be stale.
-		c.setInputQuality(cs, honeycomb.QualityUncertain)
+		for _, name := range request.GetTagNames() {
+			_ = c.db.SetTagQuality(name, honeycomb.QualityUncertain)
+		}
 		return fmt.Errorf("read: %w", err)
 	}
 
@@ -515,6 +921,9 @@ func (c *Connector) record(name string, update func(*Status), err error) {
 	if err != nil {
 		s.LastError = err
 		s.Errors++
+		if s.ErrorSince.IsZero() {
+			s.ErrorSince = time.Now()
+		}
 	}
 	c.status[name] = s
 	c.mu.Unlock()
@@ -524,10 +933,36 @@ func (c *Connector) record(name string, update func(*Status), err error) {
 	}
 }
 
+// countFailure counts one more failed exchange of cs toward its demotion,
+// in cs and in its status. The diagnostic tags show it with the error that
+// follows.
+func (c *Connector) countFailure(cs *connState) {
+	cs.failures++
+	c.mu.Lock()
+	s := c.status[cs.Name]
+	s.Failures = uint32(cs.failures)
+	c.status[cs.Name] = s
+	c.mu.Unlock()
+}
+
+// clearFailures restarts cs's count of failed exchanges after a success.
+func (c *Connector) clearFailures(cs *connState) {
+	if cs.failures == 0 {
+		return
+	}
+	cs.failures = 0
+	c.mu.Lock()
+	s := c.status[cs.Name]
+	s.Failures = 0
+	c.status[cs.Name] = s
+	c.mu.Unlock()
+}
+
 // recordRead records a successful poll or subscription event.
 func (c *Connector) recordRead(name string, err error) {
 	c.record(name, func(s *Status) {
 		s.LastError = nil
+		s.ErrorSince = time.Time{}
 		s.LastRead = time.Now()
 		s.Reads++
 	}, err)
