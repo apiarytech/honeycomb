@@ -266,6 +266,7 @@ All optional; the zero value is the behaviour above.
 | `Connection.PollGroups`, `Binding.PollGroup` | Named rates: each group is one read request on its own ticker; other inputs are read every `Interval`. |
 | `ConnectTimeout`, `RequestTimeout`, `Attempts`, `InterRequestDelay` | Bounds and pauses per connection; `RequestTimeout` defaults to 10 s. |
 | `Demotion{After, Period, DiscardWrites}` | Every failed exchange adds one to `Status.Failures` (diagnostic tag `Failures`), a success sets it to 0; when it reaches `After` the connection pauses for `Period` (10 s): inputs Bad, `Status.Demoted`, diagnostic tag `Demoted`. `DiscardWrites` drops in-out changes made meanwhile. |
+| `Standby{URL, After, ReturnEvery}` | A second path to the same device (R-136): another address, a redundant network, a gateway; same protocol. After `After` (3) attempts in a row fail on one path, the connection takes the other; on the standby it tries the first every `ReturnEvery` (a minute) and goes back once it answers. A switch never writes safe values. `Status.OnStandby`, `Status.PathSwitches`. Not for servers. JSON: `"standby": {"url": ..., "after": 3, "returnEvery": "1m"}`. |
 | `Disabled` | No connection; inputs Bad; `Status.Disabled`. |
 | `Binding.Scaling` | Linear or square-root scaling with clamps and negate: reads scaled into the tag (the tag's numeric type), writes unscaled (a whole-number address gets the raw value rounded half to even). |
 

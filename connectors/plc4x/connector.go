@@ -138,6 +138,38 @@ type Connection struct {
 	Demotion Demotion
 	// PollGroups are rates of their own for some inputs.
 	PollGroups []PollGroup
+	// Standby is a second path to the same device (R-136), used while the
+	// first fails; empty: none.
+	Standby Standby
+}
+
+// Standby is a second path to a connection's device (R-136): another
+// address of the same device, a redundant network, a gateway. After After
+// failed attempts on one path the connection takes the other; while on
+// the standby it tries the first every ReturnEvery and goes back once it
+// answers. Switching paths never writes the outputs' safe values.
+type Standby struct {
+	// URL is the standby's connection string; empty: no standby.
+	URL string
+	// After is how many attempts in a row fail before switching: 0 is 3.
+	After int
+	// ReturnEvery is how often the first path is tried while on the
+	// standby: 0 is a minute.
+	ReturnEvery time.Duration
+}
+
+func (s Standby) after() int {
+	if s.After > 0 {
+		return s.After
+	}
+	return 3
+}
+
+func (s Standby) returnEvery() time.Duration {
+	if s.ReturnEvery > 0 {
+		return s.ReturnEvery
+	}
+	return time.Minute
 }
 
 // Status reports the health of a connection.
@@ -158,6 +190,11 @@ type Status struct {
 	Demotions    uint64    // times demoted
 	ErrorSince   time.Time // start of the current run of errors; zero after a success
 	Failures     uint32    // successive failed exchanges now, counted toward Demotion.After; 0 after a success
+
+	// OnStandby: the connection uses its standby path (R-136).
+	OnStandby bool
+	// PathSwitches counts the switches between its paths.
+	PathSwitches uint64
 }
 
 // Connector exchanges values between field devices and a TagDatabase.
@@ -212,12 +249,24 @@ type connState struct {
 	// dialURL is the URL PLC4X dials when it is not URL: an IEC
 	// 60870-5-104 client over TLS dials its tunnel (iec62351.go).
 	dialURL atomic.Pointer[string]
+
+	// onStandby: the connection uses Standby.URL (R-136); pathFailures
+	// counts the sessions that failed in a row on the path in use;
+	// switching ends a session to change path, without safe values.
+	onStandby    atomic.Bool
+	pathFailures int
+	switching    atomic.Bool
+	// exchanged: the session read or wrote something.
+	exchanged atomic.Bool
 }
 
 // plc4xURL is the URL PLC4X connects to.
 func (cs *connState) plc4xURL() string {
 	if u := cs.dialURL.Load(); u != nil {
 		return *u
+	}
+	if cs.onStandby.Load() {
+		return cs.Standby.URL
 	}
 	return cs.URL
 }
@@ -365,6 +414,16 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 		}
 		cs := &connState{Connection: conn, byTag: make(map[string]Binding), ctl: make(chan struct{}, 1), pollNow: make(chan struct{}, 1)}
 		cs.enabled.Store(!conn.Disabled)
+		if conn.Standby.URL != "" {
+			switch {
+			case conn.Mode == Server:
+				return nil, fmt.Errorf("plc4x: connection %q: a server has no standby path", conn.Name)
+			case conn.Standby.After < 0 || conn.Standby.ReturnEvery < 0:
+				return nil, fmt.Errorf("plc4x: connection %q: standby: after and return-every cannot be negative", conn.Name)
+			case ProtocolOf(conn.Standby.URL) != ProtocolOf(conn.URL):
+				return nil, fmt.Errorf("plc4x: connection %q: the standby path speaks %s, the first %s: one device, one protocol", conn.Name, ProtocolOf(conn.Standby.URL), ProtocolOf(conn.URL))
+			}
+		}
 		if conn.Channel != "" {
 			if conn.Mode == Server {
 				return nil, fmt.Errorf("plc4x: connection %q: a server owns its transport and shares no channel", conn.Name)
@@ -658,12 +717,28 @@ var lostAfter = 5 * time.Second
 func (c *Connector) runConnection(ctx context.Context, cs *connState) {
 	backoff := minBackoff
 	for ctx.Err() == nil {
-		err := c.session(ctx, cs)
+		err, back := c.pathSession(ctx, cs)
 		if ctx.Err() != nil {
 			return
 		}
+		if back {
+			// The first path answers again: the standby's session was ended
+			// to go back to it.
+			c.switchPath(cs, false, nil)
+			backoff = minBackoff
+			continue
+		}
 		c.setInputQuality(cs, honeycomb.QualityBad)
 		c.record(cs.Name, func(s *Status) { s.Connected, s.Subscribed = false, false }, err)
+		if cs.Standby.URL != "" {
+			cs.pathFailures++
+			if cs.pathFailures >= cs.Standby.after() {
+				// The path in use fails: take the other.
+				c.switchPath(cs, !cs.onStandby.Load(), err)
+				backoff = minBackoff
+				continue
+			}
+		}
 		if cs.demoteDue() {
 			c.demote(ctx, cs)
 			backoff = minBackoff
@@ -716,7 +791,7 @@ func (c *Connector) session(ctx context.Context, cs *connState) error {
 	// Stopping leaves the device its safe values (R-25), before the
 	// connection closes (defers run last in, first out).
 	defer func() {
-		if ctx.Err() != nil && len(cs.safe) > 0 {
+		if ctx.Err() != nil && !cs.switching.Load() && len(cs.safe) > 0 {
 			c.writeSafe(plcConn, cs)
 		}
 	}()
@@ -750,6 +825,7 @@ func (c *Connector) session(ctx context.Context, cs *connState) error {
 	var failing time.Time
 	succeeded := func() {
 		failing = time.Time{}
+		cs.exchanged.Store(true)
 		c.clearFailures(cs)
 	}
 	// failed records err and keeps the session, unless the connection is
@@ -1000,4 +1076,80 @@ func (c *Connector) recordRead(name string, err error) {
 		s.LastRead = time.Now()
 		s.Reads++
 	}, err)
+}
+
+// pathSession runs a session on the path in use. On the standby path it
+// tries the first path every Standby.ReturnEvery, and ends the session
+// when it answers: back is then true.
+func (c *Connector) pathSession(ctx context.Context, cs *connState) (err error, back bool) {
+	cs.exchanged.Store(false)
+	if !cs.onStandby.Load() {
+		err = c.session(ctx, cs)
+		if cs.exchanged.Load() {
+			cs.pathFailures = 0 // it worked: this failure is the first
+		}
+		return err, false
+	}
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var returned atomic.Bool
+	go func() {
+		t := time.NewTicker(cs.Standby.returnEvery())
+		defer t.Stop()
+		for {
+			select {
+			case <-sctx.Done():
+				return
+			case <-t.C:
+			}
+			if c.firstPathAnswers(sctx, cs) {
+				returned.Store(true)
+				cs.switching.Store(true)
+				cancel()
+				return
+			}
+		}
+	}()
+	err = c.session(sctx, cs)
+	cs.switching.Store(false)
+	if returned.Load() && ctx.Err() == nil {
+		return nil, true
+	}
+	if cs.exchanged.Load() {
+		cs.pathFailures = 0 // it worked: this failure is the first
+	}
+	return err, false
+}
+
+// firstPathAnswers tries a connection on the first path, and closes it.
+func (c *Connector) firstPathAnswers(ctx context.Context, cs *connState) bool {
+	tctx := ctx
+	if cs.ConnectTimeout > 0 {
+		var cancel context.CancelFunc
+		tctx, cancel = context.WithTimeout(ctx, cs.ConnectTimeout)
+		defer cancel()
+	}
+	conn, err := c.manager.GetConnection(tctx, cs.URL)
+	if err != nil || conn == nil {
+		return false
+	}
+	ok := conn.IsConnected()
+	conn.Close()
+	return ok
+}
+
+// switchPath moves a connection to its standby path, or back to its first.
+func (c *Connector) switchPath(cs *connState, standby bool, cause error) {
+	cs.onStandby.Store(standby)
+	cs.pathFailures = 0
+	var note error
+	if standby {
+		note = fmt.Errorf("the first path fails (%v): on the standby path %s", cause, cs.Standby.URL)
+	} else if cause != nil {
+		note = fmt.Errorf("the standby path fails (%v): back on the first path", cause)
+	}
+	c.record(cs.Name, func(s *Status) {
+		s.OnStandby = standby
+		s.PathSwitches++
+	}, note)
 }
