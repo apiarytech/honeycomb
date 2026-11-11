@@ -391,6 +391,7 @@ var capabilities = map[string]Capabilities{
 	"eip":             {},
 	"firmata":         {Subscribe: true, Events: true},
 	"iec-60870-5-104": {Subscribe: true, Events: true, Server: true, Note: "server: an IEC 60870-5-104 outstation over TCP (general interrogation, spontaneous transmission, commands)"},
+	"dnp3":            {Server: true, Note: "server only: a DNP3 outstation over TCP, the connector's own code (class 0 and event polls, controls); no client yet"},
 	"knxnet-ip":       {Subscribe: true, Events: true, Browse: true},
 	"logix":           {},
 	"modbus-ascii":    {Server: true, Note: "server: a Modbus ASCII slave on a serial port"},

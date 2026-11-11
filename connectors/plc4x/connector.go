@@ -387,7 +387,7 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 			groups[g.Name] = true
 		}
 		if conn.Mode == Server {
-			s, err := newServer(conn)
+			s, err := newServer(c, conn)
 			if err != nil {
 				return nil, err
 			}
