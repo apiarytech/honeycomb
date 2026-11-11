@@ -247,6 +247,17 @@ exception both mean a device is there, a gateway's exception 0x0B (no
 response from the target) does not. The scan opens the port itself, so no
 connection may use it meanwhile.
 
+## Traffic view
+
+`New(..., WithTraffic())` (R-137) lets a connection's bytes be recorded
+for commissioning: `SetTraffic(name, true)` starts a ring of its own (2000
+frames), `Traffic(name, since)` reads the frames sent to the device and
+received from it with their times, `SetTraffic(name, false)` stops and
+drops it. It wraps PLC4X's TCP and serial transports, registered before
+the drivers' own; without `WithTraffic` they are PLC4X's, untouched.
+Nothing recorded goes to a log. A driver on another transport (UDP, a
+driver's own) records nothing.
+
 ## Diagnostic tags
 
 `WithDiagnostics(prefix)` (or `"diagnostics"` in the config file) publishes each

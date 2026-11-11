@@ -217,6 +217,8 @@ type Connector struct {
 
 	diagMu    sync.Mutex
 	published map[string]Status // last Status written to the diagnostic tags
+
+	traffic *trafficHub // WithTraffic (R-137); nil records none
 }
 
 // connState is a Connection with its bindings indexed.
@@ -498,8 +500,11 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 			}
 			clients = append(clients, conn)
 		}
-		m, err := NewDriverManagerFor(Protocols(clients)...)
-		if err != nil {
+		m := plc4go.NewPlcDriverManager()
+		if c.traffic != nil {
+			c.traffic.registerTracing(m) // before the drivers' own transports
+		}
+		if err := registerDrivers(m, Protocols(clients)...); err != nil {
 			return nil, err
 		}
 		c.manager = m
