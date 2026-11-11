@@ -125,6 +125,9 @@ type iecServer struct {
 	// timeTags: spontaneous changes carry the tag's source time as
 	// CP56Time2a (beehive R-141); interrogated data never does.
 	timeTags bool
+	// log keeps changes for the controlling station (buffer=N, R-142,
+	// server_iec104_log.go); nil without.
+	log *iecLog
 }
 
 var iecAddress = regexp.MustCompile(`^(\d+)/(\d+):([A-Za-z]+)$`)
@@ -147,6 +150,13 @@ func newIECServer(conn Connection) (*iecServer, error) {
 			return nil, fmt.Errorf("plc4x: server %q: %w", conn.Name, err)
 		}
 		s.roles = topts.roles
+	}
+	n, err := parseBuffer(q.Get("buffer"))
+	if err != nil {
+		return nil, fmt.Errorf("plc4x: server %q: %w", conn.Name, err)
+	}
+	if n > 0 {
+		s.log = newIECLog(n)
 	}
 	switch q.Get("time-tags") {
 	case "", "false":
@@ -228,6 +238,23 @@ func (c *Connector) serveIEC(ctx context.Context, cs *connState) error {
 	c.record(cs.Name, func(st *Status) { st.Connected = true }, nil)
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	if s.log != nil {
+		// The log records whether a station is there or not (R-142).
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			t := time.NewTicker(iecScanInterval)
+			defer t.Stop()
+			for {
+				c.recordIEC(s)
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+				}
+			}
+		}()
+	}
 	slots := make(chan struct{}, maxTCPClients)
 	for {
 		conn, err := ln.Accept()
@@ -285,6 +312,13 @@ type iecSession struct {
 	started  bool       // STARTDT confirmed
 
 	last map[string]string // last value sent per point, for change detection
+
+	// With the outstation's log (R-142): the last event sent, the frames
+	// awaiting acknowledgement, and the current values still to send
+	// after the backlog.
+	cursor      uint64
+	pending     []pendingFrame
+	needCurrent bool
 }
 
 func newIECSession(c *Connector, cs *connState, conn net.Conn) *iecSession {
@@ -328,7 +362,11 @@ func (s *iecSession) run(ctx context.Context) {
 			return
 		case <-scan.C:
 			if s.isStarted() {
-				s.sendChanges()
+				if s.s.log != nil {
+					s.sendLog()
+				} else {
+					s.sendChanges()
+				}
 			}
 		case <-idle.C:
 			s.sendU(iecTestAct)
@@ -382,6 +420,7 @@ func (s *iecSession) handleFrame(ctx context.Context, body []byte) bool {
 		asduBytes := body[4:]
 		sendSeqNo := (uint16(ctrl[0]) >> 1) | (uint16(ctrl[1]) << 7)
 		s.noteReceived(sendSeqNo)
+		s.noteAck(uint16(ctrl[2])>>1 | uint16(ctrl[3])<<7) // an I-frame acknowledges too
 		if len(asduBytes) > 0 {
 			s.handleASDU(ctx, asduBytes)
 		}
@@ -393,7 +432,16 @@ func (s *iecSession) handleFrame(ctx context.Context, body []byte) bool {
 		case iecStartDTAct:
 			s.setStarted(true)
 			s.sendU(iecStartDTCon)
-			s.sendAll(cotSpontaneous) // the push-only client never interrogates
+			if s.s.log != nil {
+				// The backlog first, in order with its times, then the
+				// current values (R-142).
+				s.mu.Lock()
+				s.cursor, s.needCurrent, s.pending = s.s.log.position(), true, nil
+				s.mu.Unlock()
+				s.sendLog()
+			} else {
+				s.sendAll(cotSpontaneous) // the push-only client never interrogates
+			}
 		case iecStopDTAct:
 			s.setStarted(false)
 			s.sendU(iecStopDTCon)
@@ -423,10 +471,21 @@ func (s *iecSession) noteReceived(sendSeqNo uint16) {
 }
 
 // noteAck records the station's acknowledgement of frames we sent.
+// An acknowledgement only moves forward: one behind what was already
+// acknowledged, or past what was sent, is ignored.
 func (s *iecSession) noteAck(recvSeqNo uint16) {
+	recvSeqNo &= 0x7FFF
 	s.mu.Lock()
-	s.ackedSeq = recvSeqNo & 0x7FFF
+	ahead := (recvSeqNo - s.ackedSeq) & 0x7FFF
+	if ahead == 0 || ahead > (s.sendSeq-s.ackedSeq)&0x7FFF {
+		s.mu.Unlock()
+		return
+	}
+	s.ackedSeq = recvSeqNo
 	s.mu.Unlock()
+	if s.s.log != nil {
+		s.ackLog(recvSeqNo & 0x7FFF)
+	}
 }
 
 // sendAck sends an S-format acknowledgement when one is due (the w window).
@@ -452,15 +511,21 @@ func (s *iecSession) sendU(command byte) {
 // sendASDU sends one ASDU in an I-format frame, within the k window. It
 // reports whether it was sent (the window may be full).
 func (s *iecSession) sendASDU(asdu iec.ASDU) bool {
+	_, ok := s.sendASDUSeq(asdu)
+	return ok
+}
+
+// sendASDUSeq is sendASDU, with the send sequence number of the frame.
+func (s *iecSession) sendASDUSeq(asdu iec.ASDU) (uint16, bool) {
 	asduBytes, err := asdu.Serialize()
 	if err != nil {
 		s.c.onError(s.cs.Name, fmt.Errorf("serialize ASDU: %w", err))
-		return false
+		return 0, false
 	}
 	s.mu.Lock()
 	if (s.sendSeq-s.ackedSeq)&0x7FFF >= s.s.k {
 		s.mu.Unlock()
-		return false // the send window is full: the change is re-sent next scan
+		return 0, false // the send window is full: the change is re-sent next scan
 	}
 	send, recv := s.sendSeq, s.recvSeq
 	s.sendSeq = (s.sendSeq + 1) & 0x7FFF
@@ -468,7 +533,7 @@ func (s *iecSession) sendASDU(asdu iec.ASDU) bool {
 	s.mu.Unlock()
 	ctrl := []byte{byte(send << 1), byte(send >> 7), byte(recv << 1), byte(recv >> 7)}
 	s.writeFrame(ctrl, asduBytes)
-	return true
+	return send, true
 }
 
 // writeFrame puts one APCI frame (its control octets and ASDU) on the wire.

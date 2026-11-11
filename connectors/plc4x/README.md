@@ -104,6 +104,20 @@ write, as on IEC 60870-5-104 LAN 2 (drone D-66). A server records
   and with its quality (invalid: bad, not topical: uncertain), so the
   source time is kept end to end.
 
+### IEC 60870-5-104 store and forward
+
+`buffer=N` (up to 100000) keeps every change of the outstation's points,
+time-tagged, in a log, whether a controlling station is connected or not.
+A station that starts data transfer receives the events no station has
+acknowledged, in order and with their original times, then the current
+values, then each new change as it comes. An event leaves the log only
+when a station acknowledges the frame that carried it, so a link that
+drops in the middle loses nothing. Past N events the oldest are dropped
+(the station should interrogate after a long outage). Without `buffer`
+the outstation sends only current values and changes while a station is
+connected, as before. Acknowledgements only move forward: one behind what
+was already acknowledged is ignored.
+
 ### IEC 60870-5-104 over TLS (IEC 62351-3 and -8)
 
 Both the outstation and the client take TLS with options on the URL:
