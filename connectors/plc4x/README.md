@@ -89,6 +89,21 @@ write, as on IEC 60870-5-104 LAN 2 (drone D-66). A server records
 `Status.Connected`, `Reads` (requests answered or frames sent) and `Writes`
 (tags written), the same diagnostic tags as a client.
 
+### IEC 60870-5-104 time and quality
+
+- **Time tags (outstation):** `time-tags=true` sends each spontaneous change
+  with its tag's own time as a CP56Time2a, in UTC (`M_SP_TB_1`,
+  `M_DP_TB_1`, `M_ME_TF_1`, `M_ME_TE_1`, `M_ME_TD_1`). General
+  interrogation answers carry no time, as the standard has it.
+- **Quality:** a point carries its tag's quality: invalid when the tag is
+  bad, not topical when it is uncertain.
+- **Clock synchronisation:** a `C_CS_NA_1` is confirmed with the
+  outstation's own time; the machine's clock is never set from a station
+  (it is kept by the machine's own time service).
+- **Client:** a point received with a time tag is stored with that time
+  and with its quality (invalid: bad, not topical: uncertain), so the
+  source time is kept end to end.
+
 ### IEC 60870-5-104 over TLS (IEC 62351-3 and -8)
 
 Both the outstation and the client take TLS with options on the URL:

@@ -90,14 +90,16 @@ type iecKind struct {
 	name string
 	mon  iec.TypeIdentification
 	cmd  iec.TypeIdentification
+	// timed is the monitored type with a CP56Time2a time tag (time-tags).
+	timed iec.TypeIdentification
 }
 
 var iecKinds = map[string]iecKind{
-	"SP":     {"SP", iec.TypeIdentification_SINGLE_POINT_INFORMATION, iec.TypeIdentification_SINGLE_COMMAND},
-	"DP":     {"DP", iec.TypeIdentification_DOUBLE_POINT_INFORMATION, iec.TypeIdentification_DOUBLE_COMMAND},
-	"FLOAT":  {"FLOAT", iec.TypeIdentification_MEASURED_VALUE_SHORT_FLOATING_POINT_NUMBER, iec.TypeIdentification_SET_POINT_COMMAND_SHORT_FLOATING_POINT_NUMBER},
-	"SCALED": {"SCALED", iec.TypeIdentification_MEASURED_VALUE_SCALED_VALUE, iec.TypeIdentification_SET_POINT_COMMAND_SCALED_VALUE},
-	"NORM":   {"NORM", iec.TypeIdentification_MEASURED_VALUE_NORMALISED_VALUE, iec.TypeIdentification_SET_POINT_COMMAND_NORMALISED_VALUE},
+	"SP":     {"SP", iec.TypeIdentification_SINGLE_POINT_INFORMATION, iec.TypeIdentification_SINGLE_COMMAND, iec.TypeIdentification_SINGLE_POINT_INFORMATION_WITH_TIME_TAG_CP56TIME2A},
+	"DP":     {"DP", iec.TypeIdentification_DOUBLE_POINT_INFORMATION, iec.TypeIdentification_DOUBLE_COMMAND, iec.TypeIdentification_DOUBLE_POINT_INFORMATION_WITH_TIME_TAG_CP56TIME2A},
+	"FLOAT":  {"FLOAT", iec.TypeIdentification_MEASURED_VALUE_SHORT_FLOATING_POINT_NUMBER, iec.TypeIdentification_SET_POINT_COMMAND_SHORT_FLOATING_POINT_NUMBER, iec.TypeIdentification_MEASURED_VALUE_SHORT_FLOATING_POINT_NUMBER_WITH_TIME_TAG_CP56TIME2A},
+	"SCALED": {"SCALED", iec.TypeIdentification_MEASURED_VALUE_SCALED_VALUE, iec.TypeIdentification_SET_POINT_COMMAND_SCALED_VALUE, iec.TypeIdentification_MEASURED_VALUE_SCALED_VALUE_WITH_TIME_TAG_CP56TIME2A},
+	"NORM":   {"NORM", iec.TypeIdentification_MEASURED_VALUE_NORMALISED_VALUE, iec.TypeIdentification_SET_POINT_COMMAND_NORMALISED_VALUE, iec.TypeIdentification_MEASURED_VALUE_NORMALISED_VALUE_WITH_TIME_TAG_CP56TIME2A},
 }
 
 // iecPoint is one binding of an IEC 60870-5-104 outstation.
@@ -120,6 +122,9 @@ type iecServer struct {
 	// whether commands need the IEC 62351-8 role OPERATOR.
 	tls   *tls.Config
 	roles bool
+	// timeTags: spontaneous changes carry the tag's source time as
+	// CP56Time2a (beehive R-141); interrogated data never does.
+	timeTags bool
 }
 
 var iecAddress = regexp.MustCompile(`^(\d+)/(\d+):([A-Za-z]+)$`)
@@ -142,6 +147,13 @@ func newIECServer(conn Connection) (*iecServer, error) {
 			return nil, fmt.Errorf("plc4x: server %q: %w", conn.Name, err)
 		}
 		s.roles = topts.roles
+	}
+	switch q.Get("time-tags") {
+	case "", "false":
+	case "true":
+		s.timeTags = true
+	default:
+		return nil, fmt.Errorf("plc4x: server %q: time-tags %q: true or false", conn.Name, q.Get("time-tags"))
 	}
 	if v := q.Get("k"); v != "" {
 		n, err := strconv.ParseUint(v, 10, 15)
@@ -504,7 +516,13 @@ func (s *iecSession) sendChanges() {
 		if !changed {
 			continue
 		}
-		if s.sendASDU(iec.NewASDU(p.kind.mon, false, false, false, cotSpontaneous, 0, p.ca, []iec.InformationObject{value})) {
+		typeID := p.kind.mon
+		if s.s.timeTags {
+			if timed, ok := s.c.iecTimedValue(p); ok {
+				value, typeID = timed, p.kind.timed
+			}
+		}
+		if s.sendASDU(iec.NewASDU(typeID, false, false, false, cotSpontaneous, 0, p.ca, []iec.InformationObject{value})) {
 			s.mu.Lock()
 			s.last[fp.key] = fp.value
 			s.mu.Unlock()
@@ -527,31 +545,38 @@ func (c *Connector) iecValue(p *iecPoint) (iec.InformationObject, iecFingerprint
 		return nil, iecFingerprint{}, false
 	}
 	key := fmt.Sprintf("%d/%d", p.ca, p.ioa)
-	good := iec.NewQualityDescriptor(false, false, false, false, false)
+	// The tag's quality: invalid when bad, not topical when uncertain
+	// (beehive R-141); a tag never written counts as good.
+	iv, nt := c.iecQuality(p.tag)
+	qds := iec.NewQualityDescriptor(iv, nt, false, false, false)
+	q := ""
+	if iv || nt {
+		q = fmt.Sprintf("/%v/%v", iv, nt) // a change of quality is a change
+	}
 	switch p.kind.name {
 	case "SP":
 		on := asBool(raw)
-		return iec.NewInformationObjectWithoutTime_SINGLE_POINT_INFORMATION(p.ioa, iec.NewSinglePointInformation(false, false, false, false, on)),
-			iecFingerprint{key, strconv.FormatBool(on)}, true
+		return iec.NewInformationObjectWithoutTime_SINGLE_POINT_INFORMATION(p.ioa, iec.NewSinglePointInformation(iv, nt, false, false, on)),
+			iecFingerprint{key, strconv.FormatBool(on) + q}, true
 	case "DP":
 		code := uint8(1) // OFF
 		if asBool(raw) {
 			code = 2 // ON
 		}
-		return iec.NewInformationObjectWithoutTime_DOUBLE_POINT_INFORMATION(p.ioa, iec.NewDoublePointInformation(false, false, false, false, code)),
-			iecFingerprint{key, strconv.Itoa(int(code))}, true
+		return iec.NewInformationObjectWithoutTime_DOUBLE_POINT_INFORMATION(p.ioa, iec.NewDoublePointInformation(iv, nt, false, false, code)),
+			iecFingerprint{key, strconv.Itoa(int(code)) + q}, true
 	case "FLOAT":
 		v := float32(asFloat(raw))
-		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_SHORT_FLOATING_POINT_NUMBER(p.ioa, v, good),
-			iecFingerprint{key, strconv.FormatFloat(float64(v), 'g', -1, 32)}, true
+		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_SHORT_FLOATING_POINT_NUMBER(p.ioa, v, qds),
+			iecFingerprint{key, strconv.FormatFloat(float64(v), 'g', -1, 32) + q}, true
 	case "SCALED":
 		v := int16(asFloat(raw))
-		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_SCALED_VALUE(p.ioa, iec.NewScaledValue(v), good),
-			iecFingerprint{key, strconv.Itoa(int(v))}, true
+		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_SCALED_VALUE(p.ioa, iec.NewScaledValue(v), qds),
+			iecFingerprint{key, strconv.Itoa(int(v)) + q}, true
 	default: // NORM
 		v := int16(asFloat(raw))
-		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_NORMALISED_VALUE(p.ioa, iec.NewNormalizedValue(uint16(v)), good),
-			iecFingerprint{key, strconv.Itoa(int(v))}, true
+		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_NORMALISED_VALUE(p.ioa, iec.NewNormalizedValue(uint16(v)), qds),
+			iecFingerprint{key, strconv.Itoa(int(v)) + q}, true
 	}
 }
 
@@ -568,6 +593,8 @@ func (s *iecSession) handleASDU(ctx context.Context, asduBytes []byte) {
 	switch asdu.GetTypeIdentification() {
 	case iec.TypeIdentification_INTERROGATION_COMMAND:
 		s.generalInterrogation(asdu)
+	case iec.TypeIdentification_CLOCK_SYNCHRONISATION_COMMAND:
+		s.clockSync(asdu)
 	case iec.TypeIdentification_SINGLE_COMMAND, iec.TypeIdentification_DOUBLE_COMMAND,
 		iec.TypeIdentification_SET_POINT_COMMAND_SHORT_FLOATING_POINT_NUMBER,
 		iec.TypeIdentification_SET_POINT_COMMAND_SCALED_VALUE,
