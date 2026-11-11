@@ -332,7 +332,7 @@ var errDemoted = errors.New("demoted after successive failures")
 // A connection that arrives after the timeout is closed.
 func (c *Connector) connect(ctx context.Context, cs *connState) (plc4go.PlcConnection, error) {
 	if cs.ConnectTimeout <= 0 {
-		return c.manager.GetConnection(ctx, cs.URL)
+		return c.manager.GetConnection(ctx, cs.plc4xURL())
 	}
 	type result struct {
 		conn plc4go.PlcConnection
@@ -340,7 +340,7 @@ func (c *Connector) connect(ctx context.Context, cs *connState) (plc4go.PlcConne
 	}
 	results := make(chan result, 1)
 	go func() {
-		conn, err := c.manager.GetConnection(ctx, cs.URL)
+		conn, err := c.manager.GetConnection(ctx, cs.plc4xURL())
 		results <- result{conn, err}
 	}()
 	late := func() {

@@ -89,6 +89,32 @@ write, as on IEC 60870-5-104 LAN 2 (drone D-66). A server records
 `Status.Connected`, `Reads` (requests answered or frames sent) and `Writes`
 (tags written), the same diagnostic tags as a client.
 
+### IEC 60870-5-104 over TLS (IEC 62351-3 and -8)
+
+Both the outstation and the client take TLS with options on the URL:
+
+```
+iec-60870-5-104://0.0.0.0:19998?tls=true&tls-cert=rtu.pem&tls-key=rtu.key&tls-ca=ca.pem
+iec-60870-5-104://10.0.0.5:19998?tls=true&tls-cert=scada.pem&tls-key=scada.key&tls-ca=ca.pem
+```
+
+- TLS is mutual: each end presents `tls-cert` and `tls-key` and checks the
+  other's against `tls-ca`. TLS 1.2 (ECDHE with AES-GCM or
+  ChaCha20-Poly1305 only) or 1.3. A client checks the outstation's name
+  against the URL's host, or `tls-server-name`. The usual port is 19998.
+- **Roles (outstation):** with `tls-roles=on` (the default), a
+  controlling station commands only when its certificate carries the
+  IEC 62351-8 role OPERATOR in the role extension (`RolesOf`, OID
+  1.2.840.10070.8.1, each role's validity checked); a certificate without
+  roles, or with others only, receives data and general interrogation but
+  every command is refused. `tls-roles=off` lets any authenticated station
+  command. A read-only interface stays read only either way. The record
+  of a write names the certificate's common name and roles.
+- **Client:** PLC4X's IEC 60870-5-104 client speaks plain TCP, so the
+  connector runs a tunnel for it: a listener on loopback whose
+  connections it carries over TLS to the outstation. PLC4X dials the
+  tunnel; nothing leaves the machine in clear.
+
 ## Quality
 
 Input and InOut tags carry the quality of the last exchange:

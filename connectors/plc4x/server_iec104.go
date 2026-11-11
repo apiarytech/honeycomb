@@ -47,6 +47,7 @@ package plc4x
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -115,6 +116,10 @@ type iecServer struct {
 	readOnly []string
 	points   []iecPoint
 	k, w     uint16 // send window, acknowledgement window
+	// tls is IEC 62351-3's TLS (iec62351.go), nil over plain TCP; roles
+	// whether commands need the IEC 62351-8 role OPERATOR.
+	tls   *tls.Config
+	roles bool
 }
 
 var iecAddress = regexp.MustCompile(`^(\d+)/(\d+):([A-Za-z]+)$`)
@@ -128,6 +133,16 @@ func newIECServer(conn Connection) (*iecServer, error) {
 	}
 	s.listen = net.JoinHostPort(host, port)
 	s.readOnly = readOnlyInterfaces(q)
+	topts, err := parseTLS(q, host)
+	if err != nil {
+		return nil, fmt.Errorf("plc4x: server %q: %w", conn.Name, err)
+	}
+	if topts.on {
+		if s.tls, err = topts.config(true); err != nil {
+			return nil, fmt.Errorf("plc4x: server %q: %w", conn.Name, err)
+		}
+		s.roles = topts.roles
+	}
 	if v := q.Get("k"); v != "" {
 		n, err := strconv.ParseUint(v, 10, 15)
 		if err != nil || n < 1 {
@@ -189,6 +204,9 @@ func (c *Connector) serveIEC(ctx context.Context, cs *connState) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.listen, err)
 	}
+	if s.tls != nil {
+		ln = tls.NewListener(ln, s.tls) // IEC 62351-3
+	}
 	stop := context.AfterFunc(ctx, func() { ln.Close() })
 	defer func() {
 		if stop() {
@@ -217,7 +235,22 @@ func (c *Connector) serveIEC(ctx context.Context, cs *connState) error {
 		go func() {
 			defer wg.Done()
 			defer func() { <-slots }()
-			newIECSession(c, cs, conn).run(ctx)
+			sess := newIECSession(c, cs, conn)
+			if s.tls != nil {
+				// The handshake, then the station's rights by its
+				// certificate's roles (IEC 62351-8).
+				commands, who, err := stationRights(conn, s.roles)
+				if err != nil {
+					c.onError(cs.Name, fmt.Errorf("iec 60870-5-104 station %s refused: %w", conn.RemoteAddr(), err))
+					conn.Close()
+					return
+				}
+				sess.writes = sess.writes && commands
+				if who != "" {
+					sess.from = who + " at " + sess.from
+				}
+			}
+			sess.run(ctx)
 		}()
 	}
 }
