@@ -75,6 +75,11 @@ func ParseConfig(r io.Reader) (Config, error) {
 				Address   string    `json:"address"`
 				Direction Direction `json:"direction"`
 			} `json:"bindings"`
+			Standby *struct {
+				URL         string `json:"url"`
+				After       int    `json:"after"`
+				ReturnEvery string `json:"returnEvery"`
+			} `json:"standby"`
 		} `json:"connections"`
 	}
 	dec := json.NewDecoder(r)
@@ -95,6 +100,16 @@ func ParseConfig(r io.Reader) (Config, error) {
 		}
 		for _, fb := range fc.Bindings {
 			conn.Bindings = append(conn.Bindings, Binding{Tag: fb.Tag, Address: fb.Address, Direction: fb.Direction})
+		}
+		if s := fc.Standby; s != nil {
+			conn.Standby = Standby{URL: s.URL, After: s.After}
+			if s.ReturnEvery != "" {
+				d, err := time.ParseDuration(s.ReturnEvery)
+				if err != nil {
+					return Config{}, fmt.Errorf("connection %q: standby returnEvery: %w", fc.Name, err)
+				}
+				conn.Standby.ReturnEvery = d
+			}
 		}
 		cfg.Connections = append(cfg.Connections, conn)
 	}

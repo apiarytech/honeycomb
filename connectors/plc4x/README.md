@@ -236,6 +236,28 @@ connector, err := plc4x.NewFromConfig(db, cfg)
 `mode` is `poll`, `change-of-state` or `cyclic`; `direction` is `input`,
 `output` or `inout`; `interval` is a Go duration.
 
+## Modbus unit scan
+
+`ScanUnits(ctx, url, ScanOptions{From, To, Timeout})` (R-138) lists the unit
+IDs that answer on a Modbus RTU serial line
+(`modbus-rtu:serial:///dev/ttyAMA2?serial.baud-rate=19200&...`) or behind a
+Modbus TCP gateway (`modbus-tcp://10.0.0.9:502`): each unit is asked for one
+holding register with a short timeout (200 ms); a normal answer or an
+exception both mean a device is there, a gateway's exception 0x0B (no
+response from the target) does not. The scan opens the port itself, so no
+connection may use it meanwhile.
+
+## Traffic view
+
+`New(..., WithTraffic())` (R-137) lets a connection's bytes be recorded
+for commissioning: `SetTraffic(name, true)` starts a ring of its own (2000
+frames), `Traffic(name, since)` reads the frames sent to the device and
+received from it with their times, `SetTraffic(name, false)` stops and
+drops it. It wraps PLC4X's TCP and serial transports, registered before
+the drivers' own; without `WithTraffic` they are PLC4X's, untouched.
+Nothing recorded goes to a log. A driver on another transport (UDP, a
+driver's own) records nothing.
+
 ## Diagnostic tags
 
 `WithDiagnostics(prefix)` (or `"diagnostics"` in the config file) publishes each
@@ -266,6 +288,7 @@ All optional; the zero value is the behaviour above.
 | `Connection.PollGroups`, `Binding.PollGroup` | Named rates: each group is one read request on its own ticker; other inputs are read every `Interval`. |
 | `ConnectTimeout`, `RequestTimeout`, `Attempts`, `InterRequestDelay` | Bounds and pauses per connection; `RequestTimeout` defaults to 10 s. |
 | `Demotion{After, Period, DiscardWrites}` | Every failed exchange adds one to `Status.Failures` (diagnostic tag `Failures`), a success sets it to 0; when it reaches `After` the connection pauses for `Period` (10 s): inputs Bad, `Status.Demoted`, diagnostic tag `Demoted`. `DiscardWrites` drops in-out changes made meanwhile. |
+| `Standby{URL, After, ReturnEvery}` | A second path to the same device (R-136): another address, a redundant network, a gateway; same protocol. After `After` (3) attempts in a row fail on one path, the connection takes the other; on the standby it tries the first every `ReturnEvery` (a minute) and goes back once it answers. A switch never writes safe values. `Status.OnStandby`, `Status.PathSwitches`. Not for servers. JSON: `"standby": {"url": ..., "after": 3, "returnEvery": "1m"}`. |
 | `Disabled` | No connection; inputs Bad; `Status.Disabled`. |
 | `Binding.Scaling` | Linear or square-root scaling with clamps and negate: reads scaled into the tag (the tag's numeric type), writes unscaled (a whole-number address gets the raw value rounded half to even). |
 
