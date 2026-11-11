@@ -236,6 +236,17 @@ connector, err := plc4x.NewFromConfig(db, cfg)
 `mode` is `poll`, `change-of-state` or `cyclic`; `direction` is `input`,
 `output` or `inout`; `interval` is a Go duration.
 
+## Modbus unit scan
+
+`ScanUnits(ctx, url, ScanOptions{From, To, Timeout})` (R-138) lists the unit
+IDs that answer on a Modbus RTU serial line
+(`modbus-rtu:serial:///dev/ttyAMA2?serial.baud-rate=19200&...`) or behind a
+Modbus TCP gateway (`modbus-tcp://10.0.0.9:502`): each unit is asked for one
+holding register with a short timeout (200 ms); a normal answer or an
+exception both mean a device is there, a gateway's exception 0x0B (no
+response from the target) does not. The scan opens the port itself, so no
+connection may use it meanwhile.
+
 ## Diagnostic tags
 
 `WithDiagnostics(prefix)` (or `"diagnostics"` in the config file) publishes each
