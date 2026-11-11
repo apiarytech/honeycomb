@@ -208,6 +208,18 @@ type connState struct {
 
 	staleMu sync.Mutex
 	changed map[string]time.Time // when a StaleAfter binding's value last changed
+
+	// dialURL is the URL PLC4X dials when it is not URL: an IEC
+	// 60870-5-104 client over TLS dials its tunnel (iec62351.go).
+	dialURL atomic.Pointer[string]
+}
+
+// plc4xURL is the URL PLC4X connects to.
+func (cs *connState) plc4xURL() string {
+	if u := cs.dialURL.Load(); u != nil {
+		return *u
+	}
+	return cs.URL
 }
 
 // now is the connector's clock; tests replace it.
@@ -375,7 +387,7 @@ func New(db *honeycomb.TagDatabase, connections []Connection, opts ...Option) (*
 			groups[g.Name] = true
 		}
 		if conn.Mode == Server {
-			s, err := newServer(conn)
+			s, err := newServer(c, conn)
 			if err != nil {
 				return nil, err
 			}
@@ -504,6 +516,16 @@ func (c *Connector) prepare(cs *connState) error {
 // disabled, until ctx ends. Disabling ends its session as stopping does: its
 // safe values are written (R-25).
 func (c *Connector) supervise(ctx context.Context, cs *connState) {
+	if cs.server == nil {
+		stop, err := startTunnel(cs)
+		if err != nil {
+			c.onError(cs.Name, err)
+			c.record(cs.Name, func(s *Status) { s.Connected = false }, err)
+		}
+		if stop != nil {
+			defer stop()
+		}
+	}
 	for ctx.Err() == nil {
 		if !cs.enabled.Load() {
 			c.setInputQuality(cs, honeycomb.QualityBad)

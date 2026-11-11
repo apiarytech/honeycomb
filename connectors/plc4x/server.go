@@ -126,6 +126,7 @@ type server struct {
 	points   map[int][]serverPoint // by area, sorted by start
 	mu       sync.Mutex            // one request at a time
 	iec      *iecServer            // an IEC 60870-5-104 server's points
+	dnp3     *dnp3Server           // a DNP3 outstation (server_dnp3.go)
 	s7       *s7Server             // an S7 server's areas
 }
 
@@ -137,10 +138,10 @@ func IsServerURL(u string) bool {
 }
 
 // serverPorts are the TCP servers' default ports.
-var serverPorts = map[string]string{"modbus-tcp": "502", "iec-60870-5-104": "2404", "s7": "102"}
+var serverPorts = map[string]string{"modbus-tcp": "502", "iec-60870-5-104": "2404", "s7": "102", "dnp3": "20000"}
 
 // newServer reads a server connection: its URL and its bindings.
-func newServer(conn Connection) (*server, error) {
+func newServer(c *Connector, conn Connection) (*server, error) {
 	s := &server{points: map[int][]serverPoint{}}
 	if err := s.parseURL(conn.URL); err != nil {
 		return nil, fmt.Errorf("plc4x: server %q: %w", conn.Name, err)
@@ -157,6 +158,9 @@ func newServer(conn Connection) (*server, error) {
 		return s, err
 	case "s7":
 		s.s7, err = newS7Server(conn)
+		return s, err
+	case "dnp3":
+		s.dnp3, err = newDNP3Server(c, conn)
 		return s, err
 	}
 	for _, b := range conn.Bindings {
@@ -191,7 +195,7 @@ func newServer(conn Connection) (*server, error) {
 // address. A serial port's settings are those of PLC4X's serial transport.
 func (s *server) parseURL(raw string) error {
 	if !IsServerURL(raw) {
-		return fmt.Errorf("a server is Modbus RTU or ASCII on a serial port (modbus-rtu:serial://...), or Modbus TCP (modbus-tcp://0.0.0.0:502), IEC 60870-5-104 (iec-60870-5-104://0.0.0.0:2404) or S7 (s7://0.0.0.0:102), not %q", ProtocolOf(raw))
+		return fmt.Errorf("a server is Modbus RTU or ASCII on a serial port (modbus-rtu:serial://...), or Modbus TCP (modbus-tcp://0.0.0.0:502), IEC 60870-5-104 (iec-60870-5-104://0.0.0.0:2404), S7 (s7://0.0.0.0:102) or DNP3 (dnp3://0.0.0.0:20000), not %q", ProtocolOf(raw))
 	}
 	s.proto = ProtocolOf(raw)
 	var q url.Values
@@ -706,6 +710,8 @@ func (c *Connector) runServer(ctx context.Context, cs *connState) {
 		switch {
 		case cs.server.iec != nil:
 			err = c.serveIEC(ctx, cs)
+		case cs.server.dnp3 != nil:
+			err = c.serveDNP3(ctx, cs)
 		case cs.server.s7 != nil:
 			err = c.serveS7(ctx, cs)
 		case cs.server.tcp:

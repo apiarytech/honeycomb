@@ -41,10 +41,14 @@ func protocols() map[string]registerFunc {
 	return byProtocol
 }
 
-// KnownProtocols returns the protocol codes PLC4X provides, sorted.
+// KnownProtocols returns the protocol codes PLC4X provides and those the
+// connector serves with its own code (DNP3), sorted.
 func KnownProtocols() []string {
 	var out []string
 	for code := range protocols() {
+		out = append(out, code)
+	}
+	for code := range ownProtocols {
 		out = append(out, code)
 	}
 	slices.Sort(out)
@@ -78,6 +82,9 @@ func NewDriverManagerFor(codes ...string) (plc4go.PlcDriverManager, error) {
 	m := plc4go.NewPlcDriverManager()
 	for _, code := range codes {
 		register, ok := known[strings.ToLower(code)]
+		if !ok && ownProtocols[strings.ToLower(code)] {
+			return nil, fmt.Errorf("plc4x: %s is served by the connector itself: a server connection (dnp3://0.0.0.0:20000); a %s client is not built yet", code, code)
+		}
 		if !ok {
 			return nil, fmt.Errorf("plc4x: unknown protocol %q (known: %s)", code, strings.Join(KnownProtocols(), ", "))
 		}
