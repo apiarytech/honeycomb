@@ -104,7 +104,32 @@ func (c *Connector) store(cs *connState, tagName string, value apiValues.PlcValu
 	if cs.byTag[tagName].Direction == InOut && !cs.link.accept(tagName, converted) {
 		return nil
 	}
-	return c.db.SetTagValueQuality(tagName, converted, honeycomb.QualityGood)
+	return c.db.SetTagValueQuality(tagName, converted, cs.freshness(tagName, current, converted))
+}
+
+// freshness is the quality of a value just read: Good, or Uncertain when
+// the binding has a StaleAfter and the value has not changed for that long
+// (beehive R-4).
+func (cs *connState) freshness(tagName string, current, read any) honeycomb.Quality {
+	after := cs.byTag[tagName].StaleAfter
+	if after <= 0 {
+		return honeycomb.QualityGood
+	}
+	t := now()
+	cs.staleMu.Lock()
+	defer cs.staleMu.Unlock()
+	if cs.changed == nil {
+		cs.changed = map[string]time.Time{}
+	}
+	since, seen := cs.changed[tagName]
+	if !seen || !reflect.DeepEqual(current, read) {
+		cs.changed[tagName] = t
+		return honeycomb.QualityGood
+	}
+	if t.Sub(since) >= after {
+		return honeycomb.QualityUncertain
+	}
+	return honeycomb.QualityGood
 }
 
 // convert turns a PLC4X value into a value of type target. Slices map to PLC4X
