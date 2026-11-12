@@ -195,3 +195,28 @@ func TestPersisterRestoreDefinitions(t *testing.T) {
 		t.Fatal("restored subrange not enforced")
 	}
 }
+
+// The display hints (label, unit, decimals) travel in the stored type
+// information, so a restored definition keeps them.
+func TestPersisterRestoresDisplayHints(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	src := NewTagDatabase()
+	two := 2
+	if err := src.AddTag(&Tag{Name: "Level", Value: plc.REAL(1.5), Retain: true, TypeInfo: &TypeInfo{DataType: TypeREAL, Label: "Tank 1 level", EngUnit: "m", Decimals: &two}}); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := src.AttachStore(store, PersistOptions{})
+	if err := p.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	db := NewTagDatabase()
+	p, _ = db.AttachStore(store, PersistOptions{RestoreDefinitions: true})
+	if err := p.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tag, ok := db.GetTag("Level")
+	if !ok || tag.TypeInfo.Label != "Tank 1 level" || tag.TypeInfo.EngUnit != "m" || tag.TypeInfo.Decimals == nil || *tag.TypeInfo.Decimals != 2 {
+		t.Fatalf("restored %+v", tag.TypeInfo)
+	}
+}
