@@ -79,10 +79,10 @@ func (c *Connector) serveASCII(ctx context.Context, cs *connState) error {
 	if err != nil {
 		return fmt.Errorf("open %s: %w", s.port, err)
 	}
-	stop := context.AfterFunc(ctx, func() { port.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = port.Close() })
 	defer func() {
 		if stop() {
-			port.Close()
+			_ = port.Close()
 		}
 	}()
 	c.record(cs.Name, func(st *Status) { st.Connected = true }, nil)

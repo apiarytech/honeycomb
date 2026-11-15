@@ -188,3 +188,13 @@ func TestScanRefusesOthers(t *testing.T) {
 		}
 	}
 }
+
+// The request PDU is function 3, the register big-endian, a count of one.
+func TestScanReadRequest(t *testing.T) {
+	for _, reg := range []uint16{0, 1, 0x1234, 0xFFFF} {
+		want := []byte{0x03, byte(reg >> 8), byte(reg), 0, 1}
+		if got := readRequest(reg); string(got) != string(want) {
+			t.Errorf("readRequest(%#04x) = % x, want % x", reg, got, want)
+		}
+	}
+}

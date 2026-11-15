@@ -95,7 +95,8 @@ type Frame struct {
 // Marshal writes the frame with its header CRC and one CRC per 16 octets
 // of user data.
 func (f Frame) Marshal() ([]byte, error) {
-	if len(f.Data) > maxUserData {
+	length := 5 + len(f.Data) // LEN: control, destination, source and user data
+	if length > 5+maxUserData {
 		return nil, fmt.Errorf("dnp3: %d octets of user data, at most %d", len(f.Data), maxUserData)
 	}
 	ctl := f.Func & 0x0F
@@ -108,7 +109,7 @@ func (f Frame) Marshal() ([]byte, error) {
 		}
 	}
 	out := make([]byte, 0, 10+len(f.Data)+2*((len(f.Data)+15)/16))
-	out = append(out, 0x05, 0x64, byte(5+len(f.Data)), ctl)
+	out = append(out, 0x05, 0x64, byte(length), ctl)
 	out = binary.LittleEndian.AppendUint16(out, f.Dest)
 	out = binary.LittleEndian.AppendUint16(out, f.Src)
 	out = binary.LittleEndian.AppendUint16(out, CRC(out[:8]))

@@ -244,9 +244,11 @@ func time48(t time.Time) []byte {
 
 // Time48 reads an absolute time.
 func Time48(b []byte) time.Time {
-	var x [8]byte
-	copy(x[:], b[:6])
-	return time.UnixMilli(int64(binary.LittleEndian.Uint64(x[:]))).UTC()
+	var ms int64
+	for i := 5; i >= 0; i-- {
+		ms = ms<<8 | int64(b[i])
+	}
+	return time.UnixMilli(ms).UTC()
 }
 
 func f32(v float64) []byte {
@@ -261,7 +263,12 @@ func i32(v float64) []byte {
 	case v < math.MinInt32:
 		v = math.MinInt32
 	}
-	return binary.LittleEndian.AppendUint32(nil, uint32(int32(v)))
+	return binary.LittleEndian.AppendUint32(nil, uint32(int64(v)&math.MaxUint32)) // two's complement
+}
+
+// int32le reads a little-endian two's complement 32-bit integer.
+func int32le(b []byte) int32 {
+	return int32(b[0]) | int32(b[1])<<8 | int32(b[2])<<16 | int32(b[3])<<24
 }
 
 // Control relay output block (g12v1) codes.

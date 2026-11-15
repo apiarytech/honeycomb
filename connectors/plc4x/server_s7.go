@@ -38,6 +38,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"reflect"
 	"regexp"
@@ -154,10 +155,10 @@ func (c *Connector) serveS7(ctx context.Context, cs *connState) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.listen, err)
 	}
-	stop := context.AfterFunc(ctx, func() { ln.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
 	defer func() {
 		if stop() {
-			ln.Close()
+			_ = ln.Close()
 		}
 	}()
 	c.record(cs.Name, func(st *Status) { st.Connected = true }, nil)
@@ -175,7 +176,7 @@ func (c *Connector) serveS7(ctx context.Context, cs *connState) error {
 		select {
 		case slots <- struct{}{}:
 		default:
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 		wg.Add(1)
@@ -193,14 +194,16 @@ func (c *Connector) serveS7Conn(ctx context.Context, cs *connState, conn net.Con
 	s := cs.server.s7
 	writes := writesFromReadOnly(s.readOnly, conn.LocalAddr())
 	from := conn.RemoteAddr().String()
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer func() {
 		stop()
-		conn.Close()
+		_ = conn.Close()
 	}()
 	var head [4]byte
 	for {
-		conn.SetReadDeadline(time.Now().Add(tcpIdle))
+		if err := conn.SetReadDeadline(time.Now().Add(tcpIdle)); err != nil {
+			return
+		}
 		if _, err := io.ReadFull(conn, head[:]); err != nil {
 			return
 		}
@@ -229,7 +232,9 @@ func (c *Connector) serveS7Conn(ctx context.Context, cs *connState, conn net.Con
 			c.onError(cs.Name, fmt.Errorf("serialize S7 reply: %w", err))
 			return
 		}
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			return
+		}
 		if _, err := conn.Write(raw); err != nil {
 			return
 		}
@@ -268,15 +273,23 @@ func (c *Connector) s7Message(name, from string, writes bool, s *s7Server, msg s
 		return s7.NewS7MessageResponseData(ref, ack, nil, 0, 0)
 	case s7.S7ParameterReadVarRequest:
 		items := param.GetItems()
+		n := len(items)
+		if n > math.MaxUint8 {
+			return nil // the item count is one octet
+		}
 		data := make([]s7.S7VarPayloadDataItem, len(items))
 		for i, it := range items {
 			data[i] = c.s7Read(s, it)
 		}
 		return s7.NewS7MessageResponseData(ref,
-			s7.NewS7ParameterReadVarResponse(uint8(len(items))),
+			s7.NewS7ParameterReadVarResponse(uint8(n)),
 			s7.NewS7PayloadReadVarResponse(data), 0, 0)
 	case s7.S7ParameterWriteVarRequest:
 		items := param.GetItems()
+		n := len(items)
+		if n > math.MaxUint8 {
+			return nil // the item count is one octet
+		}
 		var payloadItems []s7.S7VarPayloadDataItem
 		if wp, ok := msg.GetPayload().(s7.S7PayloadWriteVarRequest); ok {
 			payloadItems = wp.GetItems()
@@ -290,7 +303,7 @@ func (c *Connector) s7Message(name, from string, writes bool, s *s7Server, msg s
 			status[i] = s7.NewS7VarPayloadStatusItem(c.s7Write(name, from, writes, s, it, raw))
 		}
 		return s7.NewS7MessageResponseData(ref,
-			s7.NewS7ParameterWriteVarResponse(uint8(len(items))),
+			s7.NewS7ParameterWriteVarResponse(uint8(n)),
 			s7.NewS7PayloadWriteVarResponse(status), 0, 0)
 	}
 	return nil

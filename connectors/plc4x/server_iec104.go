@@ -48,6 +48,7 @@ package plc4x
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -73,6 +74,10 @@ const (
 	iecTestAct    = 0x43
 	iecTestCon    = 0x83
 )
+
+// maxAPDULength is the most an APDU's length octet may say: four control
+// octets and an ASDU of up to 249.
+const maxAPDULength = 253
 
 // Cause-of-transmission values used by the outstation.
 const (
@@ -229,10 +234,10 @@ func (c *Connector) serveIEC(ctx context.Context, cs *connState) error {
 	if s.tls != nil {
 		ln = tls.NewListener(ln, s.tls) // IEC 62351-3
 	}
-	stop := context.AfterFunc(ctx, func() { ln.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
 	defer func() {
 		if stop() {
-			ln.Close()
+			_ = ln.Close()
 		}
 	}()
 	c.record(cs.Name, func(st *Status) { st.Connected = true }, nil)
@@ -267,7 +272,7 @@ func (c *Connector) serveIEC(ctx context.Context, cs *connState) error {
 		select {
 		case slots <- struct{}{}:
 		default:
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 		wg.Add(1)
@@ -281,7 +286,7 @@ func (c *Connector) serveIEC(ctx context.Context, cs *connState) error {
 				commands, who, err := stationRights(conn, s.roles)
 				if err != nil {
 					c.onError(cs.Name, fmt.Errorf("iec 60870-5-104 station %s refused: %w", conn.RemoteAddr(), err))
-					conn.Close()
+					_ = conn.Close()
 					return
 				}
 				sess.writes = sess.writes && commands
@@ -344,10 +349,10 @@ const (
 func (s *iecSession) run(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stop := context.AfterFunc(ctx, func() { s.conn.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = s.conn.Close() })
 	defer func() {
 		stop()
-		s.conn.Close()
+		_ = s.conn.Close()
 	}()
 
 	go s.read(ctx, cancel)
@@ -387,7 +392,9 @@ func (s *iecSession) read(ctx context.Context, cancel context.CancelFunc) {
 	defer cancel()
 	var head [2]byte
 	for {
-		s.conn.SetReadDeadline(time.Now().Add(iecReadIdle))
+		if err := s.conn.SetReadDeadline(time.Now().Add(iecReadIdle)); err != nil {
+			return
+		}
 		if _, err := io.ReadFull(s.conn, head[:]); err != nil {
 			return
 		}
@@ -500,7 +507,7 @@ func (s *iecSession) sendAck() {
 	if !due {
 		return
 	}
-	s.writeFrame([]byte{0x01, 0x00, byte(recv << 1), byte(recv >> 7)}, nil)
+	s.writeFrame(binary.LittleEndian.AppendUint16([]byte{0x01, 0x00}, recv<<1), nil)
 }
 
 // sendU sends a U-format frame (one control command).
@@ -522,6 +529,10 @@ func (s *iecSession) sendASDUSeq(asdu iec.ASDU) (uint16, bool) {
 		s.c.onError(s.cs.Name, fmt.Errorf("serialize ASDU: %w", err))
 		return 0, false
 	}
+	if len(asduBytes) > maxAPDULength-4 {
+		s.c.onError(s.cs.Name, fmt.Errorf("ASDU of %d octets: at most %d", len(asduBytes), maxAPDULength-4))
+		return 0, false
+	}
 	s.mu.Lock()
 	if (s.sendSeq-s.ackedSeq)&0x7FFF >= s.s.k {
 		s.mu.Unlock()
@@ -531,22 +542,30 @@ func (s *iecSession) sendASDUSeq(asdu iec.ASDU) (uint16, bool) {
 	s.sendSeq = (s.sendSeq + 1) & 0x7FFF
 	s.unacked = 0 // an I-frame carries the receive sequence number too
 	s.mu.Unlock()
-	ctrl := []byte{byte(send << 1), byte(send >> 7), byte(recv << 1), byte(recv >> 7)}
+	ctrl := binary.LittleEndian.AppendUint16(binary.LittleEndian.AppendUint16(make([]byte, 0, 4), send<<1), recv<<1)
 	s.writeFrame(ctrl, asduBytes)
 	return send, true
 }
 
 // writeFrame puts one APCI frame (its control octets and ASDU) on the wire.
 func (s *iecSession) writeFrame(ctrl, asdu []byte) {
-	frame := make([]byte, 0, 2+len(ctrl)+len(asdu))
-	frame = append(frame, 0x68, byte(len(ctrl)+len(asdu)))
+	n := len(ctrl) + len(asdu)
+	if n > maxAPDULength {
+		s.c.onError(s.cs.Name, fmt.Errorf("APDU of %d octets: at most %d", n, maxAPDULength))
+		return
+	}
+	frame := make([]byte, 0, 2+n)
+	frame = append(frame, 0x68, byte(n))
 	frame = append(frame, ctrl...)
 	frame = append(frame, asdu...)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		_ = s.conn.Close()
+		return
+	}
 	if _, err := s.conn.Write(frame); err != nil {
-		s.conn.Close()
+		_ = s.conn.Close()
 		return
 	}
 	s.c.record(s.cs.Name, func(st *Status) { st.Reads++; st.LastRead = time.Now() }, nil)
@@ -640,7 +659,7 @@ func (c *Connector) iecValue(p *iecPoint) (iec.InformationObject, iecFingerprint
 			iecFingerprint{key, strconv.Itoa(int(v)) + q}, true
 	default: // NORM
 		v := int16(asFloat(raw))
-		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_NORMALISED_VALUE(p.ioa, iec.NewNormalizedValue(uint16(v)), qds),
+		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_NORMALISED_VALUE(p.ioa, iec.NewNormalizedValue(nvaBits(v)), qds),
 			iecFingerprint{key, strconv.Itoa(int(v)) + q}, true
 	}
 }
@@ -750,7 +769,7 @@ func commandValue(obj iec.InformationObject) (value apiValues.PlcValue, selected
 	case iec.InformationObjectWithoutTime_SET_POINT_COMMAND_SCALED_VALUE:
 		return spiValues.NewPlcINT(o.GetSva().GetValue()), o.GetQos().GetSelect(), true
 	case iec.InformationObjectWithoutTime_SET_POINT_COMMAND_NORMALISED_VALUE:
-		return spiValues.NewPlcINT(int16(o.GetNva().GetValue())), o.GetQos().GetSelect(), true
+		return spiValues.NewPlcINT(nvaValue(o.GetNva().GetValue())), o.GetQos().GetSelect(), true
 	}
 	return nil, false, false
 }
@@ -782,4 +801,15 @@ func asFloat(v any) float64 {
 		return rv.Float()
 	}
 	return 0
+}
+
+// nvaBits is a normalised value's octets on the wire: v in two's
+// complement.
+func nvaBits(v int16) uint16 {
+	return uint16(int32(v) & 0xFFFF)
+}
+
+// nvaValue reads a normalised value's two's complement octets.
+func nvaValue(u uint16) int16 {
+	return int16(u>>8)<<8 | int16(u&0xFF)
 }

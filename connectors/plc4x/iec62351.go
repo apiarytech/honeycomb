@@ -252,11 +252,15 @@ func stationRights(conn net.Conn, roles bool) (commands bool, who string, err er
 	if !ok {
 		return true, "", nil
 	}
-	tc.SetDeadline(time.Now().Add(handshakeTimeout))
+	if err := tc.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		return false, "", err
+	}
 	if err := tc.Handshake(); err != nil {
 		return false, "", err
 	}
-	tc.SetDeadline(time.Time{})
+	if err := tc.SetDeadline(time.Time{}); err != nil {
+		return false, "", err
+	}
 	certs := tc.ConnectionState().PeerCertificates
 	if len(certs) == 0 {
 		return false, "", errors.New("no client certificate")
@@ -327,24 +331,25 @@ func (t *tlsTunnel) carry(local net.Conn) {
 	d := &tls.Dialer{NetDialer: &net.Dialer{Timeout: handshakeTimeout}, Config: t.cfg}
 	remote, err := d.Dial("tcp", t.remote)
 	if err != nil {
-		local.Close()
+		_ = local.Close()
 		return
 	}
 	if !t.track(local, remote) {
-		local.Close()
-		remote.Close()
+		_ = local.Close()
+		_ = remote.Close()
 		return
 	}
 	var once sync.Once
 	end := func() {
 		once.Do(func() {
-			local.Close()
-			remote.Close()
+			_ = local.Close()
+			_ = remote.Close()
 			t.untrack(local, remote)
 		})
 	}
-	go func() { io.Copy(remote, local); end() }()
-	io.Copy(local, remote)
+	// A copy ends when either side closes or fails; end closes both.
+	go func() { _, _ = io.Copy(remote, local); end() }()
+	_, _ = io.Copy(local, remote)
 	end()
 }
 
@@ -375,9 +380,9 @@ func (t *tlsTunnel) Close() {
 	conns := t.conns
 	t.conns = map[net.Conn]bool{}
 	t.mu.Unlock()
-	t.ln.Close()
+	_ = t.ln.Close()
 	for c := range conns {
-		c.Close()
+		_ = c.Close()
 	}
 }
 
