@@ -89,6 +89,93 @@ write, as on IEC 60870-5-104 LAN 2 (drone D-66). A server records
 `Status.Connected`, `Reads` (requests answered or frames sent) and `Writes`
 (tags written), the same diagnostic tags as a client.
 
+### DNP3 outstation (the connector's own code)
+
+PLC4X has no DNP3 driver, so the connector serves DNP3 (IEEE 1815) itself,
+package `dnp3`, as a server connection only:
+
+```
+dnp3://0.0.0.0:20000?address=10&master=1&events=1000
+```
+
+- `address` is the outstation's link address (required); `master` the only
+  master it answers (0 or absent: any); `events` the events kept for the
+  masters (1000).
+- Bindings are points, `<kind>:<index>[:<class>]`: `BI:0` binary input
+  (g1v2; events g2v2 with time), `AI:3` single-precision analog input
+  (g30v5; events g32v7), `AI32:4` 32-bit analog input (g30v1; events
+  g32v3), `BO:0` binary output (status g10v2; CROB g12v1), `AO:1` analog
+  output (status g40v3; g41v1 and g41v3). An input's event class is 1 by
+  default, 0 to 3; inputs are `Output` bindings. Outputs bound `InOut` may
+  be commanded (latch on, close and pulse on set the tag true; latch off,
+  trip and pulse off false); select-before-operate is honoured.
+- Class 0 reads give every point; class 1 to 3 reads give the events with
+  the tag's own time and quality (a bad tag is reported offline). Events
+  stay until a master confirms them, so a master back after an outage gets
+  them in order. The restart indication is set until a master clears it;
+  a written time is noted but never sets the machine's clock.
+- The TLS options of IEC 60870-5-104 apply (IEC 62351-3), with the roles of
+  IEC 62351-8: only an OPERATOR commands. A read-only interface reads
+  only.
+- Not yet: a DNP3 client (master) connection, unsolicited responses,
+  multi-fragment responses (one fragment of 2048 octets; more events wait
+  for the next read), counters, Secure Authentication (IEC 62351-5).
+
+### IEC 60870-5-104 time and quality
+
+- **Time tags (outstation):** `time-tags=true` sends each spontaneous change
+  with its tag's own time as a CP56Time2a, in UTC (`M_SP_TB_1`,
+  `M_DP_TB_1`, `M_ME_TF_1`, `M_ME_TE_1`, `M_ME_TD_1`). General
+  interrogation answers carry no time, as the standard has it.
+- **Quality:** a point carries its tag's quality: invalid when the tag is
+  bad, not topical when it is uncertain.
+- **Clock synchronisation:** a `C_CS_NA_1` is confirmed with the
+  outstation's own time; the machine's clock is never set from a station
+  (it is kept by the machine's own time service).
+- **Client:** a point received with a time tag is stored with that time
+  and with its quality (invalid: bad, not topical: uncertain), so the
+  source time is kept end to end.
+
+### IEC 60870-5-104 store and forward
+
+`buffer=N` (up to 100000) keeps every change of the outstation's points,
+time-tagged, in a log, whether a controlling station is connected or not.
+A station that starts data transfer receives the events no station has
+acknowledged, in order and with their original times, then the current
+values, then each new change as it comes. An event leaves the log only
+when a station acknowledges the frame that carried it, so a link that
+drops in the middle loses nothing. Past N events the oldest are dropped
+(the station should interrogate after a long outage). Without `buffer`
+the outstation sends only current values and changes while a station is
+connected, as before. Acknowledgements only move forward: one behind what
+was already acknowledged is ignored.
+
+### IEC 60870-5-104 over TLS (IEC 62351-3 and -8)
+
+Both the outstation and the client take TLS with options on the URL:
+
+```
+iec-60870-5-104://0.0.0.0:19998?tls=true&tls-cert=rtu.pem&tls-key=rtu.key&tls-ca=ca.pem
+iec-60870-5-104://10.0.0.5:19998?tls=true&tls-cert=scada.pem&tls-key=scada.key&tls-ca=ca.pem
+```
+
+- TLS is mutual: each end presents `tls-cert` and `tls-key` and checks the
+  other's against `tls-ca`. TLS 1.2 (ECDHE with AES-GCM or
+  ChaCha20-Poly1305 only) or 1.3. A client checks the outstation's name
+  against the URL's host, or `tls-server-name`. The usual port is 19998.
+- **Roles (outstation):** with `tls-roles=on` (the default), a
+  controlling station commands only when its certificate carries the
+  IEC 62351-8 role OPERATOR in the role extension (`RolesOf`, OID
+  1.2.840.10070.8.1, each role's validity checked); a certificate without
+  roles, or with others only, receives data and general interrogation but
+  every command is refused. `tls-roles=off` lets any authenticated station
+  command. A read-only interface stays read only either way. The record
+  of a write names the certificate's common name and roles.
+- **Client:** PLC4X's IEC 60870-5-104 client speaks plain TCP, so the
+  connector runs a tunnel for it: a listener on loopback whose
+  connections it carries over TLS to the outstation. PLC4X dials the
+  tunnel; nothing leaves the machine in clear.
+
 ## Quality
 
 Input and InOut tags carry the quality of the last exchange:
@@ -149,6 +236,28 @@ connector, err := plc4x.NewFromConfig(db, cfg)
 `mode` is `poll`, `change-of-state` or `cyclic`; `direction` is `input`,
 `output` or `inout`; `interval` is a Go duration.
 
+## Modbus unit scan
+
+`ScanUnits(ctx, url, ScanOptions{From, To, Timeout})` (R-138) lists the unit
+IDs that answer on a Modbus RTU serial line
+(`modbus-rtu:serial:///dev/ttyAMA2?serial.baud-rate=19200&...`) or behind a
+Modbus TCP gateway (`modbus-tcp://10.0.0.9:502`): each unit is asked for one
+holding register with a short timeout (200 ms); a normal answer or an
+exception both mean a device is there, a gateway's exception 0x0B (no
+response from the target) does not. The scan opens the port itself, so no
+connection may use it meanwhile.
+
+## Traffic view
+
+`New(..., WithTraffic())` (R-137) lets a connection's bytes be recorded
+for commissioning: `SetTraffic(name, true)` starts a ring of its own (2000
+frames), `Traffic(name, since)` reads the frames sent to the device and
+received from it with their times, `SetTraffic(name, false)` stops and
+drops it. It wraps PLC4X's TCP and serial transports, registered before
+the drivers' own; without `WithTraffic` they are PLC4X's, untouched.
+Nothing recorded goes to a log. A driver on another transport (UDP, a
+driver's own) records nothing.
+
 ## Diagnostic tags
 
 `WithDiagnostics(prefix)` (or `"diagnostics"` in the config file) publishes each
@@ -179,6 +288,7 @@ All optional; the zero value is the behaviour above.
 | `Connection.PollGroups`, `Binding.PollGroup` | Named rates: each group is one read request on its own ticker; other inputs are read every `Interval`. |
 | `ConnectTimeout`, `RequestTimeout`, `Attempts`, `InterRequestDelay` | Bounds and pauses per connection; `RequestTimeout` defaults to 10 s. |
 | `Demotion{After, Period, DiscardWrites}` | Every failed exchange adds one to `Status.Failures` (diagnostic tag `Failures`), a success sets it to 0; when it reaches `After` the connection pauses for `Period` (10 s): inputs Bad, `Status.Demoted`, diagnostic tag `Demoted`. `DiscardWrites` drops in-out changes made meanwhile. |
+| `Standby{URL, After, ReturnEvery}` | A second path to the same device (R-136): another address, a redundant network, a gateway; same protocol. After `After` (3) attempts in a row fail on one path, the connection takes the other; on the standby it tries the first every `ReturnEvery` (a minute) and goes back once it answers. A switch never writes safe values. `Status.OnStandby`, `Status.PathSwitches`. Not for servers. JSON: `"standby": {"url": ..., "after": 3, "returnEvery": "1m"}`. |
 | `Disabled` | No connection; inputs Bad; `Status.Disabled`. |
 | `Binding.Scaling` | Linear or square-root scaling with clamps and negate: reads scaled into the tag (the tag's numeric type), writes unscaled (a whole-number address gets the raw value rounded half to even). |
 

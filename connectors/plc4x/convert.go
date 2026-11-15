@@ -89,6 +89,10 @@ func (c *Connector) store(cs *connState, tagName string, value apiValues.PlcValu
 	if current == nil {
 		return fmt.Errorf("tag has no value to infer its type from")
 	}
+	// A reading with its own quality and time (an IEC 60870-5-104 point:
+	// value, quality, timestamp) is stored with them, so the source time
+	// is kept end to end (beehive R-141).
+	value, devQuality, at := unwrapReading(reflect.TypeOf(current), value)
 	var converted any
 	if sc := cs.byTag[tagName].Scaling; sc.Kind != NoScaling {
 		raw, err := rawNumber(value)
@@ -104,7 +108,63 @@ func (c *Connector) store(cs *connState, tagName string, value apiValues.PlcValu
 	if cs.byTag[tagName].Direction == InOut && !cs.link.accept(tagName, converted) {
 		return nil
 	}
-	return c.db.SetTagValueQuality(tagName, converted, cs.freshness(tagName, current, converted))
+	quality := worseQuality(cs.freshness(tagName, current, converted), devQuality)
+	if !at.IsZero() {
+		return c.db.SetTagValueQualityAt(tagName, converted, quality, at)
+	}
+	return c.db.SetTagValueQuality(tagName, converted, quality)
+}
+
+// unwrapReading takes a scalar tag's reading out of a struct that carries
+// it with its quality and time ("value", "quality" {invalid, notTopical},
+// "timestamp" {dateTime, invalid}), as PLC4X's IEC 60870-5-104 client
+// delivers a point. Anything else, and a tag of a structured type, is
+// returned as it is, Good and without a time.
+func unwrapReading(target reflect.Type, value apiValues.PlcValue) (apiValues.PlcValue, honeycomb.Quality, time.Time) {
+	good := honeycomb.QualityGood
+	if value == nil || !value.IsStruct() || target.Kind() == reflect.Struct || (target.Kind() == reflect.Pointer && target.Elem().Kind() == reflect.Struct) {
+		return value, good, time.Time{}
+	}
+	m := value.GetStruct()
+	v, ok := m["value"]
+	if !ok {
+		return value, good, time.Time{}
+	}
+	q := good
+	if qs, ok := m["quality"]; ok && qs != nil && qs.IsStruct() {
+		f := qs.GetStruct()
+		switch {
+		case f["invalid"] != nil && f["invalid"].GetBool():
+			q = honeycomb.QualityBad
+		case f["notTopical"] != nil && f["notTopical"].GetBool():
+			q = honeycomb.QualityUncertain
+		}
+	}
+	var at time.Time
+	if ts, ok := m["timestamp"]; ok && ts != nil && ts.IsStruct() {
+		f := ts.GetStruct()
+		if dt := f["dateTime"]; dt != nil && (f["invalid"] == nil || !f["invalid"].GetBool()) {
+			at = dt.GetDateTime()
+		}
+	}
+	return v, q, at
+}
+
+// worseQuality is the worse of two qualities: bad, then uncertain.
+func worseQuality(a, b honeycomb.Quality) honeycomb.Quality {
+	rank := func(q honeycomb.Quality) int {
+		switch q {
+		case honeycomb.QualityBad:
+			return 2
+		case honeycomb.QualityUncertain:
+			return 1
+		}
+		return 0
+	}
+	if rank(b) > rank(a) {
+		return b
+	}
+	return a
 }
 
 // freshness is the quality of a value just read: Good, or Uncertain when

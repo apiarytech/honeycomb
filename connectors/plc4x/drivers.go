@@ -41,10 +41,14 @@ func protocols() map[string]registerFunc {
 	return byProtocol
 }
 
-// KnownProtocols returns the protocol codes PLC4X provides, sorted.
+// KnownProtocols returns the protocol codes PLC4X provides and those the
+// connector serves with its own code (DNP3), sorted.
 func KnownProtocols() []string {
 	var out []string
 	for code := range protocols() {
+		out = append(out, code)
+	}
+	for code := range ownProtocols {
 		out = append(out, code)
 	}
 	slices.Sort(out)
@@ -74,16 +78,27 @@ func Protocols(connections []Connection) []string {
 // for the given protocol codes (and their transports) registered. A device
 // can then reach no other protocol's code. Unknown codes are an error.
 func NewDriverManagerFor(codes ...string) (plc4go.PlcDriverManager, error) {
-	known := protocols()
 	m := plc4go.NewPlcDriverManager()
+	if err := registerDrivers(m, codes...); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// registerDrivers registers the drivers of the given protocol codes in m.
+func registerDrivers(m plc4go.PlcDriverManager, codes ...string) error {
+	known := protocols()
 	for _, code := range codes {
 		register, ok := known[strings.ToLower(code)]
+		if !ok && ownProtocols[strings.ToLower(code)] {
+			return fmt.Errorf("plc4x: %s is served by the connector itself: a server connection (dnp3://0.0.0.0:20000); a %s client is not built yet", code, code)
+		}
 		if !ok {
-			return nil, fmt.Errorf("plc4x: unknown protocol %q (known: %s)", code, strings.Join(KnownProtocols(), ", "))
+			return fmt.Errorf("plc4x: unknown protocol %q (known: %s)", code, strings.Join(KnownProtocols(), ", "))
 		}
 		register(m)
 	}
-	return m, nil
+	return nil
 }
 
 // NewDriverManager returns a PLC4X driver manager with every PLC4X driver

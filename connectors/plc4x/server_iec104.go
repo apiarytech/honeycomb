@@ -47,6 +47,7 @@ package plc4x
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -89,14 +90,16 @@ type iecKind struct {
 	name string
 	mon  iec.TypeIdentification
 	cmd  iec.TypeIdentification
+	// timed is the monitored type with a CP56Time2a time tag (time-tags).
+	timed iec.TypeIdentification
 }
 
 var iecKinds = map[string]iecKind{
-	"SP":     {"SP", iec.TypeIdentification_SINGLE_POINT_INFORMATION, iec.TypeIdentification_SINGLE_COMMAND},
-	"DP":     {"DP", iec.TypeIdentification_DOUBLE_POINT_INFORMATION, iec.TypeIdentification_DOUBLE_COMMAND},
-	"FLOAT":  {"FLOAT", iec.TypeIdentification_MEASURED_VALUE_SHORT_FLOATING_POINT_NUMBER, iec.TypeIdentification_SET_POINT_COMMAND_SHORT_FLOATING_POINT_NUMBER},
-	"SCALED": {"SCALED", iec.TypeIdentification_MEASURED_VALUE_SCALED_VALUE, iec.TypeIdentification_SET_POINT_COMMAND_SCALED_VALUE},
-	"NORM":   {"NORM", iec.TypeIdentification_MEASURED_VALUE_NORMALISED_VALUE, iec.TypeIdentification_SET_POINT_COMMAND_NORMALISED_VALUE},
+	"SP":     {"SP", iec.TypeIdentification_SINGLE_POINT_INFORMATION, iec.TypeIdentification_SINGLE_COMMAND, iec.TypeIdentification_SINGLE_POINT_INFORMATION_WITH_TIME_TAG_CP56TIME2A},
+	"DP":     {"DP", iec.TypeIdentification_DOUBLE_POINT_INFORMATION, iec.TypeIdentification_DOUBLE_COMMAND, iec.TypeIdentification_DOUBLE_POINT_INFORMATION_WITH_TIME_TAG_CP56TIME2A},
+	"FLOAT":  {"FLOAT", iec.TypeIdentification_MEASURED_VALUE_SHORT_FLOATING_POINT_NUMBER, iec.TypeIdentification_SET_POINT_COMMAND_SHORT_FLOATING_POINT_NUMBER, iec.TypeIdentification_MEASURED_VALUE_SHORT_FLOATING_POINT_NUMBER_WITH_TIME_TAG_CP56TIME2A},
+	"SCALED": {"SCALED", iec.TypeIdentification_MEASURED_VALUE_SCALED_VALUE, iec.TypeIdentification_SET_POINT_COMMAND_SCALED_VALUE, iec.TypeIdentification_MEASURED_VALUE_SCALED_VALUE_WITH_TIME_TAG_CP56TIME2A},
+	"NORM":   {"NORM", iec.TypeIdentification_MEASURED_VALUE_NORMALISED_VALUE, iec.TypeIdentification_SET_POINT_COMMAND_NORMALISED_VALUE, iec.TypeIdentification_MEASURED_VALUE_NORMALISED_VALUE_WITH_TIME_TAG_CP56TIME2A},
 }
 
 // iecPoint is one binding of an IEC 60870-5-104 outstation.
@@ -115,6 +118,16 @@ type iecServer struct {
 	readOnly []string
 	points   []iecPoint
 	k, w     uint16 // send window, acknowledgement window
+	// tls is IEC 62351-3's TLS (iec62351.go), nil over plain TCP; roles
+	// whether commands need the IEC 62351-8 role OPERATOR.
+	tls   *tls.Config
+	roles bool
+	// timeTags: spontaneous changes carry the tag's source time as
+	// CP56Time2a (beehive R-141); interrogated data never does.
+	timeTags bool
+	// log keeps changes for the controlling station (buffer=N, R-142,
+	// server_iec104_log.go); nil without.
+	log *iecLog
 }
 
 var iecAddress = regexp.MustCompile(`^(\d+)/(\d+):([A-Za-z]+)$`)
@@ -128,6 +141,30 @@ func newIECServer(conn Connection) (*iecServer, error) {
 	}
 	s.listen = net.JoinHostPort(host, port)
 	s.readOnly = readOnlyInterfaces(q)
+	topts, err := parseTLS(q, host)
+	if err != nil {
+		return nil, fmt.Errorf("plc4x: server %q: %w", conn.Name, err)
+	}
+	if topts.on {
+		if s.tls, err = topts.config(true); err != nil {
+			return nil, fmt.Errorf("plc4x: server %q: %w", conn.Name, err)
+		}
+		s.roles = topts.roles
+	}
+	n, err := parseBuffer(q.Get("buffer"))
+	if err != nil {
+		return nil, fmt.Errorf("plc4x: server %q: %w", conn.Name, err)
+	}
+	if n > 0 {
+		s.log = newIECLog(n)
+	}
+	switch q.Get("time-tags") {
+	case "", "false":
+	case "true":
+		s.timeTags = true
+	default:
+		return nil, fmt.Errorf("plc4x: server %q: time-tags %q: true or false", conn.Name, q.Get("time-tags"))
+	}
 	if v := q.Get("k"); v != "" {
 		n, err := strconv.ParseUint(v, 10, 15)
 		if err != nil || n < 1 {
@@ -189,6 +226,9 @@ func (c *Connector) serveIEC(ctx context.Context, cs *connState) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.listen, err)
 	}
+	if s.tls != nil {
+		ln = tls.NewListener(ln, s.tls) // IEC 62351-3
+	}
 	stop := context.AfterFunc(ctx, func() { ln.Close() })
 	defer func() {
 		if stop() {
@@ -198,6 +238,23 @@ func (c *Connector) serveIEC(ctx context.Context, cs *connState) error {
 	c.record(cs.Name, func(st *Status) { st.Connected = true }, nil)
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	if s.log != nil {
+		// The log records whether a station is there or not (R-142).
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			t := time.NewTicker(iecScanInterval)
+			defer t.Stop()
+			for {
+				c.recordIEC(s)
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+				}
+			}
+		}()
+	}
 	slots := make(chan struct{}, maxTCPClients)
 	for {
 		conn, err := ln.Accept()
@@ -217,7 +274,22 @@ func (c *Connector) serveIEC(ctx context.Context, cs *connState) error {
 		go func() {
 			defer wg.Done()
 			defer func() { <-slots }()
-			newIECSession(c, cs, conn).run(ctx)
+			sess := newIECSession(c, cs, conn)
+			if s.tls != nil {
+				// The handshake, then the station's rights by its
+				// certificate's roles (IEC 62351-8).
+				commands, who, err := stationRights(conn, s.roles)
+				if err != nil {
+					c.onError(cs.Name, fmt.Errorf("iec 60870-5-104 station %s refused: %w", conn.RemoteAddr(), err))
+					conn.Close()
+					return
+				}
+				sess.writes = sess.writes && commands
+				if who != "" {
+					sess.from = who + " at " + sess.from
+				}
+			}
+			sess.run(ctx)
 		}()
 	}
 }
@@ -240,6 +312,13 @@ type iecSession struct {
 	started  bool       // STARTDT confirmed
 
 	last map[string]string // last value sent per point, for change detection
+
+	// With the outstation's log (R-142): the last event sent, the frames
+	// awaiting acknowledgement, and the current values still to send
+	// after the backlog.
+	cursor      uint64
+	pending     []pendingFrame
+	needCurrent bool
 }
 
 func newIECSession(c *Connector, cs *connState, conn net.Conn) *iecSession {
@@ -283,7 +362,11 @@ func (s *iecSession) run(ctx context.Context) {
 			return
 		case <-scan.C:
 			if s.isStarted() {
-				s.sendChanges()
+				if s.s.log != nil {
+					s.sendLog()
+				} else {
+					s.sendChanges()
+				}
 			}
 		case <-idle.C:
 			s.sendU(iecTestAct)
@@ -337,6 +420,7 @@ func (s *iecSession) handleFrame(ctx context.Context, body []byte) bool {
 		asduBytes := body[4:]
 		sendSeqNo := (uint16(ctrl[0]) >> 1) | (uint16(ctrl[1]) << 7)
 		s.noteReceived(sendSeqNo)
+		s.noteAck(uint16(ctrl[2])>>1 | uint16(ctrl[3])<<7) // an I-frame acknowledges too
 		if len(asduBytes) > 0 {
 			s.handleASDU(ctx, asduBytes)
 		}
@@ -348,7 +432,16 @@ func (s *iecSession) handleFrame(ctx context.Context, body []byte) bool {
 		case iecStartDTAct:
 			s.setStarted(true)
 			s.sendU(iecStartDTCon)
-			s.sendAll(cotSpontaneous) // the push-only client never interrogates
+			if s.s.log != nil {
+				// The backlog first, in order with its times, then the
+				// current values (R-142).
+				s.mu.Lock()
+				s.cursor, s.needCurrent, s.pending = s.s.log.position(), true, nil
+				s.mu.Unlock()
+				s.sendLog()
+			} else {
+				s.sendAll(cotSpontaneous) // the push-only client never interrogates
+			}
 		case iecStopDTAct:
 			s.setStarted(false)
 			s.sendU(iecStopDTCon)
@@ -378,10 +471,21 @@ func (s *iecSession) noteReceived(sendSeqNo uint16) {
 }
 
 // noteAck records the station's acknowledgement of frames we sent.
+// An acknowledgement only moves forward: one behind what was already
+// acknowledged, or past what was sent, is ignored.
 func (s *iecSession) noteAck(recvSeqNo uint16) {
+	recvSeqNo &= 0x7FFF
 	s.mu.Lock()
-	s.ackedSeq = recvSeqNo & 0x7FFF
+	ahead := (recvSeqNo - s.ackedSeq) & 0x7FFF
+	if ahead == 0 || ahead > (s.sendSeq-s.ackedSeq)&0x7FFF {
+		s.mu.Unlock()
+		return
+	}
+	s.ackedSeq = recvSeqNo
 	s.mu.Unlock()
+	if s.s.log != nil {
+		s.ackLog(recvSeqNo & 0x7FFF)
+	}
 }
 
 // sendAck sends an S-format acknowledgement when one is due (the w window).
@@ -407,15 +511,21 @@ func (s *iecSession) sendU(command byte) {
 // sendASDU sends one ASDU in an I-format frame, within the k window. It
 // reports whether it was sent (the window may be full).
 func (s *iecSession) sendASDU(asdu iec.ASDU) bool {
+	_, ok := s.sendASDUSeq(asdu)
+	return ok
+}
+
+// sendASDUSeq is sendASDU, with the send sequence number of the frame.
+func (s *iecSession) sendASDUSeq(asdu iec.ASDU) (uint16, bool) {
 	asduBytes, err := asdu.Serialize()
 	if err != nil {
 		s.c.onError(s.cs.Name, fmt.Errorf("serialize ASDU: %w", err))
-		return false
+		return 0, false
 	}
 	s.mu.Lock()
 	if (s.sendSeq-s.ackedSeq)&0x7FFF >= s.s.k {
 		s.mu.Unlock()
-		return false // the send window is full: the change is re-sent next scan
+		return 0, false // the send window is full: the change is re-sent next scan
 	}
 	send, recv := s.sendSeq, s.recvSeq
 	s.sendSeq = (s.sendSeq + 1) & 0x7FFF
@@ -423,7 +533,7 @@ func (s *iecSession) sendASDU(asdu iec.ASDU) bool {
 	s.mu.Unlock()
 	ctrl := []byte{byte(send << 1), byte(send >> 7), byte(recv << 1), byte(recv >> 7)}
 	s.writeFrame(ctrl, asduBytes)
-	return true
+	return send, true
 }
 
 // writeFrame puts one APCI frame (its control octets and ASDU) on the wire.
@@ -471,7 +581,13 @@ func (s *iecSession) sendChanges() {
 		if !changed {
 			continue
 		}
-		if s.sendASDU(iec.NewASDU(p.kind.mon, false, false, false, cotSpontaneous, 0, p.ca, []iec.InformationObject{value})) {
+		typeID := p.kind.mon
+		if s.s.timeTags {
+			if timed, ok := s.c.iecTimedValue(p); ok {
+				value, typeID = timed, p.kind.timed
+			}
+		}
+		if s.sendASDU(iec.NewASDU(typeID, false, false, false, cotSpontaneous, 0, p.ca, []iec.InformationObject{value})) {
 			s.mu.Lock()
 			s.last[fp.key] = fp.value
 			s.mu.Unlock()
@@ -494,31 +610,38 @@ func (c *Connector) iecValue(p *iecPoint) (iec.InformationObject, iecFingerprint
 		return nil, iecFingerprint{}, false
 	}
 	key := fmt.Sprintf("%d/%d", p.ca, p.ioa)
-	good := iec.NewQualityDescriptor(false, false, false, false, false)
+	// The tag's quality: invalid when bad, not topical when uncertain
+	// (beehive R-141); a tag never written counts as good.
+	iv, nt := c.iecQuality(p.tag)
+	qds := iec.NewQualityDescriptor(iv, nt, false, false, false)
+	q := ""
+	if iv || nt {
+		q = fmt.Sprintf("/%v/%v", iv, nt) // a change of quality is a change
+	}
 	switch p.kind.name {
 	case "SP":
 		on := asBool(raw)
-		return iec.NewInformationObjectWithoutTime_SINGLE_POINT_INFORMATION(p.ioa, iec.NewSinglePointInformation(false, false, false, false, on)),
-			iecFingerprint{key, strconv.FormatBool(on)}, true
+		return iec.NewInformationObjectWithoutTime_SINGLE_POINT_INFORMATION(p.ioa, iec.NewSinglePointInformation(iv, nt, false, false, on)),
+			iecFingerprint{key, strconv.FormatBool(on) + q}, true
 	case "DP":
 		code := uint8(1) // OFF
 		if asBool(raw) {
 			code = 2 // ON
 		}
-		return iec.NewInformationObjectWithoutTime_DOUBLE_POINT_INFORMATION(p.ioa, iec.NewDoublePointInformation(false, false, false, false, code)),
-			iecFingerprint{key, strconv.Itoa(int(code))}, true
+		return iec.NewInformationObjectWithoutTime_DOUBLE_POINT_INFORMATION(p.ioa, iec.NewDoublePointInformation(iv, nt, false, false, code)),
+			iecFingerprint{key, strconv.Itoa(int(code)) + q}, true
 	case "FLOAT":
 		v := float32(asFloat(raw))
-		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_SHORT_FLOATING_POINT_NUMBER(p.ioa, v, good),
-			iecFingerprint{key, strconv.FormatFloat(float64(v), 'g', -1, 32)}, true
+		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_SHORT_FLOATING_POINT_NUMBER(p.ioa, v, qds),
+			iecFingerprint{key, strconv.FormatFloat(float64(v), 'g', -1, 32) + q}, true
 	case "SCALED":
 		v := int16(asFloat(raw))
-		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_SCALED_VALUE(p.ioa, iec.NewScaledValue(v), good),
-			iecFingerprint{key, strconv.Itoa(int(v))}, true
+		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_SCALED_VALUE(p.ioa, iec.NewScaledValue(v), qds),
+			iecFingerprint{key, strconv.Itoa(int(v)) + q}, true
 	default: // NORM
 		v := int16(asFloat(raw))
-		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_NORMALISED_VALUE(p.ioa, iec.NewNormalizedValue(uint16(v)), good),
-			iecFingerprint{key, strconv.Itoa(int(v))}, true
+		return iec.NewInformationObjectWithoutTime_MEASURED_VALUE_NORMALISED_VALUE(p.ioa, iec.NewNormalizedValue(uint16(v)), qds),
+			iecFingerprint{key, strconv.Itoa(int(v)) + q}, true
 	}
 }
 
@@ -535,6 +658,8 @@ func (s *iecSession) handleASDU(ctx context.Context, asduBytes []byte) {
 	switch asdu.GetTypeIdentification() {
 	case iec.TypeIdentification_INTERROGATION_COMMAND:
 		s.generalInterrogation(asdu)
+	case iec.TypeIdentification_CLOCK_SYNCHRONISATION_COMMAND:
+		s.clockSync(asdu)
 	case iec.TypeIdentification_SINGLE_COMMAND, iec.TypeIdentification_DOUBLE_COMMAND,
 		iec.TypeIdentification_SET_POINT_COMMAND_SHORT_FLOATING_POINT_NUMBER,
 		iec.TypeIdentification_SET_POINT_COMMAND_SCALED_VALUE,

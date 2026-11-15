@@ -9,10 +9,10 @@ import (
 
 func TestKnownProtocols(t *testing.T) {
 	known := KnownProtocols()
-	if len(known) != len(allDrivers) {
-		t.Fatalf("%d protocols for %d drivers: %v", len(known), len(allDrivers), known)
+	if len(known) != len(allDrivers)+len(ownProtocols) {
+		t.Fatalf("%d protocols for %d drivers and %d of the connector's own: %v", len(known), len(allDrivers), len(ownProtocols), known)
 	}
-	for _, want := range []string{"modbus-tcp", "s7", "opcua"} {
+	for _, want := range []string{"modbus-tcp", "s7", "opcua", "dnp3"} {
 		if !slices.Contains(known, want) {
 			t.Errorf("%s missing from %v", want, known)
 		}
