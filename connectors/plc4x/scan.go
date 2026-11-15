@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -129,6 +130,9 @@ func ScanUnits(ctx context.Context, rawURL string, o ScanOptions) (ScanResult, e
 		if o.Progress != nil {
 			o.Progress(unit)
 		}
+		if unit < 0 || unit > math.MaxUint8 {
+			break // From and To were checked above: never
+		}
 		res.Tried++
 		ok, exc, err := ask(byte(unit))
 		if err != nil {
@@ -143,7 +147,7 @@ func ScanUnits(ctx context.Context, rawURL string, o ScanOptions) (ScanResult, e
 
 // readRequest is "read holding registers", one register, as a PDU.
 func readRequest(register uint16) []byte {
-	return []byte{0x03, byte(register >> 8), byte(register), 0, 1}
+	return binary.BigEndian.AppendUint16(binary.BigEndian.AppendUint16([]byte{0x03}, register), 1)
 }
 
 // answer reads a response PDU: a normal answer to function 3 or an
@@ -209,9 +213,13 @@ func askRTU(port serialport.Port, gap time.Duration, unit byte, register uint16,
 // (the target did not respond) has no device there.
 func askTCP(conn net.Conn, tid uint16, unit byte, register uint16, timeout time.Duration) (bool, uint8, error) {
 	pdu := readRequest(register)
+	n := len(pdu) + 1 // MBAP length: the unit and the PDU
+	if n > math.MaxUint16 {
+		return false, 0, fmt.Errorf("plc4x: scan: request of %d octets", n)
+	}
 	req := binary.BigEndian.AppendUint16(nil, tid)
 	req = append(req, 0, 0)
-	req = binary.BigEndian.AppendUint16(req, uint16(len(pdu)+1))
+	req = binary.BigEndian.AppendUint16(req, uint16(n))
 	req = append(append(req, unit), pdu...)
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return false, 0, err

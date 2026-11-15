@@ -759,10 +759,10 @@ func (c *Connector) serve(ctx context.Context, cs *connState) error {
 	if err != nil {
 		return fmt.Errorf("open %s: %w", s.port, err)
 	}
-	stop := context.AfterFunc(ctx, func() { port.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = port.Close() })
 	defer func() {
 		if stop() {
-			port.Close()
+			_ = port.Close()
 		}
 	}()
 	c.record(cs.Name, func(st *Status) { st.Connected = true }, nil)
@@ -832,10 +832,10 @@ func (c *Connector) serveTCP(ctx context.Context, cs *connState) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.listen, err)
 	}
-	stop := context.AfterFunc(ctx, func() { ln.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
 	defer func() {
 		if stop() {
-			ln.Close()
+			_ = ln.Close()
 		}
 	}()
 	c.record(cs.Name, func(st *Status) { st.Connected = true }, nil)
@@ -853,7 +853,7 @@ func (c *Connector) serveTCP(ctx context.Context, cs *connState) error {
 		select {
 		case slots <- struct{}{}:
 		default:
-			conn.Close() // too many clients
+			_ = conn.Close() // too many clients
 			continue
 		}
 		wg.Add(1)
@@ -869,16 +869,18 @@ func (c *Connector) serveTCP(ctx context.Context, cs *connState) error {
 // falls silent for tcpIdle or ctx ends.
 func (c *Connector) serveTCPConn(ctx context.Context, cs *connState, conn net.Conn) {
 	s := cs.server
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer func() {
 		stop()
-		conn.Close()
+		_ = conn.Close()
 	}()
 	writes := s.writesFrom(conn.LocalAddr())
 	from := conn.RemoteAddr().String()
 	var head [7]byte
 	for {
-		conn.SetReadDeadline(time.Now().Add(tcpIdle))
+		if err := conn.SetReadDeadline(time.Now().Add(tcpIdle)); err != nil {
+			return
+		}
 		if _, err := io.ReadFull(conn, head[:]); err != nil {
 			return
 		}
@@ -904,7 +906,9 @@ func (c *Connector) serveTCPConn(ctx context.Context, cs *connState, conn net.Co
 		}
 		out := append(head[:4:4], 0, 0, head[6])
 		binary.BigEndian.PutUint16(out[4:6], uint16(n))
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			return
+		}
 		if _, err := conn.Write(append(out, reply...)); err != nil {
 			return
 		}

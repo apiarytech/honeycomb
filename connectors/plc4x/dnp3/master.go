@@ -66,7 +66,9 @@ func (m *Master) Request(fc uint8, objects []byte) (Response, error) {
 	var in reassembler
 	deadline := time.Now().Add(m.Timeout)
 	for {
-		m.conn.SetReadDeadline(deadline)
+		if err := m.conn.SetReadDeadline(deadline); err != nil {
+			return Response{}, err
+		}
 		f, err := ReadFrame(m.conn)
 		if err != nil {
 			return Response{}, err
@@ -99,7 +101,9 @@ func (m *Master) sendFragment(frag []byte) error {
 		if err != nil {
 			return err
 		}
-		m.conn.SetWriteDeadline(time.Now().Add(m.Timeout))
+		if err := m.conn.SetWriteDeadline(time.Now().Add(m.Timeout)); err != nil {
+			return err
+		}
 		if _, err := m.conn.Write(b); err != nil {
 			return err
 		}
@@ -181,18 +185,22 @@ func Measurements(hs []Header) []Measurement {
 	var out []Measurement
 	for _, h := range hs {
 		for i, o := range h.Objects {
-			ms := Measurement{Group: h.Group, Variation: h.Variation, Index: uint16(h.Indexes[i])}
+			idx := h.Indexes[i]
+			if idx > math.MaxUint16 {
+				continue // ParseHeaders never makes one
+			}
+			ms := Measurement{Group: h.Group, Variation: h.Variation, Index: uint16(idx)}
 			switch [2]uint8{h.Group, h.Variation} {
 			case [2]uint8{1, 2}, [2]uint8{10, 2}:
 				ms.Online, ms.Bool = o[0]&flagOnline != 0, o[0]&flagState != 0
 			case [2]uint8{2, 2}:
 				ms.Online, ms.Bool, ms.Time = o[0]&flagOnline != 0, o[0]&flagState != 0, Time48(o[1:7])
 			case [2]uint8{30, 1}, [2]uint8{40, 1}:
-				ms.Online, ms.Number = o[0]&flagOnline != 0, float64(int32(binary.LittleEndian.Uint32(o[1:5])))
+				ms.Online, ms.Number = o[0]&flagOnline != 0, float64(int32le(o[1:5]))
 			case [2]uint8{30, 5}, [2]uint8{40, 3}:
 				ms.Online, ms.Number = o[0]&flagOnline != 0, float64(math.Float32frombits(binary.LittleEndian.Uint32(o[1:5])))
 			case [2]uint8{32, 3}:
-				ms.Online, ms.Number, ms.Time = o[0]&flagOnline != 0, float64(int32(binary.LittleEndian.Uint32(o[1:5]))), Time48(o[5:11])
+				ms.Online, ms.Number, ms.Time = o[0]&flagOnline != 0, float64(int32le(o[1:5])), Time48(o[5:11])
 			case [2]uint8{32, 7}:
 				ms.Online, ms.Number, ms.Time = o[0]&flagOnline != 0, float64(math.Float32frombits(binary.LittleEndian.Uint32(o[1:5]))), Time48(o[5:11])
 			case [2]uint8{12, 1}, [2]uint8{41, 1}, [2]uint8{41, 3}:

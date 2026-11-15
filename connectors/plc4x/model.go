@@ -346,7 +346,7 @@ func (c *Connector) connect(ctx context.Context, cs *connState) (plc4go.PlcConne
 	late := func() {
 		go func() {
 			if r := <-results; r.err == nil && r.conn != nil {
-				r.conn.Close()
+				_ = r.conn.Close()
 			}
 		}()
 	}

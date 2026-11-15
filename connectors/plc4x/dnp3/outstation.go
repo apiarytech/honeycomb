@@ -180,11 +180,13 @@ func (o *Outstation) iin() uint16 {
 // certificate without the operator role); by names it in the record.
 func (o *Outstation) Serve(ctx context.Context, conn net.Conn, commands bool, by string) error {
 	s := &session{o: o, conn: conn, commands: commands, by: by, confirmSeq: -1}
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	defer conn.Close()
 	for {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+			return err
+		}
 		f, err := ReadFrame(conn)
 		if errors.Is(err, ErrCRC) || errors.Is(err, ErrLength) {
 			continue // dropped; resynchronise on the next frame
@@ -262,7 +264,9 @@ func (s *session) send(fragment []byte) error {
 		if err != nil {
 			return err
 		}
-		s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			return err
+		}
 		if _, err := s.conn.Write(b); err != nil {
 			return err
 		}
@@ -384,8 +388,8 @@ func (s *session) static(w *bytes.Buffer, k Kind, h *Header) {
 			j++
 		}
 		w.Write([]byte{group, variation, qStartStop16})
-		binary.Write(w, binary.LittleEndian, pts[i].Index)
-		binary.Write(w, binary.LittleEndian, pts[j].Index)
+		w.Write(binary.LittleEndian.AppendUint16(nil, pts[i].Index))
+		w.Write(binary.LittleEndian.AppendUint16(nil, pts[j].Index))
 		for _, p := range pts[i : j+1] {
 			v, ok := s.o.cfg.Source.Read(p)
 			w.Write(encodeStatic(k, v, ok))
@@ -519,25 +523,40 @@ func (s *session) control(fc, seq uint8, b []byte) ([]byte, uint16) {
 	for _, h := range hs {
 		echo.Write([]byte{h.Group, h.Variation, h.Qualifier})
 		count := make([]byte, 0, 2)
+		n := len(h.Indexes)
 		switch h.Qualifier {
 		case qIndex8, qCount8:
-			count = append(count, byte(len(h.Indexes)))
+			if n > math.MaxUint8 {
+				return nil, IINParameterError
+			}
+			count = append(count, byte(n))
 		case qIndex16, qCount16:
-			count = binary.LittleEndian.AppendUint16(count, uint16(len(h.Indexes)))
+			if n > math.MaxUint16 {
+				return nil, IINParameterError
+			}
+			count = binary.LittleEndian.AppendUint16(count, uint16(n))
 		default:
 			return nil, IINParameterError
 		}
 		echo.Write(count)
 		for i, idx := range h.Indexes {
+			if idx > math.MaxUint16 {
+				return nil, IINParameterError
+			}
+			var prefix []byte
+			switch h.Qualifier {
+			case qIndex8:
+				if idx > math.MaxUint8 {
+					return nil, IINParameterError
+				}
+				prefix = []byte{byte(idx)}
+			case qIndex16:
+				prefix = binary.LittleEndian.AppendUint16(nil, uint16(idx))
+			}
 			obj := slices.Clone(h.Objects[i])
 			status := s.command(fc, h, uint16(idx), obj, selectOK)
 			obj[len(obj)-1] = status
-			switch h.Qualifier {
-			case qIndex8:
-				echo.WriteByte(byte(idx))
-			case qIndex16:
-				binary.Write(&echo, binary.LittleEndian, uint16(idx))
-			}
+			echo.Write(prefix)
 			echo.Write(obj)
 		}
 	}
@@ -559,7 +578,7 @@ func (s *session) command(fc uint8, h Header, idx uint16, obj []byte, selectOK b
 		}
 		p, v = Point{Kind: BinaryOutput, Index: idx}, Value{Bool: on, Online: true, Time: time.Now()}
 	case [2]uint8{41, 1}:
-		p, v = Point{Kind: AnalogOutput, Index: idx}, Value{Number: float64(int32(binary.LittleEndian.Uint32(obj[:4]))), Online: true, Time: time.Now()}
+		p, v = Point{Kind: AnalogOutput, Index: idx}, Value{Number: float64(int32le(obj[:4])), Online: true, Time: time.Now()}
 	case [2]uint8{41, 3}:
 		p, v = Point{Kind: AnalogOutput, Index: idx}, Value{Number: float64(math.Float32frombits(binary.LittleEndian.Uint32(obj[:4]))), Online: true, Time: time.Now()}
 	default:

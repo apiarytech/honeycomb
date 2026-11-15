@@ -21,6 +21,7 @@ package plc4x
 // the outstation's own time, so the station can see the difference.
 
 import (
+	"math"
 	"time"
 
 	iec "github.com/apache/plc4x/plc4go/protocols/iec608705104/readwrite/model"
@@ -31,8 +32,11 @@ import (
 // outstation does not trust (a tag never stamped).
 func cp56(t time.Time, invalid bool) iec.SevenOctetBinaryTime {
 	t = t.UTC()
-	ms := uint16(t.Second()*1000 + t.Nanosecond()/int(time.Millisecond))
-	dow := uint8(t.Weekday())
+	ms := t.Second()*1000 + t.Nanosecond()/int(time.Millisecond)
+	if ms < 0 || ms > 59999 {
+		ms, invalid = 0, true // never: time.Time keeps seconds 0 to 59
+	}
+	dow := octet(int(t.Weekday()))
 	if dow == 0 {
 		dow = 7 // Sunday is 7; Monday 1
 	}
@@ -40,7 +44,16 @@ func cp56(t time.Time, invalid bool) iec.SevenOctetBinaryTime {
 	if year < 0 || year > 99 {
 		year, invalid = 0, true
 	}
-	return iec.NewSevenOctetBinaryTime(ms, invalid, false, uint8(t.Minute()), false, uint8(t.Hour()), dow, uint8(t.Day()), uint8(t.Month()), uint8(year))
+	return iec.NewSevenOctetBinaryTime(uint16(ms), invalid, false, octet(t.Minute()), false, octet(t.Hour()), dow, octet(t.Day()), octet(int(t.Month())), uint8(year))
+}
+
+// octet narrows a calendar field time.Time keeps small (minute, hour, day,
+// month, weekday) to its CP56Time2a field.
+func octet(n int) uint8 {
+	if n < 0 || n > math.MaxUint8 {
+		return 0 // never
+	}
+	return uint8(n)
 }
 
 // FromCP56 reads a CP56Time2a as a UTC time.
@@ -94,7 +107,7 @@ func (c *Connector) iecTimedValue(p *iecPoint) (iec.InformationObject, bool) {
 	case "SCALED":
 		return iec.NewInformationObjectWithSevenByteTime_MEASURED_VALUE_SCALED_VALUE(p.ioa, iec.NewScaledValue(int16(asFloat(raw))), qds, at), true
 	default:
-		return iec.NewInformationObjectWithSevenByteTime_MEASURED_VALUE_NORMALISED_VALUE(p.ioa, iec.NewNormalizedValue(uint16(int16(asFloat(raw)))), qds, at), true
+		return iec.NewInformationObjectWithSevenByteTime_MEASURED_VALUE_NORMALISED_VALUE(p.ioa, iec.NewNormalizedValue(nvaBits(int16(asFloat(raw)))), qds, at), true
 	}
 }
 

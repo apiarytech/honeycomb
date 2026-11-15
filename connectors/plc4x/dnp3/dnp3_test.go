@@ -13,6 +13,7 @@ package dnp3
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"net"
 	"sync"
 	"testing"
@@ -288,5 +289,48 @@ func TestEventBufferBounded(t *testing.T) {
 	}
 	if o.Pending() != 3 || o.iin()&IINEventOverflow == 0 {
 		t.Errorf("%d events, IIN %04x", o.Pending(), o.iin())
+	}
+}
+
+// Controls with a one-octet index prefix are echoed with the same prefix,
+// and a 32-bit analog output block is read as two's complement.
+func TestControlsIndex8(t *testing.T) {
+	_, src, m := setup(t, true)
+	obj := []byte{12, 1, qIndex8, 1, 0, OpLatchOn, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	r, err := m.Request(FuncDirectOperate, obj)
+	if err != nil || status(r) != StatusSuccess {
+		t.Fatalf("direct operate: %d %v", status(r), err)
+	}
+	if len(r.Headers) != 1 || r.Headers[0].Qualifier != qIndex8 || len(r.Headers[0].Indexes) != 1 || r.Headers[0].Indexes[0] != 0 {
+		t.Errorf("echo %+v", r.Headers)
+	}
+	obj = []byte{41, 1, qIndex8, 1, 2, 0xFB, 0xFF, 0xFF, 0xFF, 0} // -5
+	if r, err = m.Request(FuncDirectOperate, obj); err != nil || status(r) != StatusSuccess {
+		t.Fatalf("analog direct operate: %d %v", status(r), err)
+	}
+	if v, _ := src.Read(Point{Kind: AnalogOutput, Index: 2}); v.Number != -5 {
+		t.Errorf("the analog output is %v", v.Number)
+	}
+}
+
+// The signed codecs keep the two's complement octets of the old
+// conversions, and absolute time round-trips.
+func TestSignedCodecs(t *testing.T) {
+	for _, v := range []int32{0, 1, -1, 5, -5, 123456789, -123456789, 2147483647, -2147483648} {
+		want := binary.LittleEndian.AppendUint32(nil, uint32(v))
+		if got := i32(float64(v)); !bytes.Equal(got, want) {
+			t.Errorf("i32(%d) = % x, want % x", v, got, want)
+		}
+		if got := int32le(want); got != v {
+			t.Errorf("int32le(% x) = %d, want %d", want, got, v)
+		}
+	}
+	for _, at := range []time.Time{time.UnixMilli(0).UTC(), time.Date(2026, 11, 15, 12, 34, 56, 789e6, time.UTC), time.UnixMilli(1<<47 - 1).UTC()} {
+		if got := Time48(time48(at)); !got.Equal(at) {
+			t.Errorf("Time48(time48(%v)) = %v", at, got)
+		}
+	}
+	if got := Time48([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}); got.UnixMilli() != 1<<48-1 {
+		t.Errorf("the largest time48 reads as %d", got.UnixMilli())
 	}
 }

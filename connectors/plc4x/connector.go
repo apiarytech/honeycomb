@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -334,7 +335,7 @@ func closeAfterRequests(cs *connState, plcConn plc4go.PlcConnection) {
 	case <-done:
 	case <-time.After(cs.timeout() + time.Second):
 	}
-	plcConn.Close()
+	_ = plcConn.Close()
 }
 
 // Option configures a Connector.
@@ -1055,7 +1056,10 @@ func (c *Connector) countFailure(cs *connState) {
 	cs.failures++
 	c.mu.Lock()
 	s := c.status[cs.Name]
-	s.Failures = uint32(cs.failures)
+	s.Failures = math.MaxUint32
+	if n := int64(cs.failures); n >= 0 && n <= math.MaxUint32 {
+		s.Failures = uint32(n)
+	}
 	c.status[cs.Name] = s
 	c.mu.Unlock()
 }
@@ -1139,7 +1143,7 @@ func (c *Connector) firstPathAnswers(ctx context.Context, cs *connState) bool {
 		return false
 	}
 	ok := conn.IsConnected()
-	conn.Close()
+	_ = conn.Close()
 	return ok
 }
 

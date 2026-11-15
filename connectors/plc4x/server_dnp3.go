@@ -99,12 +99,15 @@ func newDNP3Server(c *Connector, conn Connection) (*dnp3Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	if addr < 0 {
+	if addr < 0 || addr > 65519 {
 		return nil, fmt.Errorf("plc4x: server %q: no address: the outstation's link address, 0 to 65519", conn.Name)
 	}
 	master, err := num("master", 0, 0, 65519)
 	if err != nil {
 		return nil, err
+	}
+	if master < 0 || master > 65519 {
+		return nil, fmt.Errorf("plc4x: server %q: master %d: 0 to 65519", conn.Name, master)
 	}
 	events, err := num("events", 1000, 1, 100000)
 	if err != nil {
@@ -128,7 +131,7 @@ func newDNP3Server(c *Connector, conn Connection) (*dnp3Server, error) {
 			return nil, fmt.Errorf("plc4x: server %q: tag %q: address %q: <kind>:<index>[:<class>], kinds BI, AI, AI32, BO, AO, e.g. BI:0 or AI:3:2", conn.Name, b.Tag, b.Address)
 		}
 		idx, _ := strconv.Atoi(m[2])
-		if idx > 65535 {
+		if idx < 0 || idx > 65535 {
 			return nil, fmt.Errorf("plc4x: server %q: tag %q: index %d: 0 to 65535", conn.Name, b.Tag, idx)
 		}
 		p := dnp3.Point{Kind: dnp3Kinds[m[1]], Index: uint16(idx)}
@@ -144,8 +147,7 @@ func newDNP3Server(c *Connector, conn Connection) (*dnp3Server, error) {
 		default:
 			p.Class = 1
 			if m[3] != "" {
-				c, _ := strconv.Atoi(m[3])
-				p.Class = uint8(c)
+				p.Class = m[3][0] - '0' // one digit, 0 to 3
 			}
 		}
 		key := [2]int{int(p.Kind), idx}
@@ -208,10 +210,10 @@ func (c *Connector) serveDNP3(ctx context.Context, cs *connState) error {
 	if s.tls != nil {
 		ln = tls.NewListener(ln, s.tls)
 	}
-	stop := context.AfterFunc(ctx, func() { ln.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
 	defer func() {
 		if stop() {
-			ln.Close()
+			_ = ln.Close()
 		}
 	}()
 	c.record(cs.Name, func(st *Status) { st.Connected = true }, nil)
@@ -243,7 +245,7 @@ func (c *Connector) serveDNP3(ctx context.Context, cs *connState) error {
 		select {
 		case slots <- struct{}{}:
 		default:
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 		wg.Add(1)
@@ -256,7 +258,7 @@ func (c *Connector) serveDNP3(ctx context.Context, cs *connState) error {
 				ok, name, err := stationRights(conn, s.roles)
 				if err != nil {
 					c.onError(cs.Name, fmt.Errorf("dnp3 master %s refused: %w", conn.RemoteAddr(), err))
-					conn.Close()
+					_ = conn.Close()
 					return
 				}
 				commands = commands && ok
@@ -265,7 +267,9 @@ func (c *Connector) serveDNP3(ctx context.Context, cs *connState) error {
 				}
 			}
 			c.record(cs.Name, func(st *Status) { st.Reads++; st.LastRead = time.Now() }, nil)
-			s.out.Serve(ctx, conn, commands, who)
+			// Serve ends when the master goes, falls silent or ctx ends:
+			// none of them is a fault of the server.
+			_ = s.out.Serve(ctx, conn, commands, who)
 		}()
 	}
 }

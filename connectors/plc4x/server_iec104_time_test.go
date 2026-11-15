@@ -129,3 +129,16 @@ func TestIECClientKeepsSourceTime(t *testing.T) {
 		t.Errorf("client tag at %s quality %s; want %s uncertain", tag.Timestamp, tag.Quality, at)
 	}
 }
+
+// A normalised value keeps its two's complement octets both ways.
+func TestNormalisedValueBits(t *testing.T) {
+	for i := -32768; i <= 32767; i++ {
+		v := int16(i)
+		if got := nvaBits(v); got != uint16(v) {
+			t.Fatalf("nvaBits(%d) = %#04x, want %#04x", v, got, uint16(v))
+		}
+		if got := nvaValue(uint16(v)); got != v {
+			t.Fatalf("nvaValue(%#04x) = %d, want %d", uint16(v), got, v)
+		}
+	}
+}
