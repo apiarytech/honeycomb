@@ -332,7 +332,7 @@ var errDemoted = errors.New("demoted after successive failures")
 // A connection that arrives after the timeout is closed.
 func (c *Connector) connect(ctx context.Context, cs *connState) (plc4go.PlcConnection, error) {
 	if cs.ConnectTimeout <= 0 {
-		return c.manager.GetConnection(ctx, cs.URL)
+		return c.manager.GetConnection(ctx, cs.plc4xURL())
 	}
 	type result struct {
 		conn plc4go.PlcConnection
@@ -340,7 +340,7 @@ func (c *Connector) connect(ctx context.Context, cs *connState) (plc4go.PlcConne
 	}
 	results := make(chan result, 1)
 	go func() {
-		conn, err := c.manager.GetConnection(ctx, cs.URL)
+		conn, err := c.manager.GetConnection(ctx, cs.plc4xURL())
 		results <- result{conn, err}
 	}()
 	late := func() {
@@ -391,6 +391,7 @@ var capabilities = map[string]Capabilities{
 	"eip":             {},
 	"firmata":         {Subscribe: true, Events: true},
 	"iec-60870-5-104": {Subscribe: true, Events: true, Server: true, Note: "server: an IEC 60870-5-104 outstation over TCP (general interrogation, spontaneous transmission, commands)"},
+	"dnp3":            {Server: true, Note: "server only: a DNP3 outstation over TCP, the connector's own code (class 0 and event polls, controls); no client yet"},
 	"knxnet-ip":       {Subscribe: true, Events: true, Browse: true},
 	"logix":           {},
 	"modbus-ascii":    {Server: true, Note: "server: a Modbus ASCII slave on a serial port"},
