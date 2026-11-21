@@ -43,6 +43,18 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(append(body, '\n'))
 }
 
+// MarshalJSONSafe encodes v as encoding/json does, except that a NaN or ±Inf
+// float, which encoding/json refuses, is written as null. It is for values
+// that must be stored or sent whatever they hold, such as a tag's history.
+func MarshalJSONSafe(v any) ([]byte, error) {
+	body, err := json.Marshal(v)
+	var unsupported *json.UnsupportedValueError
+	if errors.As(err, &unsupported) {
+		body, err = json.Marshal(jsonSafe(reflect.ValueOf(v)))
+	}
+	return body, err
+}
+
 var (
 	jsonMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
 	textMarshalerType = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()

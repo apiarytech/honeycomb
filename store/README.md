@@ -40,7 +40,9 @@ keeps the two in sync.
 | Shutdown  | `persister.Close(ctx)`        | Stops the loop, saves every in-scope tag, closes the store.         |
 
 A failed flush keeps its tags queued and retries on the next interval, so a
-database outage never stalls the scan cycle.
+database outage never stalls the scan cycle. The Persister keeps each tag's
+latest value only; to deliver every change through an outage, use
+[forward](forward/README.md) (store-and-forward through a local spool).
 
 ## Folder layout
 
