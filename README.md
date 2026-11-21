@@ -17,6 +17,7 @@ The `TagDatabase` project provides a robust, thread-safe, and feature-rich in-me
   - [Subscriptions](#subscriptions)
   - [Change Feed](#change-feed)
   - [Batch Read](#batch-read)
+  - [Store-and-Forward](#store-and-forward)
 - [Installation](#installation)
 - [Usage](#usage)
   - [Initializing and Registering Types](#initializing-and-registering-types)
@@ -199,6 +200,9 @@ readings, err := db.ReadTags(ctx, []string{"Temp", "Lid", "Motors[1]"}) // err j
 ```
 
 Over HTTP, `GET /tags?names=Temp,Lid` (or repeated `name=` parameters) and `POST /tags` with `{"names": [...]}` (for lists too long for a URL; up to `MaxReadTags`) both return `{"tags": {"Temp": {"value": 42.5, "quality": 1, "timestamp": "…"}, ...}}`. A tag that cannot be read has quality 3 (Bad) and an `"error"`. `GET /tags` without names still lists all tags. `NetworkDatabaseClient.ReadTags` wraps the POST form, and returns `ErrReadTagsUnsupported` for an older server. Both implement `TagReader`, as both implement `ChangeSource`, so a client reads the same way in process and over the network.
+
+### Store-and-Forward
+`store/forward` delivers every change (or every change beyond a deadband) to databases that may be unreachable for a while. A collector copies the change feed into a spool, a SQLite file on the node's own disk, in the same transaction as its position; a forwarder per destination sends the spool in order and retries with backoff while the destination is down. A full spool drops its oldest records and each destination is told how many it lost; gaps in the feed are recorded with the tags' current values. Status tags (`SF_Backlog`, `SF_Online`, ...) let a program or an alarm watch it. See [store/forward/README.md](store/forward/README.md).
 
 ## Installation
 
