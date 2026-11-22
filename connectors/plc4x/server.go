@@ -128,17 +128,18 @@ type server struct {
 	iec      *iecServer            // an IEC 60870-5-104 server's points
 	dnp3     *dnp3Server           // a DNP3 outstation (server_dnp3.go)
 	s7       *s7Server             // an S7 server's areas
+	opcua    *opcuaServer          // an OPC UA server (server_opcua.go)
 }
 
 // IsServerURL says whether url is one a server connection can take: Modbus
-// RTU or ASCII on a serial port, Modbus TCP, IEC 60870-5-104 or S7 over TCP:
-// the protocols whose Capabilities say Server.
+// RTU or ASCII on a serial port, Modbus TCP, IEC 60870-5-104, S7, DNP3 or
+// OPC UA over TCP: the protocols whose Capabilities say Server.
 func IsServerURL(u string) bool {
 	return CapabilitiesOf(ProtocolOf(u)).Server
 }
 
 // serverPorts are the TCP servers' default ports.
-var serverPorts = map[string]string{"modbus-tcp": "502", "iec-60870-5-104": "2404", "s7": "102", "dnp3": "20000"}
+var serverPorts = map[string]string{"modbus-tcp": "502", "iec-60870-5-104": "2404", "s7": "102", "dnp3": "20000", "opcua": "4840"}
 
 // newServer reads a server connection: its URL and its bindings.
 func newServer(c *Connector, conn Connection) (*server, error) {
@@ -161,6 +162,9 @@ func newServer(c *Connector, conn Connection) (*server, error) {
 		return s, err
 	case "dnp3":
 		s.dnp3, err = newDNP3Server(c, conn)
+		return s, err
+	case "opcua":
+		s.opcua, err = newOPCUAServer(c, conn)
 		return s, err
 	}
 	for _, b := range conn.Bindings {
@@ -195,7 +199,7 @@ func newServer(c *Connector, conn Connection) (*server, error) {
 // address. A serial port's settings are those of PLC4X's serial transport.
 func (s *server) parseURL(raw string) error {
 	if !IsServerURL(raw) {
-		return fmt.Errorf("a server is Modbus RTU or ASCII on a serial port (modbus-rtu:serial://...), or Modbus TCP (modbus-tcp://0.0.0.0:502), IEC 60870-5-104 (iec-60870-5-104://0.0.0.0:2404), S7 (s7://0.0.0.0:102) or DNP3 (dnp3://0.0.0.0:20000), not %q", ProtocolOf(raw))
+		return fmt.Errorf("a server is Modbus RTU or ASCII on a serial port (modbus-rtu:serial://...), or Modbus TCP (modbus-tcp://0.0.0.0:502), IEC 60870-5-104 (iec-60870-5-104://0.0.0.0:2404), S7 (s7://0.0.0.0:102), DNP3 (dnp3://0.0.0.0:20000) or OPC UA (opcua:tcp://0.0.0.0:4840), not %q", ProtocolOf(raw))
 	}
 	s.proto = ProtocolOf(raw)
 	var q url.Values
@@ -712,6 +716,8 @@ func (c *Connector) runServer(ctx context.Context, cs *connState) {
 			err = c.serveIEC(ctx, cs)
 		case cs.server.dnp3 != nil:
 			err = c.serveDNP3(ctx, cs)
+		case cs.server.opcua != nil:
+			err = c.serveOPCUA(ctx, cs)
 		case cs.server.s7 != nil:
 			err = c.serveS7(ctx, cs)
 		case cs.server.tcp:

@@ -22,6 +22,7 @@ require (
 replace github.com/apiarytech/honeycomb => ../..
 
 // PLC4Go from ApiaryTech's fork (branch opcua-security), until the fixes are merged upstream:
-// OPC UA chunking, security policies and browsing, and the codec and model fixes the OPC UA
-// driver needs to talk to a server at all. A module using this one needs the same line.
-replace github.com/apache/plc4x/plc4go => github.com/apiarytech/plc4x/plc4go v0.0.0-20261122110142-f61efa267de8
+// OPC UA chunking, security policies, browsing, working subscriptions and writes, and the
+// codec and model fixes the OPC UA driver needs to talk to a server at all. A module using
+// this one needs the same line.
+replace github.com/apache/plc4x/plc4go => github.com/apiarytech/plc4x/plc4go v0.0.0-20261122123230-eb93b2cd9bd4

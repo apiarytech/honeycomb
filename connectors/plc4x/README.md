@@ -79,6 +79,7 @@ have no scaling and no poll group. `WithServerWrites` reports each write.
 | `modbus-tcp` | `modbus-tcp://0.0.0.0:502?default-unit-identifier=1&read-only-interfaces=eth1` | the Modbus forms above | Modbus TCP server |
 | `iec-60870-5-104` | `iec-60870-5-104://0.0.0.0:2404?read-only-interfaces=eth1&k=12&w=8` | `<ca>/<ioa>:<type>`, e.g. `1/100:FLOAT` (types `SP`, `DP`, `FLOAT`, `SCALED`, `NORM`); the client's tag is the same without the type | IEC 60870-5-104 outstation: connect handshake, general interrogation, spontaneous transmission of changed points, and single/double/set-point commands for `InOut` points |
 | `s7` | `s7://0.0.0.0:102?read-only-interfaces=eth1` | the PLC4X S7 form, e.g. `%DB1.DBW0:INT`, `%DB1.DBX0.0:BOOL`, `%M4.0:BOOL`, `%Q0.0:BOOL` | S7 server over ISO-on-TCP: COTP connect, setup communication, read-var and write-var on DB, M, I and Q areas |
+| `opcua` | `opcua:tcp://0.0.0.0:4840?security=Basic256Sha256&cert=server.pem&key=server-key.pem&trust=clients.pem` | a dotted name with an optional type, e.g. `Line1.Speed`, `Line1.Temps;INT[3]` | OPC UA server over UA-TCP (see below) |
 
 For the Modbus servers, `holding-register`/`coil` write requests (function
 codes 5, 6, 15, 16) are answered only for `InOut` points; everything else is
@@ -120,6 +121,44 @@ dnp3://0.0.0.0:20000?address=10&master=1&events=1000
 - Not yet: a DNP3 client (master) connection, unsolicited responses,
   multi-fragment responses (one fragment of 2048 octets; more events wait
   for the next read), counters, Secure Authentication (IEC 62351-5).
+
+### OPC UA server (the connector's own code)
+
+PLC4X has an OPC UA client only, so the connector serves OPC UA itself,
+package `opcua`, with PLC4X's OPC UA model for the service messages:
+
+```
+opcua:tcp://0.0.0.0:4840?security=None,Basic256Sha256&cert=server.pem&key=server-key.pem&trust=clients.pem&users=users.txt
+```
+
+- Each binding is a variable in namespace 1: `Line1.Speed` is the node
+  `ns=1;s=Line1.Speed` in the folder `ns=1;s=Line1` under Objects. The
+  address may give a data type (`;REAL`, `;INT[3]` for an array), IEC
+  61131-3 or OPC UA names; without one the tag's declared type is used.
+  `Output` bindings are read only, `InOut` ones writable. A written value of
+  another numeric type is converted.
+- `security`: the endpoints, `policy[:mode]` separated by commas; mode
+  `Sign` or `SignAndEncrypt` (the default). Policies: `None` (the default),
+  `Basic128Rsa15`, `Basic256`, `Basic256Sha256`, `Aes128_Sha256_RsaOaep`,
+  `Aes256_Sha256_RsaPss`. Any but `None` needs `cert` and `key` (PEM, RSA),
+  and `trust`: a PEM file of the clients' certificates or their CAs
+  (`trust=*` trusts every client, for tests only).
+- `users`: a file of `name:password` or `name:sha256:<hex>` lines. With it a
+  client logs in with a user name, its password encrypted with the server's
+  key (Basic256Sha256 on an endpoint without security); `anonymous=true`
+  also lets clients in without one. Writes are reported with the user.
+- `uri`, `name`, `endpoint`: the application URI, name and the endpoint URL
+  given to clients (by default `urn:<host>:honeycomb:<connection>`,
+  `honeycomb <connection>`, `opc.tcp://<host>:<port>`).
+- Services: GetEndpoints, FindServers, sessions, Browse, BrowseNext,
+  TranslateBrowsePathsToNodeIds, RegisterNodes, Read (the attributes of a
+  variable: value, data type, value rank, access level, ...), Write of
+  values, and subscriptions with data-change monitored items (trigger and
+  absolute deadband filters, keep-alives, acknowledgements, Republish).
+  Messages are chunked both ways (up to 16 MiB).
+- A read-only interface reads only, as for the other servers.
+- Not yet: methods, events and alarms, history, index ranges, structures,
+  and certificates made by the server itself.
 
 ### IEC 60870-5-104 time and quality
 
