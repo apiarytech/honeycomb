@@ -397,7 +397,7 @@ var capabilities = map[string]Capabilities{
 	"modbus-ascii":    {Server: true, Note: "server: a Modbus ASCII slave on a serial port"},
 	"modbus-rtu":      {Server: true, Note: "server: a Modbus RTU slave on a serial port"},
 	"modbus-tcp":      {Server: true, Note: "server: a Modbus TCP server"},
-	"opcua":           {Subscribe: true, Events: true, Browse: true, Server: true, Note: "server: an OPC UA server over UA-TCP, the connector's own code (read, write, browse, subscriptions; security policies None to Aes256_Sha256_RsaPss)"},
+	"opcua":           {Subscribe: true, Events: true, Browse: true, Server: true, Note: "server: an OPC UA server over UA-TCP, the connector's own code (read, write, browse, subscriptions, structures, methods, alarms and events, history; security policies None to Aes256_Sha256_RsaPss)"},
 	"s7":              {Subscribe: true, Events: true, Browse: true, Server: true, Note: "server: an S7 server over ISO-on-TCP (read/write var on DB, M, I, Q); as a client, subscriptions and browsing only on PLCs with user-data services"},
 	"slmp":            {Subscribe: true, Events: true},
 	"umas":            {Subscribe: true, Events: true, Browse: true},

@@ -255,8 +255,8 @@ func TestProtocol(t *testing.T) {
 		t.Errorf("Read before ActivateSession: 0x%08X", status)
 	}
 	c.session(true)
-	if status := fault(c.call(ua.NewCallRequest(c.header(), nil))); status != statusBadServiceUnsupported {
-		t.Errorf("Call: 0x%08X", status)
+	if status := fault(c.call(ua.NewAddNodesRequest(c.header(), nil))); status != statusBadServiceUnsupported {
+		t.Errorf("AddNodes: 0x%08X", status)
 	}
 	if status := fault(c.call(ua.NewReadRequest(c.header(), 0, 0, nil))); status != statusBadNothingToDo {
 		t.Errorf("Read of nothing: 0x%08X", status)

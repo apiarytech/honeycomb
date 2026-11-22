@@ -79,7 +79,7 @@ have no scaling and no poll group. `WithServerWrites` reports each write.
 | `modbus-tcp` | `modbus-tcp://0.0.0.0:502?default-unit-identifier=1&read-only-interfaces=eth1` | the Modbus forms above | Modbus TCP server |
 | `iec-60870-5-104` | `iec-60870-5-104://0.0.0.0:2404?read-only-interfaces=eth1&k=12&w=8` | `<ca>/<ioa>:<type>`, e.g. `1/100:FLOAT` (types `SP`, `DP`, `FLOAT`, `SCALED`, `NORM`); the client's tag is the same without the type | IEC 60870-5-104 outstation: connect handshake, general interrogation, spontaneous transmission of changed points, and single/double/set-point commands for `InOut` points |
 | `s7` | `s7://0.0.0.0:102?read-only-interfaces=eth1` | the PLC4X S7 form, e.g. `%DB1.DBW0:INT`, `%DB1.DBX0.0:BOOL`, `%M4.0:BOOL`, `%Q0.0:BOOL` | S7 server over ISO-on-TCP: COTP connect, setup communication, read-var and write-var on DB, M, I and Q areas |
-| `opcua` | `opcua:tcp://0.0.0.0:4840?security=Basic256Sha256&cert=server.pem&key=server-key.pem&trust=clients.pem` | a dotted name with an optional type, e.g. `Line1.Speed`, `Line1.Temps;INT[3]` | OPC UA server over UA-TCP (see below) |
+| `opcua` | `opcua:tcp://0.0.0.0:4840?security=Basic256Sha256&cert=server.pem&key=server-key.pem&trust=clients.pem` | a dotted name with an optional type, e.g. `Line1.Speed`, `Line1.Temps;INT[3]`; `Name()` for a method, `Name;ALARM[700]` for an alarm | OPC UA server over UA-TCP: variables, structures, methods, alarms, history (see below) |
 
 For the Modbus servers, `holding-register`/`coil` write requests (function
 codes 5, 6, 15, 16) are answered only for `InOut` points; everything else is
@@ -128,37 +128,66 @@ PLC4X has an OPC UA client only, so the connector serves OPC UA itself,
 package `opcua`, with PLC4X's OPC UA model for the service messages:
 
 ```
-opcua:tcp://0.0.0.0:4840?security=None,Basic256Sha256&cert=server.pem&key=server-key.pem&trust=clients.pem&users=users.txt
+opcua:tcp://0.0.0.0:4840?security=None,Basic256Sha256&cert-directory=pki&trust=clients.pem&users=users.txt&history=1000
 ```
 
-- Each binding is a variable in namespace 1: `Line1.Speed` is the node
-  `ns=1;s=Line1.Speed` in the folder `ns=1;s=Line1` under Objects. The
-  address may give a data type (`;REAL`, `;INT[3]` for an array), IEC
-  61131-3 or OPC UA names; without one the tag's declared type is used.
-  `Output` bindings are read only, `InOut` ones writable. A written value of
-  another numeric type is converted.
+Bindings:
+
+| Address | Served as |
+|---|---|
+| `Line1.Speed` | the variable `ns=1;s=Line1.Speed` in the folder `ns=1;s=Line1`, of the tag's declared type |
+| `Line1.Temps;INT[3]` | the same, with the type given (IEC 61131-3 or OPC UA names) |
+| `Motor1` (a UDT tag) | a structure: a DataType node with its DataTypeDefinition, the value as an ExtensionObject, and a variable per field (`Motor1.Speed`, `Motor1.Config.MaxSpeed`) |
+| `Line1.Reset()` | a method of `Line1` that sets the BOOL tag to TRUE; `InOut` |
+| `Line1.SetSpeed(REAL)` | a method that writes its argument to the tag; `InOut` |
+| `Line1.High;ALARM[700]` | an AlarmConditionType condition, active while the tag is TRUE (or not zero); severity 1 to 1000 (500), message the tag's description |
+
+`Output` bindings are read only, `InOut` ones writable. A written value of
+another numeric type is converted. Reads, writes and monitored items take
+index ranges (`1:3`) on arrays and strings.
+
+Options:
+
 - `security`: the endpoints, `policy[:mode]` separated by commas; mode
   `Sign` or `SignAndEncrypt` (the default). Policies: `None` (the default),
   `Basic128Rsa15`, `Basic256`, `Basic256Sha256`, `Aes128_Sha256_RsaOaep`,
-  `Aes256_Sha256_RsaPss`. Any but `None` needs `cert` and `key` (PEM, RSA),
-  and `trust`: a PEM file of the clients' certificates or their CAs
-  (`trust=*` trusts every client, for tests only).
-- `users`: a file of `name:password` or `name:sha256:<hex>` lines. With it a
-  client logs in with a user name, its password encrypted with the server's
-  key (Basic256Sha256 on an endpoint without security); `anonymous=true`
-  also lets clients in without one. Writes are reported with the user.
+  `Aes256_Sha256_RsaPss`. A channel without security can always find the
+  endpoints.
+- `cert`, `key`: the server's certificate and RSA key (PEM). Or
+  `cert-directory`: the server makes a self-signed certificate there
+  (`server.pem`, `server-key.pem`, five years, the application URI and host
+  names in it) and keeps it. Any policy but `None` needs one of the two.
+- `trust`: a PEM file of the clients' certificates or their CAs (`trust=*`
+  trusts every client, for tests only).
+- `users`: a file of `name:password` or `name:sha256:<hex>` lines; a client
+  then logs in with a user name, its password encrypted with the server's
+  key. `anonymous=true` also lets clients in without one. Writes, method
+  calls and acknowledgements are reported with the user.
+- `history`: values kept per variable, in memory, for HistoryRead (raw, in
+  either direction, with continuation points), and as many events on the
+  Server object; `history-events` sets the events apart, `history-interval`
+  (`1s`) how often the variables are sampled.
+- `alarm-interval` (`250ms`): how often the alarms' tags are looked at.
 - `uri`, `name`, `endpoint`: the application URI, name and the endpoint URL
   given to clients (by default `urn:<host>:honeycomb:<connection>`,
   `honeycomb <connection>`, `opc.tcp://<host>:<port>`).
-- Services: GetEndpoints, FindServers, sessions, Browse, BrowseNext,
-  TranslateBrowsePathsToNodeIds, RegisterNodes, Read (the attributes of a
-  variable: value, data type, value rank, access level, ...), Write of
-  values, and subscriptions with data-change monitored items (trigger and
-  absolute deadband filters, keep-alives, acknowledgements, Republish).
-  Messages are chunked both ways (up to 16 MiB).
-- A read-only interface reads only, as for the other servers.
-- Not yet: methods, events and alarms, history, index ranges, structures,
-  and certificates made by the server itself.
+- `read-only-interfaces`: clients reaching the server there only read: no
+  writes, method calls or acknowledgements.
+
+Services: GetEndpoints, FindServers, sessions, Browse, BrowseNext,
+TranslateBrowsePathsToNodeIds, RegisterNodes, Read of every attribute
+(including DataTypeDefinition), Write of values, Call, HistoryRead, and
+subscriptions with data-change items (trigger and absolute deadband) and
+event items (EventFilter: select clauses on BaseEventType and the condition
+types, where clauses with OfType, And, Or, Not, IsNull and comparisons).
+Alarms answer Acknowledge, Confirm, AddComment, Enable, Disable and
+ConditionRefresh. The address space has a type tree (data, object, variable
+and reference types) clients resolve names by. Messages are chunked both
+ways (up to 16 MiB).
+
+Not served: node management (AddNodes and the like), HistoryUpdate,
+aggregates (ReadProcessed), alarm shelving and dialogs, structures with
+optional fields, and arrays of structures.
 
 ### IEC 60870-5-104 time and quality
 

@@ -30,6 +30,8 @@ const (
 	keepAliveDefault      = 10
 	retransmitQueue       = 64
 	itemQueueMax          = 100
+	eventQueueMin         = 100
+	eventQueueMax         = 10000
 )
 
 // subscription samples its monitored items every publishing interval and sends what changed in
@@ -59,7 +61,8 @@ type subscription struct {
 	stopOnce sync.Once
 }
 
-// monitoredItem watches the Value of a variable.
+// monitoredItem watches the Value of a variable (or part of it, indexes), or the events of a
+// notifier (filter).
 type monitoredItem struct {
 	id            uint32
 	node          *node
@@ -70,17 +73,24 @@ type monitoredItem struct {
 	timestamps    ua.TimestampsToReturn
 	trigger       ua.DataChangeTrigger
 	deadband      float64 // absolute; 0 for none
+	indexes       *indexRange
+	filter        *eventFilter // an event item's
 
 	sampled bool
 	last    sample
 	lastRaw []byte
 	queue   []ua.DataValue
+	events  [][]ua.Variant
 }
 
 func (sub *subscription) stop() {
 	sub.stopOnce.Do(func() {
 		close(sub.done)
 		sub.ticker.Stop()
+		server := sub.s.c.s
+		server.subsMutex.Lock()
+		delete(server.subs, sub)
+		server.subsMutex.Unlock()
 	})
 }
 
@@ -121,6 +131,9 @@ func (c *conn) createSubscription(s *session, request ua.CreateSubscriptionReque
 	response := ua.NewCreateSubscriptionResponse(c.responseHeader(header, statusGood), sub.id,
 		float64(sub.interval)/float64(time.Millisecond), sub.lifetime, sub.keepAlive)
 	s.mutex.Unlock()
+	c.s.subsMutex.Lock()
+	c.s.subs[sub] = struct{}{}
+	c.s.subsMutex.Unlock()
 	go c.runSubscription(sub)
 	return response
 }
@@ -231,6 +244,11 @@ func queueSizeOf(requested uint32) int {
 	return int(min(max(requested, 1), itemQueueMax))
 }
 
+// eventQueueSizeOf is the queue of an event item: events do not replace each other.
+func eventQueueSizeOf(requested uint32) int {
+	return int(min(max(requested, eventQueueMin), eventQueueMax))
+}
+
 func (c *conn) createMonitoredItems(s *session, request ua.CreateMonitoredItemsRequest) ua.ExtensionObjectDefinition {
 	header := request.GetRequestHeader()
 	items := request.GetItemsToCreate()
@@ -256,28 +274,61 @@ func (c *conn) createMonitoredItems(s *session, request ua.CreateMonitoredItemsR
 		target := item.GetItemToMonitor()
 		n := c.s.space.nodes[keyOf(target.GetNodeId())]
 		parameters := item.GetRequestedParameters()
-		trigger, deadband, filterStatus := filterOf(parameters.GetFilter())
 		switch {
 		case n == nil:
 			results[i] = failed(statusBadNodeIdUnknown)
-		case target.GetAttributeId() != attrValue || n.class != ua.NodeClass_nodeClassVariable:
-			results[i] = failed(statusBadAttributeIdInvalid)
-		case stringOf(target.GetIndexRange()) != "":
-			results[i] = failed(statusBadIndexRangeInvalid)
+			continue
 		case item.GetMonitoringMode() > ua.MonitoringMode_monitoringModeReporting:
 			results[i] = failed(statusBadMonitoringModeInvalid)
-		case filterStatus != statusGood:
-			results[i] = failed(filterStatus)
+			continue
 		case len(sub.items) >= maxMonitoredItems:
 			results[i] = failed(statusBadTooManyMonitoredItems)
-		default:
-			sub.nextItem++
-			m := &monitoredItem{id: sub.nextItem, node: n, clientHandle: parameters.GetClientHandle(), mode: item.GetMonitoringMode(),
-				queueSize: queueSizeOf(parameters.GetQueueSize()), discardOldest: parameters.GetDiscardOldest(), timestamps: timestamps,
-				trigger: trigger, deadband: deadband}
-			sub.items[m.id] = m
-			results[i] = ua.NewMonitoredItemCreateResult(ua.NewStatusCode(statusGood), m.id, interval, uint32(m.queueSize), nullExtensionObject())
+			continue
 		}
+		m := &monitoredItem{node: n, clientHandle: parameters.GetClientHandle(), mode: item.GetMonitoringMode(),
+			discardOldest: parameters.GetDiscardOldest(), timestamps: timestamps}
+		filterResult := nullExtensionObject()
+		switch {
+		case target.GetAttributeId() == attrEventNotifier && n.class == ua.NodeClass_nodeClassObject:
+			if n.eventNotifier&notifierSubscribe == 0 {
+				results[i] = failed(statusBadAttributeIdInvalid)
+				continue
+			}
+			var eventFilterBody ua.EventFilter
+			if f := parameters.GetFilter(); f != nil {
+				eventFilterBody, _ = f.GetBody().(ua.EventFilter)
+			}
+			if eventFilterBody == nil {
+				results[i] = failed(statusBadEventFilterInvalid)
+				continue
+			}
+			filter, result, status := newEventFilter(eventFilterBody)
+			if status != statusGood {
+				results[i] = ua.NewMonitoredItemCreateResult(ua.NewStatusCode(status), 0, 0, 0, extensionObject(result, 736))
+				continue
+			}
+			m.filter, m.queueSize = filter, eventQueueSizeOf(parameters.GetQueueSize())
+			filterResult = extensionObject(result, 736)
+		case target.GetAttributeId() == attrValue && n.class == ua.NodeClass_nodeClassVariable:
+			indexes, ok := parseIndexRange(stringOf(target.GetIndexRange()))
+			if !ok {
+				results[i] = failed(statusBadIndexRangeInvalid)
+				continue
+			}
+			trigger, deadband, filterStatus := filterOf(parameters.GetFilter())
+			if filterStatus != statusGood {
+				results[i] = failed(filterStatus)
+				continue
+			}
+			m.indexes, m.trigger, m.deadband, m.queueSize = indexes, trigger, deadband, queueSizeOf(parameters.GetQueueSize())
+		default:
+			results[i] = failed(statusBadAttributeIdInvalid)
+			continue
+		}
+		sub.nextItem++
+		m.id = sub.nextItem
+		sub.items[m.id] = m
+		results[i] = ua.NewMonitoredItemCreateResult(ua.NewStatusCode(statusGood), m.id, interval, uint32(m.queueSize), filterResult)
 	}
 	return ua.NewCreateMonitoredItemsResponse(c.responseHeader(header, statusGood), results, nil)
 }
@@ -302,21 +353,44 @@ func (c *conn) modifyMonitoredItems(s *session, request ua.ModifyMonitoredItemsR
 	for i, item := range items {
 		m := sub.items[item.GetMonitoredItemId()]
 		parameters := item.GetRequestedParameters()
-		trigger, deadband, filterStatus := filterOf(parameters.GetFilter())
-		switch {
-		case m == nil:
+		if m == nil {
 			results[i] = ua.NewMonitoredItemModifyResult(ua.NewStatusCode(statusBadMonitoredItemIdInvalid), 0, 0, nullExtensionObject())
-		case filterStatus != statusGood:
-			results[i] = ua.NewMonitoredItemModifyResult(ua.NewStatusCode(filterStatus), 0, 0, nullExtensionObject())
-		default:
-			m.clientHandle, m.discardOldest, m.timestamps = parameters.GetClientHandle(), parameters.GetDiscardOldest(), request.GetTimestampsToReturn()
+			continue
+		}
+		filterResult := nullExtensionObject()
+		if m.filter != nil {
+			var body ua.EventFilter
+			if f := parameters.GetFilter(); f != nil {
+				body, _ = f.GetBody().(ua.EventFilter)
+			}
+			if body == nil {
+				results[i] = ua.NewMonitoredItemModifyResult(ua.NewStatusCode(statusBadEventFilterInvalid), 0, 0, nullExtensionObject())
+				continue
+			}
+			filter, result, status := newEventFilter(body)
+			filterResult = extensionObject(result, 736)
+			if status != statusGood {
+				results[i] = ua.NewMonitoredItemModifyResult(ua.NewStatusCode(status), 0, 0, filterResult)
+				continue
+			}
+			m.filter, m.queueSize = filter, eventQueueSizeOf(parameters.GetQueueSize())
+			if len(m.events) > m.queueSize {
+				m.events = m.events[len(m.events)-m.queueSize:]
+			}
+		} else {
+			trigger, deadband, filterStatus := filterOf(parameters.GetFilter())
+			if filterStatus != statusGood {
+				results[i] = ua.NewMonitoredItemModifyResult(ua.NewStatusCode(filterStatus), 0, 0, nullExtensionObject())
+				continue
+			}
 			m.trigger, m.deadband = trigger, deadband
 			m.queueSize = queueSizeOf(parameters.GetQueueSize())
 			if len(m.queue) > m.queueSize {
 				m.queue = m.queue[len(m.queue)-m.queueSize:]
 			}
-			results[i] = ua.NewMonitoredItemModifyResult(ua.NewStatusCode(statusGood), interval, uint32(m.queueSize), nullExtensionObject())
 		}
+		m.clientHandle, m.discardOldest, m.timestamps = parameters.GetClientHandle(), parameters.GetDiscardOldest(), request.GetTimestampsToReturn()
+		results[i] = ua.NewMonitoredItemModifyResult(ua.NewStatusCode(statusGood), interval, uint32(m.queueSize), filterResult)
 	}
 	return ua.NewModifyMonitoredItemsResponse(c.responseHeader(header, statusGood), results, nil)
 }
@@ -345,7 +419,7 @@ func (c *conn) setMonitoringMode(s *session, request ua.SetMonitoringModeRequest
 		}
 		m.mode = request.GetMonitoringMode()
 		if m.mode == ua.MonitoringMode_monitoringModeDisabled {
-			m.sampled, m.lastRaw, m.queue = false, nil, nil
+			m.sampled, m.lastRaw, m.queue, m.events = false, nil, nil, nil
 		}
 	}
 	return ua.NewSetMonitoringModeResponse(c.responseHeader(header, statusGood), statusCodes(results), nil)
@@ -466,43 +540,28 @@ func (c *conn) cycle(sub *subscription, sampling bool) (uint32, ua.ExtensionObje
 	}
 	if sampling {
 		for _, m := range sub.items {
-			if m.mode != ua.MonitoringMode_monitoringModeDisabled {
+			if m.mode != ua.MonitoringMode_monitoringModeDisabled && m.filter == nil {
 				c.s.sampleItem(m)
 			}
 		}
 	}
-	var notifications []ua.MonitoredItemNotification
-	more := false
+	pending := false
 	if sub.enabled {
-		for _, id := range slices.Sorted(maps.Keys(sub.items)) {
-			m := sub.items[id]
-			if m.mode != ua.MonitoringMode_monitoringModeReporting {
-				continue
-			}
-			for len(m.queue) > 0 {
-				if sub.maxNotifications != 0 && uint32(len(notifications)) >= sub.maxNotifications {
-					more = true
-					break
-				}
-				notifications = append(notifications, ua.NewMonitoredItemNotification(m.clientHandle, m.queue[0]))
-				m.queue = m.queue[1:]
+		for _, m := range sub.items {
+			if m.mode == ua.MonitoringMode_monitoringModeReporting && (len(m.queue) > 0 || len(m.events) > 0) {
+				pending = true
+				break
 			}
 		}
 	}
-	keepAliveDue := false
-	if len(notifications) == 0 {
-		if sampling {
-			sub.keepAliveCount++
-		}
-		keepAliveDue = sub.keepAliveCount >= sub.keepAlive
-		if !keepAliveDue {
-			return 0, nil
-		}
+	if !pending && sampling {
+		sub.keepAliveCount++
+	}
+	if !pending && sub.keepAliveCount < sub.keepAlive {
+		return 0, nil
 	}
 	if len(s.publishes) == 0 {
-		if len(notifications) > 0 {
-			sub.requeue(notifications)
-		}
+		// Nothing to answer with: the notifications wait in their queues.
 		if sampling {
 			sub.lifetimeCount++
 			if sub.lifetimeCount >= sub.lifetime {
@@ -515,15 +574,50 @@ func (c *conn) cycle(sub *subscription, sampling bool) (uint32, ua.ExtensionObje
 	p := s.publishes[0]
 	s.publishes = s.publishes[1:]
 	sub.keepAliveCount, sub.lifetimeCount = 0, 0
+
+	var changes []ua.MonitoredItemNotification
+	var events []ua.EventFieldList
+	more := false
+	full := func() bool {
+		return sub.maxNotifications != 0 && uint32(len(changes)+len(events)) >= sub.maxNotifications
+	}
+	if pending {
+		for _, id := range slices.Sorted(maps.Keys(sub.items)) {
+			m := sub.items[id]
+			if m.mode != ua.MonitoringMode_monitoringModeReporting {
+				continue
+			}
+			for len(m.queue) > 0 && !full() {
+				changes = append(changes, ua.NewMonitoredItemNotification(m.clientHandle, m.queue[0]))
+				m.queue = m.queue[1:]
+			}
+			for len(m.events) > 0 && !full() {
+				events = append(events, ua.NewEventFieldList(m.clientHandle, m.events[0]))
+				m.events = m.events[1:]
+			}
+			more = more || len(m.queue) > 0 || len(m.events) > 0
+		}
+	}
+	if more {
+		select { // the rest goes with the next Publish request
+		case sub.kick <- struct{}{}:
+		default:
+		}
+	}
 	now := dateTime(time.Now())
 	var message ua.NotificationMessage
-	if len(notifications) == 0 {
+	if len(changes) == 0 && len(events) == 0 {
 		message = ua.NewNotificationMessage(sub.sequence, now, nil) // a keep-alive does not use its number
 	} else {
-		data := ua.NewDataChangeNotification(notifications, nil)
-		message = ua.NewNotificationMessage(sub.sequence, now, []ua.ExtensionObject{
-			ua.NewBinaryExtensionObjectWithMask(expandedId(data.GetExtensionId()), ua.NewExtensionObjectEncodingMask(false, false, true), data),
-		})
+		var data []ua.ExtensionObject
+		if len(changes) > 0 {
+			changed := ua.NewDataChangeNotification(changes, nil)
+			data = append(data, extensionObject(changed, uint32(changed.GetExtensionId())))
+		}
+		if len(events) > 0 {
+			data = append(data, extensionObject(ua.NewEventNotificationList(events), 916))
+		}
+		message = ua.NewNotificationMessage(sub.sequence, now, data)
 		sub.sequence++
 		if sub.sequence == 0 {
 			sub.sequence = 1
@@ -541,25 +635,10 @@ func (c *conn) cycle(sub *subscription, sampling bool) (uint32, ua.ExtensionObje
 		message, statusCodes(p.results), nil)
 }
 
-// requeue puts notifications that found no Publish request back at the front of their items'
-// queues.
-func (sub *subscription) requeue(notifications []ua.MonitoredItemNotification) {
-	byHandle := map[uint32][]ua.DataValue{}
-	for _, n := range notifications {
-		byHandle[n.GetClientHandle()] = append(byHandle[n.GetClientHandle()], n.GetValue())
-	}
-	for _, m := range sub.items {
-		if values, ok := byHandle[m.clientHandle]; ok {
-			m.queue = append(values, m.queue...)
-			delete(byHandle, m.clientHandle)
-		}
-	}
-}
-
 // sampleItem reads an item's variable and queues the value when it changed as the item's
 // trigger and deadband say.
 func (s *Server) sampleItem(m *monitoredItem) {
-	got := s.sample(m.node)
+	got := s.sampleRange(m.node, m.indexes)
 	var raw []byte
 	if got.variant != nil {
 		raw, _ = got.variant.Serialize()

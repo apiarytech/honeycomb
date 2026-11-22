@@ -204,7 +204,7 @@ func TestOPCUAServerConfig(t *testing.T) {
 		"is not served":           {URL: "opcua:tcp://0.0.0.0:4840", Bindings: []Binding{out("A", "A;TIME")}},
 		"MotorData is not served": {URL: "opcua:tcp://0.0.0.0:4840", Bindings: []Binding{out("U", "U")}},
 		"two variables":           {URL: "opcua:tcp://0.0.0.0:4840", Bindings: []Binding{out("A", "X"), out("A", "ns=1;s=X")}},
-		"cannot also be a folder": {URL: "opcua:tcp://0.0.0.0:4840", Bindings: []Binding{out("A", "X"), out("A", "X.Y")}},
+		"is not a folder":         {URL: "opcua:tcp://0.0.0.0:4840", Bindings: []Binding{out("A", "X"), out("A", "X.Y")}},
 		"no such file":            {URL: "opcua:tcp://0.0.0.0:4840?users=" + filepath.Join(dir, "nope"), Bindings: []Binding{out("A", "A")}},
 		"anonymous":               {URL: "opcua:tcp://0.0.0.0:4840?anonymous=maybe", Bindings: []Binding{out("A", "A")}},
 	} {
@@ -245,4 +245,171 @@ func writeOPCUAIdentity(t *testing.T, dir string) (string, string) {
 		t.Fatal(err)
 	}
 	return cert, keyFile
+}
+
+// opcuaMotor is a UDT served as an OPC UA structure.
+type opcuaMotor struct {
+	Speed   plc.REAL
+	Running plc.BOOL
+	Temps   [3]plc.INT
+	Config  *opcuaMotorConfig
+}
+
+func (*opcuaMotor) TypeName() honeycomb.DataType { return "OPCUAMotor" }
+
+type opcuaMotorConfig struct {
+	MaxSpeed plc.LREAL
+	Label    plc.STRING
+}
+
+func (*opcuaMotorConfig) TypeName() honeycomb.DataType { return "OPCUAMotorConfig" }
+
+func init() {
+	honeycomb.RegisterUDT(&opcuaMotor{})
+	honeycomb.RegisterUDT(&opcuaMotorConfig{})
+}
+
+// TestOPCUAServerUDTMethodsAlarms: a UDT tag is a structure whose fields a
+// client reads and writes one by one; a Name() binding is a method that sets
+// its tag; an ;ALARM binding follows its tag.
+func TestOPCUAServerUDTMethodsAlarms(t *testing.T) {
+	port := freePort(t)
+	db := honeycomb.NewTagDatabase()
+	addTag(t, db, "Motor1", "OPCUAMotor", &opcuaMotor{Speed: 3.5, Running: true, Temps: [3]plc.INT{1, 2, 3},
+		Config: &opcuaMotorConfig{MaxSpeed: 90, Label: "m1"}})
+	addTag(t, db, "Reset", honeycomb.TypeBOOL, plc.BOOL(false))
+	addTag(t, db, "Target", honeycomb.TypeREAL, plc.REAL(0))
+	addTag(t, db, "High", honeycomb.TypeBOOL, plc.BOOL(false))
+	conn := Connection{Name: "plant", URL: fmt.Sprintf("opcua:tcp://127.0.0.1:%d?history=10&history-interval=50ms", port), Mode: Server,
+		Bindings: []Binding{inout("Motor1", "Motor1"), inout("Reset", "Line.Reset()"), inout("Target", "Line.SetTarget(LREAL)"),
+			out("High", "Line.High;ALARM[800]")}}
+	c, err := New(db, []Connection{conn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { c.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done }) // after the client closes
+
+	cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer ccancel()
+	client := opcuaClient(t, cctx, fmt.Sprintf("opcua:tcp://127.0.0.1:%d?discovery=false", port))
+	read, _ := client.ReadRequestBuilder().AddTagAddress("speed", "ns=1;s=Motor1.Speed").AddTagAddress("label", "ns=1;s=Motor1.Config.Label").
+		AddTagAddress("temps", "ns=1;s=Motor1.Temps").Build()
+	r := <-read.Execute(cctx)
+	if r.GetErr() != nil {
+		t.Fatal(r.GetErr())
+	}
+	if v := r.GetResponse().GetValue("speed").GetList()[0].GetFloat32(); v != 3.5 {
+		t.Errorf("Motor1.Speed %v", v)
+	}
+	if v := r.GetResponse().GetValue("label").GetList()[0].GetString(); v != "m1" {
+		t.Errorf("Motor1.Config.Label %q", v)
+	}
+	if v := r.GetResponse().GetValue("temps").GetList(); len(v) != 3 || v[2].GetInt16() != 3 {
+		t.Errorf("Motor1.Temps %v", v)
+	}
+	write, _ := client.WriteRequestBuilder().AddTagAddress("max", "ns=1;s=Motor1.Config.MaxSpeed;LREAL", 120.0).Build()
+	if w := <-write.Execute(cctx); w.GetErr() != nil || w.GetResponse().GetResponseCode("max") != apiModel.PlcResponseCode_OK {
+		t.Fatalf("write Motor1.Config.MaxSpeed: %v %v", w.GetErr(), w.GetResponse().GetResponseCode("max"))
+	}
+	v, _ := db.GetTagValue("Motor1")
+	motor := v.(*opcuaMotor)
+	if motor.Config.MaxSpeed != 120 || motor.Speed != 3.5 || motor.Config.Label != "m1" {
+		t.Errorf("Motor1 after the write: %+v %+v", motor, motor.Config)
+	}
+
+	// The methods and the alarm, as the server got them.
+	if c.connections[0].server.opcua == nil {
+		t.Fatal("no OPC UA server")
+	}
+	src := &opcuaSource{c: c, name: "plant"}
+	reset, err := src.method(inout("Reset", ""), "Line.Reset", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reset.Call(nil, "op"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := db.GetTagValue("Reset"); v != plc.BOOL(true) {
+		t.Errorf("Reset = %v", v)
+	}
+	setTarget, err := src.method(inout("Target", ""), "Line.SetTarget", "LREAL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setTarget.Call([]any{42.5}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := db.GetTagValue("Target"); v != plc.REAL(42.5) {
+		t.Errorf("Target = %v", v)
+	}
+	al, err := src.alarm(out("High", ""), "Line.High", "800")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if al.Active() || al.Severity != 800 {
+		t.Errorf("alarm %+v active %v", al, al.Active())
+	}
+	_ = db.SetTagValue("High", plc.BOOL(true))
+	if !al.Active() {
+		t.Error("the alarm did not follow its tag")
+	}
+}
+
+// TestOPCUAServerCertDirectory: with cert-directory the server makes its
+// certificate once and keeps it.
+func TestOPCUAServerCertDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pki")
+	_, port := startOPCUAServer(t, "security=Basic256Sha256&trust=*&cert-directory="+url.QueryEscape(dir))
+	first, err := os.ReadFile(filepath.Join(dir, "server.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	q := url.Values{"security-policy": {"Basic256Sha256"}, "message-security": {"SIGN_ENCRYPT"}, "tls.verify": {"false"}, "cert-directory": {t.TempDir()}}
+	client := opcuaClient(t, ctx, fmt.Sprintf("opcua:tcp://127.0.0.1:%d?%s", port, q.Encode()))
+	read, _ := client.ReadRequestBuilder().AddTagAddress("level", "ns=1;s=Tank.Level").Build()
+	if r := <-read.Execute(ctx); r.GetErr() != nil || r.GetResponse().GetResponseCode("level") != apiModel.PlcResponseCode_OK {
+		t.Fatalf("read over the made certificate: %v", r.GetErr())
+	}
+	db := honeycomb.NewTagDatabase()
+	addTag(t, db, "A", honeycomb.TypeINT, plc.INT(0))
+	if _, err := New(db, []Connection{{Name: "again", Mode: Server, URL: "opcua:tcp://127.0.0.1:0?security=Basic256Sha256&trust=*&cert-directory=" + url.QueryEscape(dir),
+		Bindings: []Binding{out("A", "A")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := os.ReadFile(filepath.Join(dir, "server.pem")); string(again) != string(first) {
+		t.Error("the certificate was made again")
+	}
+}
+
+func TestOPCUAServerBindingErrors(t *testing.T) {
+	db := honeycomb.NewTagDatabase()
+	addTag(t, db, "A", honeycomb.TypeINT, plc.INT(0))
+	addTag(t, db, "B", honeycomb.TypeBOOL, plc.BOOL(false))
+	for want, b := range map[string]Binding{
+		"is InOut":        out("B", "X()"),
+		"sets a BOOL tag": inout("A", "X()"),
+		"FOO is not":      inout("A", "X(FOO)"),
+		"not 1 to 1000":   out("B", "X;ALARM[2000]"),
+		"is not served":   out("A", "X;TIME"),
+	} {
+		_, err := New(db, []Connection{{Name: "S", Mode: Server, URL: "opcua:tcp://0.0.0.0:4840", Bindings: []Binding{b}}})
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v", want, err)
+		}
+	}
+	for want, query := range map[string]string{
+		"history":          "history=-1",
+		"history-interval": "history-interval=soon",
+		"alarm-interval":   "alarm-interval=0s",
+	} {
+		_, err := New(db, []Connection{{Name: "S", Mode: Server, URL: "opcua:tcp://0.0.0.0:4840?" + query, Bindings: []Binding{out("A", "A")}}})
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v", want, err)
+		}
+	}
 }

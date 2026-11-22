@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -98,6 +99,7 @@ type session struct {
 	user          string
 	lastUsed      time.Time
 	browses       map[string][]ua.ReferenceDescription
+	histories     map[string]historyCursor
 	subscriptions map[uint32]*subscription
 	publishes     []publishRequest
 }
@@ -190,6 +192,10 @@ func (c *conn) serveRequest(requestId uint32, request ua.ExtensionObjectDefiniti
 		return c.publish(s, requestId, request)
 	case ua.RepublishRequest:
 		return c.republish(s, request)
+	case ua.CallRequest:
+		return c.call(s, request)
+	case ua.HistoryReadRequest:
+		return c.historyRead(s, request)
 	}
 	return c.fault(header, statusBadServiceUnsupported)
 }
@@ -325,7 +331,7 @@ func (c *conn) createSession(request ua.CreateSessionRequest) ua.ExtensionObject
 	timeout := time.Duration(request.GetRequestedSessionTimeout() * float64(time.Millisecond))
 	timeout = min(max(timeout, sessionTimeoutMin), sessionTimeoutMax)
 	s := &session{c: c, nonce: randomBytes(32), timeout: timeout, lastUsed: time.Now(),
-		browses: map[string][]ua.ReferenceDescription{}, subscriptions: map[uint32]*subscription{}}
+		browses: map[string][]ua.ReferenceDescription{}, histories: map[string]historyCursor{}, subscriptions: map[uint32]*subscription{}}
 	s.token = ua.NewNodeId(ua.NewNodeIdGuid(1, randomBytes(16)))
 	s.tokenKey = keyOf(s.token)
 	c.s.mutex.Lock()
@@ -717,23 +723,31 @@ func (c *conn) read(request ua.ReadRequest) ua.ExtensionObjectDefinition {
 	}
 	results := make([]ua.DataValue, len(nodes))
 	for i, r := range nodes {
-		results[i] = c.s.readValueId(r, timestamps)
+		results[i] = c.readValueId(r, timestamps)
 	}
 	return ua.NewReadResponse(c.responseHeader(header, statusGood), results, nil)
 }
 
-func (s *Server) readValueId(r ua.ReadValueId, timestamps ua.TimestampsToReturn) ua.DataValue {
-	n := s.space.nodes[keyOf(r.GetNodeId())]
+func (c *conn) readValueId(r ua.ReadValueId, timestamps ua.TimestampsToReturn) ua.DataValue {
+	n := c.s.space.nodes[keyOf(r.GetNodeId())]
 	if n == nil {
 		return statusValue(statusBadNodeIdUnknown)
 	}
-	if stringOf(r.GetIndexRange()) != "" {
+	indexes, ok := parseIndexRange(stringOf(r.GetIndexRange()))
+	if !ok {
 		return statusValue(statusBadIndexRangeInvalid)
 	}
-	if encoding := r.GetDataEncoding(); encoding != nil && stringOf(encoding.GetName()) != "" {
+	if encoding := r.GetDataEncoding(); encoding != nil && stringOf(encoding.GetName()) != "" &&
+		!(stringOf(encoding.GetName()) == "Default Binary" && n.structure != nil) {
 		return statusValue(statusBadDataEncodingUnsupported)
 	}
-	return s.readAttribute(n, r.GetAttributeId(), timestamps)
+	if r.GetAttributeId() == attrValue && n.class == ua.NodeClass_nodeClassVariable {
+		return c.s.readValue(n, indexes, timestamps)
+	}
+	if indexes != nil {
+		return statusValue(statusBadIndexRangeNoData)
+	}
+	return c.s.readAttribute(n, r.GetAttributeId(), c.mayWrite)
 }
 
 func statusValue(status uint32) ua.DataValue {
@@ -767,39 +781,64 @@ func scalar(variant ua.Variant, err error) ua.DataValue {
 	return dataValue(variant, statusGood, time.Time{}, ua.TimestampsToReturn_timestampsToReturnNeither)
 }
 
-func (s *Server) readAttribute(n *node, attribute uint32, timestamps ua.TimestampsToReturn) ua.DataValue {
+func plain(variant ua.Variant) ua.DataValue {
+	return dataValue(variant, statusGood, time.Time{}, ua.TimestampsToReturn_timestampsToReturnNeither)
+}
+
+// readAttribute reads an attribute other than a variable's Value. writes says whether the
+// client may write (its UserAccessLevel and UserExecutable).
+func (s *Server) readAttribute(n *node, attribute uint32, writes bool) ua.DataValue {
 	variable := n.class == ua.NodeClass_nodeClassVariable
+	variableType := n.class == ua.NodeClass_nodeClassVariableType
+	isType := n.class == ua.NodeClass_nodeClassObjectType || variableType || n.class == ua.NodeClass_nodeClassDataType ||
+		n.class == ua.NodeClass_nodeClassReferenceType
+	history := s.cfg.History.Depth > 0
 	switch attribute {
 	case attrNodeId:
-		return dataValue(ua.NewVariantNodeId(false, false, nil, nil, nil, []ua.NodeId{n.id}), statusGood, time.Time{}, ua.TimestampsToReturn_timestampsToReturnNeither)
+		return plain(variantNodeId(n.id))
 	case attrNodeClass:
 		return scalar(variantOf(int32(n.class), TypeInt32))
 	case attrBrowseName:
-		return dataValue(ua.NewVariantQualifiedName(false, false, nil, nil, nil, []ua.QualifiedName{ua.NewQualifiedName(n.namespace, str(n.name))}), statusGood, time.Time{}, ua.TimestampsToReturn_timestampsToReturnNeither)
+		return plain(ua.NewVariantQualifiedName(false, false, nil, nil, nil, []ua.QualifiedName{ua.NewQualifiedName(n.namespace, str(n.name))}))
 	case attrDisplayName:
-		return dataValue(ua.NewVariantLocalizedText(false, false, nil, nil, nil, []ua.LocalizedText{text(n.name)}), statusGood, time.Time{}, ua.TimestampsToReturn_timestampsToReturnNeither)
+		return plain(variantText(n.name))
 	case attrDescription:
-		return dataValue(ua.NewVariantLocalizedText(false, false, nil, nil, nil, []ua.LocalizedText{text(n.description)}), statusGood, time.Time{}, ua.TimestampsToReturn_timestampsToReturnNeither)
+		return plain(variantText(n.description))
 	case attrWriteMask, attrUserWriteMask:
 		return scalar(variantOf(uint32(0), TypeUInt32))
+	case attrIsAbstract:
+		if isType {
+			return plain(variantBool(n.isAbstract))
+		}
+	case attrSymmetric:
+		if n.class == ua.NodeClass_nodeClassReferenceType {
+			return plain(variantBool(n.symmetric))
+		}
+	case attrInverseName:
+		if n.class == ua.NodeClass_nodeClassReferenceType {
+			return plain(variantText(n.inverseName))
+		}
 	case attrEventNotifier:
 		if n.class == ua.NodeClass_nodeClassObject {
-			return scalar(variantOf(uint8(0), TypeByte))
+			return scalar(variantOf(n.eventNotifier, TypeByte))
 		}
 	case attrValue:
-		if variable {
-			return s.readValue(n, timestamps)
+		if variableType {
+			return dataValue(nil, statusGood, time.Time{}, ua.TimestampsToReturn_timestampsToReturnNeither)
 		}
 	case attrDataType:
-		if variable {
-			return dataValue(ua.NewVariantNodeId(false, false, nil, nil, nil, []ua.NodeId{numericNodeId(0, n.dataType)}), statusGood, time.Time{}, ua.TimestampsToReturn_timestampsToReturnNeither)
+		if variable || variableType {
+			if n.dataTypeId != nil {
+				return plain(variantNodeId(n.dataTypeId))
+			}
+			return plain(variantNodeId(numericNodeId(0, n.dataType)))
 		}
 	case attrValueRank:
-		if variable {
+		if variable || variableType {
 			return scalar(variantOf(n.valueRank, TypeInt32))
 		}
 	case attrArrayDimensions:
-		if variable {
+		if variable || variableType {
 			if n.dims == nil {
 				return dataValue(nil, statusGood, time.Time{}, ua.TimestampsToReturn_timestampsToReturnNeither)
 			}
@@ -807,11 +846,11 @@ func (s *Server) readAttribute(n *node, attribute uint32, timestamps ua.Timestam
 		}
 	case attrAccessLevel:
 		if variable {
-			return scalar(variantOf(n.accessLevel(true), TypeByte))
+			return scalar(variantOf(n.accessLevel(true, history), TypeByte))
 		}
 	case attrUserAccessLevel:
 		if variable {
-			return scalar(variantOf(n.accessLevel(true), TypeByte))
+			return scalar(variantOf(n.accessLevel(writes, history), TypeByte))
 		}
 	case attrMinimumSamplingInterval:
 		if variable {
@@ -819,7 +858,19 @@ func (s *Server) readAttribute(n *node, attribute uint32, timestamps ua.Timestam
 		}
 	case attrHistorizing:
 		if variable {
-			return scalar(variantOf(false, TypeBoolean))
+			return plain(variantBool(n.accessLevel(true, history)&4 != 0))
+		}
+	case attrExecutable:
+		if n.method != nil {
+			return plain(variantBool(n.method.executable))
+		}
+	case attrUserExecutable:
+		if n.method != nil {
+			return plain(variantBool(n.method.executable && writes))
+		}
+	case attrDataTypeDefinition:
+		if n.definition != nil {
+			return plain(n.definition.definitionVariant())
 		}
 	}
 	return statusValue(statusBadAttributeIdInvalid)
@@ -832,39 +883,75 @@ type sample struct {
 	time    time.Time
 }
 
-func (s *Server) sample(n *node) sample {
-	if n.value != nil {
-		v, t := n.value()
-		if t == 0 {
-			return sample{status: statusBadNotReadable}
-		}
-		variant, err := variantOf(v, t)
-		if err != nil {
-			return sample{status: statusBadInternalError}
-		}
-		return sample{variant: variant, time: time.Now()}
-	}
-	if n.point == nil {
-		return sample{status: statusBadNotReadable}
-	}
+// current is the Go value of a point or member variable as the Source has it.
+func (s *Server) current(n *node) (any, uint32, time.Time) {
 	value, ok := s.cfg.Source.Read(*n.point)
 	if !ok || value.Value == nil {
-		return sample{status: statusBadWaitingForInitialData}
-	}
-	variant, err := variantOf(value.Value, n.point.DataType)
-	if err != nil {
-		s.onError(fmt.Errorf("opcua: point %s: %w", n.point.Name, err))
-		return sample{status: statusBadTypeMismatch}
+		return nil, statusBadWaitingForInitialData, time.Time{}
 	}
 	status := uint32(statusGood)
 	if !value.Good {
 		status = statusBad
 	}
-	return sample{variant: variant, status: status, time: value.Time}
+	v := value.Value
+	if n.path != nil {
+		if v, ok = member(v, n.path); !ok {
+			return nil, statusBadWaitingForInitialData, time.Time{}
+		}
+	}
+	return v, status, value.Time
 }
 
-func (s *Server) readValue(n *node, timestamps ua.TimestampsToReturn) ua.DataValue {
-	got := s.sample(n)
+// encode is the Variant of a variable's Go value.
+func (s *Server) encode(n *node, v any) (ua.Variant, error) {
+	if n.structure != nil {
+		return n.structure.variant(v)
+	}
+	return variantOf(v, n.dataType)
+}
+
+func (s *Server) sample(n *node) sample {
+	return s.sampleRange(n, nil)
+}
+
+// sampleRange is a variable's value, or the part an index range selects.
+func (s *Server) sampleRange(n *node, indexes *indexRange) sample {
+	if n.variant != nil {
+		if indexes != nil {
+			return sample{status: statusBadIndexRangeNoData}
+		}
+		v := n.variant()
+		if v == nil {
+			return sample{status: statusBadNotReadable}
+		}
+		return sample{variant: v, time: time.Now()}
+	}
+	if n.point == nil {
+		return sample{status: statusBadNotReadable}
+	}
+	v, status, t := s.current(n)
+	if v == nil {
+		return sample{status: status}
+	}
+	if indexes != nil {
+		if n.structure != nil {
+			return sample{status: statusBadIndexRangeNoData}
+		}
+		var rangeStatus uint32
+		if v, rangeStatus = indexes.apply(v); rangeStatus != statusGood {
+			return sample{status: rangeStatus}
+		}
+	}
+	variant, err := s.encode(n, v)
+	if err != nil {
+		s.onError(fmt.Errorf("opcua: %s: %w", strings.TrimPrefix(n.key, "ns=1;s="), err))
+		return sample{status: statusBadTypeMismatch}
+	}
+	return sample{variant: variant, status: status, time: t}
+}
+
+func (s *Server) readValue(n *node, indexes *indexRange, timestamps ua.TimestampsToReturn) ua.DataValue {
+	got := s.sampleRange(n, indexes)
 	if got.variant == nil {
 		return statusValue(got.status)
 	}
@@ -892,7 +979,7 @@ func (c *conn) writeValue(w ua.WriteValue, user string) uint32 {
 	if n == nil {
 		return statusBadNodeIdUnknown
 	}
-	if w.GetAttributeId() < attrNodeId || w.GetAttributeId() > attrHistorizing {
+	if w.GetAttributeId() < attrNodeId || w.GetAttributeId() > attrDataTypeDefinition {
 		return statusBadAttributeIdInvalid
 	}
 	if w.GetAttributeId() != attrValue || n.point == nil || !n.point.Writable {
@@ -901,37 +988,86 @@ func (c *conn) writeValue(w ua.WriteValue, user string) uint32 {
 	if !c.mayWrite {
 		return statusBadUserAccessDenied
 	}
-	if stringOf(w.GetIndexRange()) != "" {
+	indexes, ok := parseIndexRange(stringOf(w.GetIndexRange()))
+	if !ok {
 		return statusBadIndexRangeInvalid
 	}
 	if w.GetValue() == nil || !w.GetValue().GetValueSpecified() || w.GetValue().GetValue() == nil {
 		return statusBadTypeMismatch
 	}
-	value, status := convert(*n.point, w.GetValue().GetValue())
+	arrayLength := 0
+	if len(n.dims) == 1 {
+		arrayLength = int(n.dims[0])
+	}
+	if indexes != nil {
+		arrayLength = -1 // any length: the range says
+	}
+	value, status := convertTo(n.dataType, arrayLength, n.structure, w.GetValue().GetValue())
 	if status != statusGood {
 		return status
 	}
+	if indexes != nil || n.path != nil {
+		full, fullStatus, _ := c.s.currentFull(n)
+		if fullStatus != statusGood {
+			return fullStatus
+		}
+		if indexes != nil {
+			part := full
+			if n.path != nil {
+				part, _ = member(full, n.path)
+			}
+			if value, status = indexes.splice(part, value); status != statusGood {
+				return status
+			}
+		}
+		if n.path != nil {
+			if value, ok = withMemberAny(full, n.path, value); !ok {
+				return statusBadInternalError
+			}
+		}
+	}
 	if err := c.s.cfg.Source.Write(*n.point, value, user); err != nil {
-		c.s.onError(fmt.Errorf("opcua: writing %s: %w", n.point.Name, err))
+		c.s.onError(fmt.Errorf("opcua: writing %s: %w", strings.TrimPrefix(n.key, "ns=1;s="), err))
 		return statusBadNotWritable
 	}
 	return statusGood
 }
 
-// convert decodes a written Variant into a value of the point's type: a number of another
-// numeric type converts, anything else must have the point's type, and an array the point's
-// length.
-func convert(p Point, variant ua.Variant) (any, uint32) {
-	value, dataType, err := valueOf(variant)
+// currentFull is the whole value of a variable's point (a member's structure).
+func (s *Server) currentFull(n *node) (any, uint32, time.Time) {
+	value, ok := s.cfg.Source.Read(*n.point)
+	if !ok || value.Value == nil {
+		return nil, statusBadWaitingForInitialData, time.Time{}
+	}
+	return value.Value, statusGood, value.Time
+}
+
+func withMemberAny(full any, path []string, value any) (any, bool) {
+	out, err := withMember(full, path, value)
+	return out, err == nil
+}
+
+// convertTo decodes a written Variant into a value of a variable's type: a number of another
+// numeric type converts, anything else must have the type, and an array arrayLength elements
+// (any number for -1). A structure is decoded by its definition.
+func convertTo(dataType uint32, arrayLength int, structure *structureType, variant ua.Variant) (any, uint32) {
+	if structure != nil {
+		value, err := structure.valueOf(variant)
+		if err != nil {
+			return nil, statusBadTypeMismatch
+		}
+		return value, statusGood
+	}
+	value, actual, err := valueOf(variant)
 	if err != nil {
 		return nil, statusBadTypeMismatch
 	}
 	numeric := func(t uint32) bool { return t >= TypeSByte && t <= TypeDouble }
-	if dataType != p.DataType {
-		if !numeric(dataType) || !numeric(p.DataType) {
+	if actual != dataType {
+		if !numeric(actual) || !numeric(dataType) {
 			return nil, statusBadTypeMismatch
 		}
-		converted, err := variantOf(value, p.DataType)
+		converted, err := variantOf(value, dataType)
 		if err != nil {
 			return nil, statusBadTypeMismatch
 		}
@@ -941,7 +1077,9 @@ func convert(p Point, variant ua.Variant) (any, uint32) {
 	}
 	rv := reflect.ValueOf(value)
 	array := rv.Kind() == reflect.Slice
-	if array != (p.ArrayLength > 0) || array && rv.Len() != p.ArrayLength {
+	switch {
+	case arrayLength == -1:
+	case array != (arrayLength > 0), array && rv.Len() != arrayLength:
 		return nil, statusBadTypeMismatch
 	}
 	return value, statusGood
