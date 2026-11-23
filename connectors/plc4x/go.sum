@@ -1,7 +1,7 @@
 github.com/ajankovic/xdiff v0.0.1 h1:V1cj8t5xwYzm6ZGPqPOlAc9AIajXuTEn41D/1MJBWMM=
 github.com/ajankovic/xdiff v0.0.1/go.mod h1:SUmEZ67uB97I0zkiuQ+lb+LOms9ipn8X+p+2RdJV710=
-github.com/apiarytech/plc4x/plc4go v0.0.0-20261123040149-40c9680e8f06 h1:1tHeNC9KPhZbAERpzeWU9KnFsNeldnuhy1Pwgoi1eJU=
-github.com/apiarytech/plc4x/plc4go v0.0.0-20261123040149-40c9680e8f06/go.mod h1:TcyC4UJb+IVS6aN6Bb2UcWFSFXUUrUn/vWOtfYxxA3Q=
+github.com/apiarytech/plc4x/plc4go v0.0.0-20261123050917-2d0dc4deb0ab h1:F/ZYjwM8IBOENKcjHBIw9Pw0lLA7HgA/wdCd2U0j8yw=
+github.com/apiarytech/plc4x/plc4go v0.0.0-20261123050917-2d0dc4deb0ab/go.mod h1:TcyC4UJb+IVS6aN6Bb2UcWFSFXUUrUn/vWOtfYxxA3Q=
 github.com/apiarytech/royaljelly v0.4.0 h1:GUKWj+HmOYQ8NvmwUK4C9JePo/KFcgXVAqAu21knXwQ=
 github.com/apiarytech/royaljelly v0.4.0/go.mod h1:btdgGAeb/abudrywsv5lYjflnyX3LcAOrNLLRF6b3iA=
 github.com/fatih/color v1.19.0 h1:Zp3PiM21/9Ld6FzSKyL5c/BULoe/ONr9KlbYVOfG8+w=
