@@ -20,7 +20,7 @@ var allDrivers = []registerFunc{
 	drivers.RegisterCanopenDriver, drivers.RegisterCBusDriver, drivers.RegisterEipDriver, drivers.RegisterLogixDriver,
 	drivers.RegisterFirmataDriver, drivers.RegisterIec608705104Driver, drivers.RegisterKnxDriver,
 	drivers.RegisterModbusTcpDriver, drivers.RegisterModbusRtuDriver, drivers.RegisterModbusAsciiDriver,
-	drivers.RegisterOpcuaDriver, drivers.RegisterS7Driver, drivers.RegisterSlmpDriver, drivers.RegisterUmasDriver,
+	drivers.RegisterOpcuaDriver, drivers.RegisterProfinetDriver, drivers.RegisterS7Driver, drivers.RegisterSlmpDriver, drivers.RegisterUmasDriver,
 }
 
 var (
