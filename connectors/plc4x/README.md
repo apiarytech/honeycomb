@@ -3,7 +3,7 @@
 Exchanges field-device data with a honeycomb `TagDatabase` using
 [Apache PLC4X](https://plc4x.apache.org) (Go). PLC4X supplies the protocol
 drivers: S7, Modbus TCP/RTU/ASCII, EtherNet/IP, Logix, ADS, OPC UA, BACnet/IP,
-KNXnet/IP, C-Bus, Firmata, IEC 60870-5-104, SLMP and UMAS.
+KNXnet/IP, C-Bus, CANopen, Firmata, IEC 60870-5-104, SLMP and UMAS.
 
 ```go
 import "github.com/apiarytech/honeycomb/connectors/plc4x"
