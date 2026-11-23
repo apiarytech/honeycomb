@@ -388,6 +388,7 @@ var capabilities = map[string]Capabilities{
 	"ads":             {Subscribe: true, Events: true, Browse: true},
 	"bacnet-ip":       {Subscribe: true, Events: true},
 	"c-bus":           {Subscribe: true, Events: true, Browse: true},
+	"canopen":         {Subscribe: true, Events: true, Note: "SocketCAN (Linux) or the in-process virtualcan bus: SDO tags are read by polling; PDO, NMT and HEARTBEAT tags only arrive in Event or ChangeOfState mode, so a device needs one connection of each; no Cyclic mode"},
 	"eip":             {},
 	"firmata":         {Subscribe: true, Events: true},
 	"iec-60870-5-104": {Subscribe: true, Events: true, Server: true, Note: "server: an IEC 60870-5-104 outstation over TCP (general interrogation, spontaneous transmission, commands)"},
