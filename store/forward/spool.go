@@ -110,7 +110,7 @@ func OpenSpool(ctx context.Context, path string, opts SpoolOptions) (*Spool, err
 	}
 	s, err := NewSpool(ctx, db, opts)
 	if err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	s.own = true
@@ -192,12 +192,12 @@ func (s *Spool) registerSinks(ctx context.Context) error {
 		for rows.Next() {
 			var name string
 			if err := rows.Scan(&name); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return err
 			}
 			have = append(have, name)
 		}
-		rows.Close()
+		_ = rows.Close()
 		if err := rows.Err(); err != nil {
 			return err
 		}
@@ -322,7 +322,7 @@ func (s *Spool) Read(ctx context.Context, sink string, max int) (Batch, error) {
 	for drops.Next() {
 		var through, first, fromNs, toNs int64
 		if err := drops.Scan(&through, &first, &fromNs, &toNs); err != nil {
-			drops.Close()
+			_ = drops.Close()
 			return b, fmt.Errorf("forward: read spool: %w", err)
 		}
 		b.Lost += through - max64(first-1, acked)
@@ -334,7 +334,7 @@ func (s *Spool) Read(ctx context.Context, sink string, max int) (Batch, error) {
 		}
 		b.Through = max64(b.Through, through)
 	}
-	drops.Close()
+	_ = drops.Close()
 	if err := drops.Err(); err != nil {
 		return b, fmt.Errorf("forward: read spool: %w", err)
 	}

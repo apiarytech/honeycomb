@@ -140,13 +140,13 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 		Exclude: exclude, Deadbands: opts.Deadbands, OnError: opts.OnError,
 	})
 	if err != nil {
-		spool.Close()
+		_ = spool.Close()
 		return nil, err
 	}
 	s.spool, s.collector, s.opts = spool, collector, opts
 	if opts.Status != nil {
 		if err := s.addStatusTags(); err != nil {
-			spool.Close()
+			_ = spool.Close()
 			return nil, err
 		}
 	}

@@ -160,6 +160,7 @@ func (s *SQLSink) Send(ctx context.Context, b Batch) error {
 		if at.IsZero() {
 			at = r.Time
 		}
+		// #nosec G115 -- a feed sequence stays far below 2^63; the column is BIGINT.
 		if _, err := stmt.ExecContext(ctx, s.opts.SourceID, e.Epoch, int64(e.Seq), e.Kind, e.Name,
 			value, int64(e.Quality), at.UTC(), e.Reason, now); err != nil {
 			return fmt.Errorf("forward: %s: record %d: %w", s.opts.Name, r.ID, err)
@@ -187,6 +188,7 @@ type HistoryRow struct {
 // (rows without a tag).
 func (s *SQLSink) History(ctx context.Context, tag string, from, to time.Time, limit int) ([]HistoryRow, error) {
 	p := s.d.Placeholder
+	// #nosec G201 -- the table is a constant and the placeholders the dialect's; values go as arguments.
 	q := fmt.Sprintf("SELECT source_id, epoch, seq, kind, tag_name, tag_value, quality, value_time, reason FROM %s "+
 		"WHERE source_id = %s AND (tag_name = %s OR tag_name = '')", HistoryTable, p(1), p(2))
 	args := []any{s.opts.SourceID, tag}
@@ -211,7 +213,7 @@ func (s *SQLSink) History(ctx context.Context, tag string, from, to time.Time, l
 		if err := rows.Scan(&h.SourceID, &h.Epoch, &seq, &h.Kind, &h.Name, &value, &h.Quality, &at, &h.Reason); err != nil {
 			return nil, fmt.Errorf("forward: history: %w", err)
 		}
-		h.Seq, h.Time = uint64(seq), asTime(at)
+		h.Seq, h.Time = uint64(seq), asTime(at) // #nosec G115 -- stored from a uint64 by Send
 		if value.Valid {
 			h.Value = json.RawMessage(value.String)
 		}

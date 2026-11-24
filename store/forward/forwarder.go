@@ -173,7 +173,7 @@ func (f *Forwarder) run(ctx context.Context, drain bool) bool {
 		}
 		f.opts.OnError(err)
 		// Jitter keeps many units from retrying a recovered server at once.
-		wait := backoff/2 + rand.N(backoff/2+1)
+		wait := backoff/2 + rand.N(backoff/2+1) // #nosec G404 -- jitter, not a secret
 		select {
 		case <-ctx.Done():
 		case <-time.After(wait):
@@ -197,7 +197,7 @@ func (f *Forwarder) sent(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.status.Online, f.status.Failures, f.status.LastSent = true, 0, time.Now()
-	f.status.Sent += uint64(n)
+	f.status.Sent += uint64(n) // #nosec G115 -- n is a batch length, never negative
 }
 
 func (f *Forwarder) failed(err error) {
