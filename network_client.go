@@ -1,3 +1,13 @@
+/*
+ * Copyright (C) 2026 Franklin D. Amador
+ *
+ * This software is dual-licensed under the terms of the GPL v3.0 and
+ * a commercial license. You may choose to use this software under either
+ * license.
+ *
+ * See the LICENSE files in the project root for full license text.
+ */
+
 // Package honeycomb provides a thread-safe, in-memory database for managing
 // PLC-like tags, adhering to IEC 61131-3 concepts. This file, network_client.go,
 // specifically defines the client-side logic for accessing a remote TagDatabase
