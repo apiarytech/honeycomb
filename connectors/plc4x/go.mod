@@ -21,4 +21,4 @@ require (
 // Develop against the honeycomb checkout in this repository.
 replace github.com/apiarytech/honeycomb => ../..
 
-replace github.com/apache/plc4x/plc4go => github.com/apiarytech/plc4x/plc4go v0.0.0-20261124025116-81fa346bff4f
+replace github.com/apache/plc4x/plc4go => github.com/apiarytech/plc4x/plc4go v0.0.0-20261125015415-1dcb250decd5
